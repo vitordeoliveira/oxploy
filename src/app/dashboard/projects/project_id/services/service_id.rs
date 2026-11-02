@@ -3,6 +3,7 @@
 
 mod general;
 pub mod tab;
+mod variables;
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,7 +18,7 @@ use topcoat::{
         href, module_param, page, path_param, route,
     },
     runtime::{Event, signal},
-    view::{View, attributes, component, view},
+    view::{Child, View, attributes, component, view},
 };
 
 use super::super::{ProjectId, current_project};
@@ -32,6 +33,7 @@ use crate::features::project::Project;
 use crate::features::service::Service;
 use general::general_tab;
 use tab::Tab;
+use variables::{Draft, environment_tab};
 
 module_param!(pub service_id: u64, error = not_found);
 
@@ -134,7 +136,7 @@ impl ServiceTab {
                 "The repository and branch to deploy, how cargo builds the binary, and the buttons to deploy, restart and stop it."
             }
             Self::Environment => {
-                "Variables and secrets the binary reads when it starts, such as DATABASE_URL."
+                "Variables passed to cargo while it builds and to the binary when it runs."
             }
             Self::Domains => {
                 "The hostnames Caddy sends to this app, with HTTPS certificates it renews on its own."
@@ -203,9 +205,10 @@ pub async fn page() -> Result<impl View> {
     Ok(view! { service_view(tab: ServiceTab::General) })
 }
 
-/// The service's name and actions above its tabs, with `tab` open.
+/// The service's name and actions above its tabs, with `tab` open. `draft` holds
+/// variables that could not be saved, to show again on the Environment tab.
 #[component]
-async fn service_view(cx: &Cx, tab: ServiceTab) -> Result<impl View> {
+async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>) -> Result<impl View> {
     let (project, service) = current_service(cx).await?;
     let editing = signal(cx, || false);
     let deleting = signal(cx, || false);
@@ -282,17 +285,23 @@ async fn service_view(cx: &Cx, tab: ServiceTab) -> Result<impl View> {
                 </nav>
                 tabs_content(
                     attrs: attributes! { class="flex flex-1 flex-col" },
-                    if tab == ServiceTab::General {
-                        general_tab(project: &project, service: &service, here: &return_to)
-                    } else {
-                        empty_state(
-                            symbol: tab.icon(),
-                            title: tab.label(),
-                            text: tab.summary(),
-                            <span class="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
-                                "Coming soon"
-                            </span>
-                        )
+                    match tab {
+                        ServiceTab::General => {
+                            general_tab(project: &project, service: &service, here: &return_to)
+                        }
+                        ServiceTab::Environment => {
+                            environment_tab(service: &service, here: &return_to, draft: draft)
+                        }
+                        _ => {
+                            empty_state(
+                                symbol: tab.icon(),
+                                title: tab.label(),
+                                text: tab.summary(),
+                                <span class="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+                                    "Coming soon"
+                                </span>
+                            )
+                        }
                     }
                 )
             )
@@ -313,6 +322,20 @@ async fn service_view(cx: &Cx, tab: ServiceTab) -> Result<impl View> {
             name: &service.name,
             action: href!(remove, ProjectId(project.id), ServiceId(service.id)).resolve(cx)
         )
+    })
+}
+
+/// A card with a heading over one group of settings.
+#[component]
+async fn settings_card(title: &str, text: &str, #[default] child: Child<'_>) -> Result<impl View> {
+    Ok(view! {
+        <section class="flex flex-col rounded-xl border border-border bg-card">
+            <header class="flex flex-col gap-0.5 border-b border-border px-5 py-4">
+                <h2 class="font-semibold">(title)</h2>
+                <p class="text-sm text-muted-foreground">(text)</p>
+            </header>
+            <div class="flex flex-col gap-5 p-5">(child)</div>
+        </section>
     })
 }
 

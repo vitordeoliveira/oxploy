@@ -11,11 +11,11 @@ use topcoat::{
         href, route,
     },
     runtime::{Event, Signal, shard, signal},
-    view::{Child, View, attributes, component, element_id, view},
+    view::{View, attributes, component, element_id, view},
 };
 
 use super::super::super::ProjectId;
-use super::{ServiceId, current_service};
+use super::{ServiceId, current_service, settings_card};
 use crate::app::dashboard::git;
 use crate::app::dashboard::require_organization;
 use crate::components::button::{ButtonSize, ButtonVariant, button, button_variants};
@@ -209,20 +209,6 @@ pub async fn general_tab(
                 </form>
             )
         </div>
-    })
-}
-
-/// A card with a heading over one group of settings.
-#[component]
-async fn settings_card(title: &str, text: &str, #[default] child: Child<'_>) -> Result<impl View> {
-    Ok(view! {
-        <section class="flex flex-col rounded-xl border border-border bg-card">
-            <header class="flex flex-col gap-0.5 border-b border-border px-5 py-4">
-                <h2 class="font-semibold">(title)</h2>
-                <p class="text-sm text-muted-foreground">(text)</p>
-            </header>
-            <div class="flex flex-col gap-5 p-5">(child)</div>
-        </section>
     })
 }
 

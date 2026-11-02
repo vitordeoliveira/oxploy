@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
 use super::project::{Details, Project, now};
 use crate::db::db;
@@ -53,6 +54,10 @@ pub struct Service {
 
     /// The features to enable, comma separated, passed to `cargo build --features`.
     pub cargo_features: Option<String>,
+
+    /// The environment variables, written like a `.env` file, as the user wrote them.
+    /// See [`environment`].
+    pub environment: Option<String>,
 }
 
 /// Where a service's code comes from, as the user chose it.
@@ -126,6 +131,7 @@ impl Service {
             rust_version: None,
             cargo_bin: None,
             cargo_features: None,
+            environment: None,
         })
         .exec(&mut db(cx))
         .await?;
@@ -188,6 +194,23 @@ impl Service {
             .exec(&mut db(cx))
             .await?;
         Ok(true)
+    }
+
+    /// Replaces the environment variables, keeping them as written. Returns the problem,
+    /// changing nothing, if a line is not a variable oxploy can pass on.
+    pub async fn set_environment(
+        &mut self,
+        cx: &Cx,
+        text: &str,
+    ) -> Result<Result<(), EnvironmentError>> {
+        let text = text.replace("\r\n", "\n");
+        let text = text.trim();
+        if let Err(error) = environment::parse(text) {
+            return Ok(Err(error));
+        }
+        let text = (!text.is_empty()).then(|| text.to_owned());
+        self.update().environment(text).exec(&mut db(cx)).await?;
+        Ok(Ok(()))
     }
 
     /// The cargo command that builds the service.
