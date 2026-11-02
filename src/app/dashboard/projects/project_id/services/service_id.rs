@@ -1,6 +1,7 @@
-//! One service, with a tab for each part of deploying it. The tabs have nothing in
-//! them yet, only what each one will hold.
+//! One service, with a tab for each part of deploying it. Only General has settings
+//! so far; the other tabs say what they will hold.
 
+mod general;
 pub mod tab;
 
 use std::fmt;
@@ -29,6 +30,7 @@ use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::tabs::{tabs, tabs_content, tabs_list, tabs_trigger};
 use crate::features::project::Project;
 use crate::features::service::Service;
+use general::general_tab;
 use tab::Tab;
 
 module_param!(pub service_id: u64, error = not_found);
@@ -280,14 +282,18 @@ async fn service_view(cx: &Cx, tab: ServiceTab) -> Result<impl View> {
                 </nav>
                 tabs_content(
                     attrs: attributes! { class="flex flex-1 flex-col" },
-                    empty_state(
-                        symbol: tab.icon(),
-                        title: tab.label(),
-                        text: tab.summary(),
-                        <span class="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
-                            "Coming soon"
-                        </span>
-                    )
+                    if tab == ServiceTab::General {
+                        general_tab(project: &project, service: &service, here: &return_to)
+                    } else {
+                        empty_state(
+                            symbol: tab.icon(),
+                            title: tab.label(),
+                            text: tab.summary(),
+                            <span class="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+                                "Coming soon"
+                            </span>
+                        )
+                    }
                 )
             )
         </div>

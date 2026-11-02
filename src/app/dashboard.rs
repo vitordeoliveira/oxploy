@@ -1,5 +1,6 @@
 //! The signed-in area: a sidebar beside the page.
 
+pub mod git;
 pub mod monitoring;
 mod organizations;
 pub mod projects;
@@ -84,17 +85,22 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let mobile_open = signal(cx, || false);
     let projects = href!(projects::page);
     let projects_url = projects.resolve(cx);
+    let git_url = href!(git::page).resolve(cx);
     let monitoring = href!(monitoring::page);
     let monitoring_url = monitoring.resolve(cx);
     // Pages about the whole server are only for the user who owns it.
     let owns_server = signed_in.user.role == Role::SuperAdmin;
     let on_server_page = monitoring.is_current(cx);
     let path = uri(cx).path();
-    let in_projects = path == projects_url || path.starts_with(&format!("{projects_url}/"));
-    // The breadcrumb names what the page is about: the whole server, or the active
-    // organization's projects down to the open project and service.
+    let within = |section: &str| path == section || path.starts_with(&format!("{section}/"));
+    let in_projects = within(&projects_url);
+    let in_git = within(&git_url);
+    // The breadcrumb names what the page is about: the whole server, or something of
+    // the active organization, down to the open project and service.
     let trail = if on_server_page {
         vec![("Monitoring".to_owned(), monitoring_url.clone())]
+    } else if in_git {
+        vec![("Git".to_owned(), git_url.clone())]
     } else {
         let mut trail = vec![("Projects".to_owned(), projects_url.clone())];
         trail.extend(projects::trail(cx).await?);
@@ -138,6 +144,16 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     attrs: attributes! { class=(CURRENT_PAGE) },
                                     icon(data: iconify_icon!("lucide:layers"))
                                     <span>"Projects"</span>
+                                )
+                            )
+                            sidebar_menu_item(
+                                sidebar_menu_button(
+                                    href: Some(&git_url),
+                                    active: in_git,
+                                    tooltip: Some("Git"),
+                                    attrs: attributes! { class=(CURRENT_PAGE) },
+                                    icon(data: iconify_icon!("lucide:git-merge"))
+                                    <span>"Git"</span>
                                 )
                             )
                         )

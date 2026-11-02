@@ -44,6 +44,10 @@ file = "src/components/label.rs"
 hash = "sha256:32946542e73a3701fb42b43b61c6795aef984b7dafe280c6d3c06e71c5666610"
 file = "src/components/popover.rs"
 
+[registries.topcoat.components.select]
+hash = "sha256:044fb72b888ef18e16ed17feeb495010f9aaad8fde8b0933ff750e66d612c9ff"
+file = "src/components/select.rs"
+
 [registries.topcoat.components.separator]
 hash = "sha256:7ba5a7628128e1811e960884bd56da34f754c1d516230b4442dfbc1cb97e73e9"
 file = "src/components/separator.rs"

@@ -8,6 +8,7 @@ pub mod input;
 pub mod label;
 pub mod password_input;
 pub mod popover;
+pub mod select;
 pub mod separator;
 pub mod sheet;
 pub mod sidebar;

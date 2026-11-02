@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::github::is_repository_name;
 use super::project::{Details, Project, now};
 use crate::db::db;
 
@@ -28,7 +29,49 @@ pub struct Service {
 
     /// When the service was created, in seconds since the Unix epoch.
     pub created_at: i64,
+
+    /// The GitHub App that reads the repository. It belongs to the service's
+    /// organization, and may have been removed since.
+    pub github_app_id: Option<u64>,
+
+    /// The repository to build, as `owner/name`.
+    pub repository: Option<String>,
+
+    pub branch: Option<String>,
+
+    /// The folder with the `Cargo.toml` to build, from the repository root, such as
+    /// `crates/api`. `None` builds the root.
+    pub build_path: Option<String>,
+
+    /// The Rust toolchain to build with, such as `stable` or `1.85`. `None` uses the
+    /// repository's `rust-toolchain.toml`, or stable when it has none.
+    pub rust_version: Option<String>,
+
+    /// The binary to build, passed to `cargo build --bin`. `None` builds the package's
+    /// only binary.
+    pub cargo_bin: Option<String>,
+
+    /// The features to enable, comma separated, passed to `cargo build --features`.
+    pub cargo_features: Option<String>,
 }
+
+/// Where a service's code comes from, as the user chose it.
+pub struct Source<'a> {
+    pub github_app_id: u64,
+    pub repository: &'a str,
+    pub branch: &'a str,
+    pub build_path: &'a str,
+}
+
+/// How cargo builds a service, as the user typed it.
+pub struct CargoBuild<'a> {
+    pub rust_version: &'a str,
+    pub binary: &'a str,
+    pub features: &'a str,
+}
+
+/// The most features a build may enable.
+const MAX_FEATURES: usize = 32;
 
 /// The most characters an app name may have, which keeps it a valid DNS label.
 const MAX_APP_NAME_LEN: usize = 63;
@@ -76,6 +119,13 @@ impl Service {
             description,
             project_id: project.id,
             created_at: now(),
+            github_app_id: None,
+            repository: None,
+            branch: None,
+            build_path: None,
+            rust_version: None,
+            cargo_bin: None,
+            cargo_features: None,
         })
         .exec(&mut db(cx))
         .await?;
@@ -94,6 +144,62 @@ impl Service {
             .exec(&mut db(cx))
             .await?;
         Ok(true)
+    }
+
+    /// Sets where the code comes from. Returns `false`, changing nothing, if a value is
+    /// invalid. The caller checks that the app belongs to the service's organization.
+    pub async fn set_source(&mut self, cx: &Cx, source: &Source<'_>) -> Result<bool> {
+        let repository = source.repository.trim();
+        let branch = source.branch.trim();
+        let Some(build_path) = normalize_build_path(source.build_path) else {
+            return Ok(false);
+        };
+        if !is_repository_name(repository) || !is_branch_name(branch) {
+            return Ok(false);
+        }
+        self.update()
+            .github_app_id(Some(source.github_app_id))
+            .repository(Some(repository.to_owned()))
+            .branch(Some(branch.to_owned()))
+            .build_path(build_path)
+            .exec(&mut db(cx))
+            .await?;
+        Ok(true)
+    }
+
+    /// Sets how cargo builds the service. Returns `false`, changing nothing, if a value
+    /// is invalid. Empty values mean the defaults.
+    pub async fn set_build(&mut self, cx: &Cx, build: &CargoBuild<'_>) -> Result<bool> {
+        let rust_version = build.rust_version.trim();
+        let binary = build.binary.trim();
+        let Some(features) = normalize_features(build.features) else {
+            return Ok(false);
+        };
+        let valid = (rust_version.is_empty() || is_rust_version(rust_version))
+            && (binary.is_empty() || is_target_name(binary));
+        if !valid {
+            return Ok(false);
+        }
+        let optional = |value: &str| (!value.is_empty()).then(|| value.to_owned());
+        self.update()
+            .rust_version(optional(rust_version))
+            .cargo_bin(optional(binary))
+            .cargo_features(features)
+            .exec(&mut db(cx))
+            .await?;
+        Ok(true)
+    }
+
+    /// The cargo command that builds the service.
+    pub fn build_command(&self) -> String {
+        let mut command = "cargo build --release".to_owned();
+        if let Some(binary) = &self.cargo_bin {
+            command += &format!(" --bin {binary}");
+        }
+        if let Some(features) = &self.cargo_features {
+            command += &format!(" --features {features}");
+        }
+        command
     }
 
     /// Deletes the service.
@@ -160,4 +266,137 @@ fn slug(text: &str) -> String {
         }
     }
     slug.trim_end_matches('-').to_owned()
+}
+
+/// Returns the build path without its outer slashes, `None` for the repository root,
+/// or no answer if it leaves the repository or is not a plain folder path.
+fn normalize_build_path(path: &str) -> Option<Option<String>> {
+    let path = path.trim().trim_matches('/');
+    if path.is_empty() {
+        return Some(None);
+    }
+    let valid = path.len() <= 255
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !segment.chars().any(|c| c.is_control() || c == '\\')
+        });
+    valid.then(|| Some(path.to_owned()))
+}
+
+/// Returns whether `name` is a branch name git accepts, following
+/// `git check-ref-format`.
+fn is_branch_name(name: &str) -> bool {
+    const FORBIDDEN: [char; 9] = [' ', '~', '^', ':', '?', '*', '[', '\\', '\u{7f}'];
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "@"
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.ends_with('.')
+        && !name.chars().any(|c| c.is_control() || FORBIDDEN.contains(&c))
+        && name.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+/// Returns whether `version` names a Rust toolchain: a channel such as `stable`, a
+/// dated `nightly-2025-01-31`, or a release such as `1.85` or `1.85.0`.
+fn is_rust_version(version: &str) -> bool {
+    let is_number = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+    let is_date = |date: &str| {
+        let parts: Vec<_> = date.split('-').collect();
+        matches!(parts.as_slice(), [year, month, day]
+            if year.len() == 4 && month.len() == 2 && day.len() == 2
+                && parts.iter().all(|part| is_number(part)))
+    };
+    match version {
+        "stable" | "beta" | "nightly" => true,
+        _ => {
+            if let Some(date) = version
+                .strip_prefix("nightly-")
+                .or_else(|| version.strip_prefix("beta-"))
+            {
+                return is_date(date);
+            }
+            let parts: Vec<_> = version.split('.').collect();
+            (2..=3).contains(&parts.len()) && parts.iter().all(|part| is_number(part))
+        }
+    }
+}
+
+/// Returns whether `name` is a valid name for a cargo target, such as a binary.
+fn is_target_name(name: &str) -> bool {
+    name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Returns the features as a comma separated list, `None` for no features, or no
+/// answer if one is not a feature name. Features may be separated by commas or spaces,
+/// and may name a dependency's feature, as in `serde/derive`.
+fn normalize_features(features: &str) -> Option<Option<String>> {
+    let features: Vec<_> = features
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|feature| !feature.is_empty())
+        .collect();
+    let valid = features.len() <= MAX_FEATURES
+        && features.iter().all(|feature| {
+            feature.len() <= 64
+                && feature
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '/' | '?'))
+        });
+    valid.then(|| (!features.is_empty()).then(|| features.join(",")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_paths_stay_inside_the_repository() {
+        assert_eq!(normalize_build_path(" / "), Some(None));
+        assert_eq!(normalize_build_path("/crates/api/"), Some(Some("crates/api".to_owned())));
+        assert_eq!(normalize_build_path("../secrets"), None);
+        assert_eq!(normalize_build_path("crates//api"), None);
+        assert_eq!(normalize_build_path("crates\\api"), None);
+    }
+
+    #[test]
+    fn branch_names_follow_git() {
+        assert!(is_branch_name("main"));
+        assert!(is_branch_name("feature/login-2"));
+        assert!(!is_branch_name("-x"));
+        assert!(!is_branch_name("a..b"));
+        assert!(!is_branch_name("with space"));
+        assert!(!is_branch_name("topic.lock"));
+        assert!(!is_branch_name("a/.hidden"));
+    }
+
+    #[test]
+    fn rust_versions_are_channels_or_releases() {
+        for version in ["stable", "nightly", "1.85", "1.85.0", "nightly-2025-01-31"] {
+            assert!(is_rust_version(version), "{version}");
+        }
+        for version in ["1", "1.x", "latest", "nightly-2025-1-31", "1.85.0.1"] {
+            assert!(!is_rust_version(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn features_are_joined_with_commas() {
+        assert_eq!(normalize_features(""), Some(None));
+        assert_eq!(
+            normalize_features("postgres, tls serde/derive"),
+            Some(Some("postgres,tls,serde/derive".to_owned()))
+        );
+        assert_eq!(normalize_features("bad;feature"), None);
+    }
+
+    #[test]
+    fn app_names_are_slugs() {
+        assert_eq!(slug("My API!"), "my-api");
+        assert_eq!(slug("  Ação  "), "a-o");
+    }
 }

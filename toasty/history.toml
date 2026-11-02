@@ -14,3 +14,8 @@ snapshot_name = "0001_snapshot.toml"
 id = 2411429994646315334
 name = "0002_add_projects_and_services.sql"
 snapshot_name = "0002_snapshot.toml"
+
+[[migrations]]
+id = 3391428040266223
+name = "0003_add_github_apps_and_service_sources.sql"
+snapshot_name = "0003_snapshot.toml"

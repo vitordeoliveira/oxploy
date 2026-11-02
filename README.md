@@ -31,6 +31,11 @@ The session cookie is `Secure`, which browsers accept over plain HTTP only on
 `localhost` and `127.0.0.1`. Anywhere else, serve the panel over HTTPS, or signing in
 will not stick.
 
+Services build from GitHub. Open **Git** in the sidebar to connect an account: oxploy
+registers a private GitHub App on it that can only read code. The app sends the browser
+back to the address the panel was opened at, so connect from the address you will keep
+using.
+
 ## Project structure
 
 | Path | Contents |
