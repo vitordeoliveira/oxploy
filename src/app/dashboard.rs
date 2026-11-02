@@ -1,5 +1,6 @@
 //! The signed-in area: a sidebar beside the page.
 
+pub mod monitoring;
 mod organizations;
 pub mod projects;
 
@@ -26,7 +27,7 @@ use crate::components::sidebar::{
     sidebar_menu_item, sidebar_provider, sidebar_rail, sidebar_trigger,
 };
 use crate::features::session::{SignedIn, UserSession};
-use crate::features::user::User;
+use crate::features::user::{Role, User};
 use organizations::{OrganizationMenu, organization_dialogs, organization_switcher};
 
 /// Returns who is signed in, or sends the browser to sign in.
@@ -61,6 +62,18 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let mobile_open = signal(cx, || false);
     let projects = href!(projects::page);
     let projects_url = projects.resolve(cx);
+    let monitoring = href!(monitoring::page);
+    let monitoring_url = monitoring.resolve(cx);
+    // Pages about the whole server are only for the user who owns it.
+    let owns_server = signed_in.user.role == Role::SuperAdmin;
+    // The breadcrumb names what the page is about: the active organization, or the
+    // whole server.
+    let on_server_page = monitoring.is_current(cx);
+    let (page_title, page_url) = if on_server_page {
+        ("Monitoring", monitoring_url.clone())
+    } else {
+        ("Projects", projects_url.clone())
+    };
 
     Ok(view! {
         sidebar_provider(
@@ -102,6 +115,23 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             )
                         )
                     )
+                    if owns_server {
+                        sidebar_group(
+                            sidebar_group_label("Server")
+                            sidebar_menu(
+                                sidebar_menu_item(
+                                    sidebar_menu_button(
+                                        href: Some(&monitoring_url),
+                                        active: on_server_page,
+                                        tooltip: Some("Monitoring"),
+                                        attrs: attributes! { class=(CURRENT_PAGE) },
+                                        icon(data: iconify_icon!("lucide:activity"))
+                                        <span>"Monitoring"</span>
+                                    )
+                                )
+                            )
+                        )
+                    }
                 )
                 sidebar_footer(account(user: &signed_in.user))
                 sidebar_rail(open: $(open.get()), attrs: attributes! { @click=$(|_e: Event| open.toggle()) })
@@ -124,11 +154,17 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     separator(orientation: SeparatorOrientation::Vertical)
                     <nav aria-label="Breadcrumb" class="min-w-0 flex-1">
                         <ol class="flex min-w-0 items-center gap-1.5 text-sm">
-                            <li class="truncate text-muted-foreground">(&organization)</li>
+                            if on_server_page {
+                                <li class="flex items-center gap-1.5 text-muted-foreground">
+                                    icon(data: iconify_icon!("lucide:server"), size: 14)
+                                    "Server"
+                                </li>
+                            } else {
+                                <li class="truncate text-muted-foreground">(&organization)</li>
+                            }
                             <li aria-hidden="true" class="text-muted-foreground/50">"/"</li>
-                            // Projects is the only page so far, so it is always the current one.
                             <li>
-                                <a class="font-medium" href=(&projects_url) aria-current="page">"Projects"</a>
+                                <a class="font-medium" href=(&page_url) aria-current="page">(page_title)</a>
                             </li>
                         </ol>
                     </nav>
