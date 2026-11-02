@@ -1,21 +1,22 @@
 mod login;
-mod todos;
+mod onboarding;
+mod register;
 
 use topcoat::{
     Result,
     asset::{AssetBundle, RouterBuilderAssetExt, asset},
+    context::Cx,
     font::{Font, fontsource::fontsource_font},
-    icon::{icon, iconify::iconify_icon},
-    router::{RouterBuilder, RouterBuilderDiscoverExt, Slot, href, layout, module_router, page},
+    router::{
+        RouterBuilder, RouterBuilderDiscoverExt, Slot, error::redirect, href, layout,
+        module_router, page,
+    },
     runtime::RouterBuilderRuntimeExt,
     tailwind,
-    view::{View, attributes, view},
+    view::{View, view},
 };
 
-use crate::components::{
-    button::{ButtonSize, ButtonVariant, button_variants},
-    card::{card, card_content, card_description, card_header, card_title},
-};
+use crate::features::user::User;
 
 /// The Inter font family, loaded from Fontsource.
 const INTER: Font = fontsource_font!(INTER, weight: [400, 500, 600], style: Normal);
@@ -52,43 +53,13 @@ async fn root(slot: Slot<'_>) -> Result<impl View> {
     })
 }
 
+/// Sends visitors to setup until the server has its super admin, and to sign-in after.
 #[page]
-async fn home() -> Result<impl View> {
-    Ok(view! {
-        <main class="mx-auto max-w-2xl px-4 py-16">
-            card(
-                card_header(
-                    card_title(
-                        icon(
-                            data: iconify_icon!("lucide:sparkles"),
-                            attrs: attributes! { class="inline-block" }
-                        )
-                        " "
-                        "oxploy"
-                    )
-                    card_description(
-                        "Edit "
-                        <code>"src/app.rs"</code>
-                        " and save to see your changes."
-                    )
-                )
-                card_content(
-                    attrs: attributes! { class="flex gap-2" },
-                    // A link styled like a button, with the button component's classes.
-                    <a
-                        class=(button_variants(ButtonVariant::Primary, ButtonSize::Md))
-                        href=(href!(login::page))
-                    >
-                        "Sign in"
-                    </a>
-                    <a
-                        class=(button_variants(ButtonVariant::Outline, ButtonSize::Md))
-                        href=(href!(todos::page))
-                    >
-                        "Todo example"
-                    </a>
-                )
-            )
-        </main>
-    })
+async fn home(cx: &Cx) -> Result<()> {
+    let target = if User::super_admin_exists(cx).await? {
+        href!(login::page).resolve(cx)
+    } else {
+        href!(register::page).resolve(cx)
+    };
+    Err(redirect(target).into())
 }

@@ -1,0 +1,60 @@
+version = 1
+
+[schema]
+
+[[schema.tables]]
+id = 0
+name = "users"
+primary_key = { columns = [{ table = 0, index = 0 }], index = { table = 0, index = 0 } }
+
+[[schema.tables.columns]]
+id = { table = 0, index = 0 }
+name = "id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 4 }
+auto_increment = true
+
+[[schema.tables.columns]]
+id = { table = 0, index = 1 }
+name = "first_name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 0, index = 2 }
+name = "last_name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 0, index = 3 }
+name = "email"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 0, index = 4 }
+name = "password_hash"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 0, index = 5 }
+name = "role"
+ty = "String"
+storage_ty = { Enum = { name = "role", variants = [{ name = "super_admin" }] } }
+
+[[schema.tables.indices]]
+id = { table = 0, index = 0 }
+name = "index_users_by_id"
+on = 0
+columns = [{ column = { table = 0, index = 0 }, op = "Eq", scope = "Partition" }]
+unique = true
+primary_key = true
+
+[[schema.tables.indices]]
+id = { table = 0, index = 1 }
+name = "index_users_by_email"
+on = 0
+columns = [{ column = { table = 0, index = 3 }, op = "Eq", scope = "Partition" }]
+unique = true

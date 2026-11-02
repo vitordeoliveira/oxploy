@@ -10,14 +10,13 @@ Install the Topcoat CLI:
 cargo install topcoat-cli
 ```
 
-Create the database tables by generating a migration from the models and applying it:
+The database is stored in `data.db`; set `DATABASE_URL` to use another one. The app
+applies pending migrations from `toasty/` when it starts. After changing a model,
+generate a migration for it:
 
 ```sh
-cargo run -- toasty migration generate
-cargo run -- toasty migration apply
+cargo run -- toasty migration generate --name <what_changed>
 ```
-
-Run both commands again after changing a model. The database is stored in `data.db`.
 
 Start the development server, which rebuilds the application when you edit its source:
 
@@ -25,7 +24,8 @@ Start the development server, which rebuilds the application when you edit its s
 topcoat dev
 ```
 
-Then open <http://127.0.0.1:3000>.
+Then open <http://127.0.0.1:3000>. On a fresh database it asks you to create the super
+admin; after that it shows the sign-in page.
 
 ## Project structure
 

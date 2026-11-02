@@ -1,4 +1,6 @@
 mod app;
+// Installed components come with variants and helpers the app may not use yet.
+#[allow(dead_code)]
 mod components;
 mod db;
 mod features;
