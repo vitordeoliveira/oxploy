@@ -1,3 +1,4 @@
+mod login;
 mod todos;
 
 use topcoat::{
@@ -71,9 +72,16 @@ async fn home() -> Result<impl View> {
                     )
                 )
                 card_content(
+                    attrs: attributes! { class="flex gap-2" },
                     // A link styled like a button, with the button component's classes.
                     <a
                         class=(button_variants(ButtonVariant::Primary, ButtonSize::Md))
+                        href=(href!(login::page))
+                    >
+                        "Sign in"
+                    </a>
+                    <a
+                        class=(button_variants(ButtonVariant::Outline, ButtonSize::Md))
                         href=(href!(todos::page))
                     >
                         "Todo example"
