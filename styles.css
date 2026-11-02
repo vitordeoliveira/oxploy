@@ -1,4 +1,4 @@
-/* Rust, oxploy's theme: Dokploy's neutrals with a rust-orange primary.
+/* Rust, oxploy's theme: warm, slightly brown neutrals with a rust-orange primary.
 
    The theme is a small set of design tokens. Components refer to tokens only,
    never to raw colors, so a project restyles itself by editing the values in
@@ -84,28 +84,28 @@
 
 :root {
   color-scheme: light;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.141 0.004 286);
+  --background: oklch(0.995 0.002 80);
+  --foreground: oklch(0.21 0.012 50);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.141 0.004 286);
+  --card-foreground: oklch(0.21 0.012 50);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.141 0.004 286);
-  --muted: oklch(0.968 0.001 286);
-  --muted-foreground: oklch(0.552 0.014 286);
+  --popover-foreground: oklch(0.21 0.012 50);
+  --muted: oklch(0.965 0.006 70);
+  --muted-foreground: oklch(0.5 0.015 55);
   --primary: oklch(0.55 0.16 40);
-  --primary-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.596 0.237 29);
-  --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.92 0.004 286);
-  --input: oklch(0.92 0.004 286);
+  --primary-foreground: oklch(0.99 0.003 80);
+  --destructive: oklch(0.577 0.215 27);
+  --destructive-foreground: oklch(0.99 0.003 80);
+  --border: oklch(0.905 0.009 70);
+  --input: oklch(0.935 0.007 70);
   --ring: oklch(0.55 0.16 40);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.37 0.012 286);
+  --sidebar: oklch(0.965 0.007 70);
+  --sidebar-foreground: oklch(0.3 0.013 50);
   --sidebar-primary: oklch(0.55 0.16 40);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.968 0.001 286);
-  --sidebar-accent-foreground: oklch(0.21 0.006 286);
-  --sidebar-border: oklch(0.928 0.006 265);
+  --sidebar-primary-foreground: oklch(0.99 0.003 80);
+  --sidebar-accent: oklch(0.925 0.01 65);
+  --sidebar-accent-foreground: oklch(0.21 0.012 50);
+  --sidebar-border: oklch(0.9 0.01 70);
   --sidebar-ring: oklch(0.55 0.16 40);
   /* Use these values to enable shadows:
   --shadow-xs: 0 1px 2px oklch(0.24 0.02 260 / 12%);
@@ -119,29 +119,29 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --background: oklch(0 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.212 0.004 286);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.141 0.004 286);
-    --popover-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.212 0.004 286);
-    --muted-foreground: oklch(0.712 0.013 286);
-    --primary: oklch(0.62 0.17 42);
-    --primary-foreground: oklch(0.21 0.006 286);
-    --destructive: oklch(0.596 0.237 29);
-    --destructive-foreground: oklch(0.985 0 0);
-    --border: oklch(0.274 0.005 286);
-    --input: oklch(0.212 0.004 286);
-    --ring: oklch(0.62 0.17 42);
-    --sidebar: oklch(0.21 0.006 286);
-    --sidebar-foreground: oklch(0.968 0.001 286);
-    --sidebar-primary: oklch(0.62 0.17 42);
-    --sidebar-primary-foreground: oklch(0.21 0.006 286);
-    --sidebar-accent: oklch(0.274 0.005 286);
-    --sidebar-accent-foreground: oklch(0.968 0.001 286);
-    --sidebar-border: oklch(0.274 0.005 286);
-    --sidebar-ring: oklch(0.62 0.17 42);
+    --background: oklch(0.17 0.007 55);
+    --foreground: oklch(0.965 0.006 70);
+    --card: oklch(0.2 0.008 55);
+    --card-foreground: oklch(0.965 0.006 70);
+    --popover: oklch(0.2 0.008 55);
+    --popover-foreground: oklch(0.965 0.006 70);
+    --muted: oklch(0.205 0.008 55);
+    --muted-foreground: oklch(0.72 0.014 60);
+    --primary: oklch(0.64 0.17 42);
+    --primary-foreground: oklch(0.17 0.007 55);
+    --destructive: oklch(0.62 0.2 27);
+    --destructive-foreground: oklch(0.99 0.003 80);
+    --border: oklch(0.28 0.009 55);
+    --input: oklch(0.235 0.009 55);
+    --ring: oklch(0.64 0.17 42);
+    --sidebar: oklch(0.135 0.006 55);
+    --sidebar-foreground: oklch(0.9 0.008 70);
+    --sidebar-primary: oklch(0.64 0.17 42);
+    --sidebar-primary-foreground: oklch(0.17 0.007 55);
+    --sidebar-accent: oklch(0.21 0.009 55);
+    --sidebar-accent-foreground: oklch(0.965 0.006 70);
+    --sidebar-border: oklch(0.25 0.009 55);
+    --sidebar-ring: oklch(0.64 0.17 42);
     /* Use these values to enable shadows:
     --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
     --shadow-sm:

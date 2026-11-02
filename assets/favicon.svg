@@ -2,10 +2,10 @@
   <!-- The colors match the primary and primary-foreground tokens in styles.css. -->
   <style>
     rect { fill: #bb4717; }
-    g { stroke: #fafafa; }
+    g { stroke: #fdfcf9; }
     @media (prefers-color-scheme: dark) {
-      rect { fill: #d75a21; }
-      g { stroke: #18181b; }
+      rect { fill: #de6129; }
+      g { stroke: #120f0d; }
     }
   </style>
   <rect width="32" height="32" rx="8"/>
