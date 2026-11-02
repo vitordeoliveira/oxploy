@@ -3,7 +3,7 @@ mod todos;
 
 use topcoat::{
     Result,
-    asset::{AssetBundle, RouterBuilderAssetExt},
+    asset::{AssetBundle, RouterBuilderAssetExt, asset},
     font::{Font, fontsource::fontsource_font},
     icon::{icon, iconify::iconify_icon},
     router::{RouterBuilder, RouterBuilderDiscoverExt, Slot, href, layout, module_router, page},
@@ -41,6 +41,7 @@ async fn root(slot: Slot<'_>) -> Result<impl View> {
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"oxploy"</title>
+                <link rel="icon" type="image/svg+xml" href=(asset!("assets/favicon.svg"))>
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
                 topcoat::font::link(font: INTER)
                 topcoat::runtime::script()
