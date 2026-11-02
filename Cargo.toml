@@ -1,0 +1,21 @@
+[package]
+name = "oxploy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toasty = { version = "0.11", features = ["sqlite"] }
+toasty-cli = "0.11"
+tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread"] }
+topcoat = { version = "0.11.0", default-features = false, features = ["asset", "discover", "font-fontsource", "icon-iconify", "router", "runtime", "serve", "tailwind", "ui", "view"] }
+
+[build-dependencies]
+topcoat = { version = "0.11.0", default-features = false, features = ["icon-iconify", "tailwind"] }
+
+# Speed up compilation while keeping file and line numbers in error backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+# Speed up compilation by skipping debug information for dependencies.
+[profile.dev.package."*"]
+debug = false
