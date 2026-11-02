@@ -16,8 +16,8 @@ use crate::components::{
     card::{card, card_content, card_description, card_header, card_title},
 };
 
-/// The Geist font family, loaded from Fontsource.
-const GEIST: Font = fontsource_font!(GEIST, weight: [400, 700], style: Normal);
+/// The Inter font family, loaded from Fontsource.
+const INTER: Font = fontsource_font!(INTER, weight: [400, 500, 600], style: Normal);
 
 /// Builds the application's router.
 pub fn router() -> RouterBuilder {
@@ -41,7 +41,7 @@ async fn root(slot: Slot<'_>) -> Result<impl View> {
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"oxploy"</title>
                 <link rel="stylesheet" href=(tailwind::stylesheet!())>
-                topcoat::font::link(font: GEIST)
+                topcoat::font::link(font: INTER)
                 topcoat::runtime::script()
                 topcoat::dev::script()
             </head>

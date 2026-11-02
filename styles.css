@@ -1,8 +1,8 @@
-/* Neutral, the built-in Topcoat theme.
+/* Rust, oxploy's theme: Dokploy's neutrals with a rust-orange primary.
 
    The theme is a small set of design tokens. Components refer to tokens only,
    never to raw colors, so a project restyles itself by editing the values in
-   `:root` and `.dark` below.
+   both `:root` blocks below.
 
      --background              the page background
      --foreground              text and iconography on the background
@@ -10,12 +10,14 @@
      --card-foreground         text and iconography on cards and panels
      --popover                 floating menu and popover backgrounds
      --popover-foreground      text and iconography on floating surfaces
+     --muted                   muted surfaces, such as side panels
      --muted-foreground        secondary text: captions, descriptions, placeholders
      --primary                 the emphasis color: primary actions, selection, highlights
      --primary-foreground      text on a primary-filled surface
      --destructive             destructive actions and error states
      --destructive-foreground  text on a destructive-filled surface
      --border                  hairline borders and dividers
+     --input                   the fill of text inputs
      --ring                    the focus ring
      --sidebar                 the sidebar background
      --sidebar-foreground      sidebar text and icons
@@ -29,7 +31,7 @@
      --shadow-sm               a shadow for raised surfaces: cards, menus
 
    Shadows are disabled by default. To enable them, replace the shadow values
-   in `:root` and `.dark` with the commented values beside them. Use `0 0 #0000`
+   in both `:root` blocks with the commented values beside them. Use `0 0 #0000`
    to disable a shadow. Tailwind combines shadows and focus rings in one
    `box-shadow`, so `none` would also break the ring.
 
@@ -37,7 +39,7 @@
    color at reduced opacity. The sidebar has its own accent token for
    interactive rows, so it can be themed independently.
 
-   The Geist font is not bundled here; provide it with topcoat-font. */
+   The Inter font is not bundled here; provide it with topcoat-font. */
 
 @import "tailwindcss";
 
@@ -45,27 +47,28 @@
    file is installed at the project root, so `./src` is the crate's source. */
 @source "./src/**/*.rs";
 
-/* Dark mode is opted into by putting the `dark` class on an ancestor,
-   typically <html>. */
-@custom-variant dark (&:is(.dark *));
+/* Dark mode follows the operating system's color scheme. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
 
 /* Expose the tokens as Tailwind utilities (`bg-background`, `text-primary`,
    `border-border`, ...). The indirection through plain variables on `:root`
-   and `.dark` is what lets the values swap when the color scheme changes. */
+   is what lets the values swap when the color scheme changes. */
 @theme inline {
-  --font-sans: "Geist", sans-serif;
+  --font-sans: "Inter", sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
+  --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
+  --color-input: var(--input);
   --color-ring: var(--ring);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
@@ -80,27 +83,30 @@
 }
 
 :root {
-  --background: oklch(0.9875 0.003 260);
-  --foreground: oklch(0.24 0.012 260);
-  --card: oklch(0.995 0.003 260);
-  --card-foreground: oklch(0.24 0.012 260);
-  --popover: oklch(0.995 0.003 260);
-  --popover-foreground: oklch(0.24 0.012 260);
-  --muted-foreground: oklch(0.51 0.014 260);
-  --primary: oklch(0.21 0.02 260);
-  --primary-foreground: oklch(0.985 0.003 260);
-  --destructive: oklch(0.55 0.2 27);
-  --destructive-foreground: oklch(0.99 0.012 27);
-  --border: oklch(0.9 0.008 260);
-  --ring: oklch(0.32 0.02 260);
-  --sidebar: oklch(0.995 0.003 260);
-  --sidebar-foreground: oklch(0.24 0.012 260);
-  --sidebar-primary: oklch(0.21 0.02 260);
-  --sidebar-primary-foreground: oklch(0.985 0.003 260);
-  --sidebar-accent: color-mix(in oklab, var(--sidebar-foreground) 10%, var(--sidebar));
-  --sidebar-accent-foreground: oklch(0.24 0.012 260);
-  --sidebar-border: oklch(0.9 0.008 260);
-  --sidebar-ring: oklch(0.32 0.02 260);
+  color-scheme: light;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.141 0.004 286);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.141 0.004 286);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.141 0.004 286);
+  --muted: oklch(0.968 0.001 286);
+  --muted-foreground: oklch(0.552 0.014 286);
+  --primary: oklch(0.55 0.16 40);
+  --primary-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.596 0.237 29);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.92 0.004 286);
+  --input: oklch(0.92 0.004 286);
+  --ring: oklch(0.55 0.16 40);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.37 0.012 286);
+  --sidebar-primary: oklch(0.55 0.16 40);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.968 0.001 286);
+  --sidebar-accent-foreground: oklch(0.21 0.006 286);
+  --sidebar-border: oklch(0.928 0.006 265);
+  --sidebar-ring: oklch(0.55 0.16 40);
   /* Use these values to enable shadows:
   --shadow-xs: 0 1px 2px oklch(0.24 0.02 260 / 12%);
   --shadow-sm:
@@ -110,35 +116,40 @@
   --shadow-sm: 0 0 #0000;
 }
 
-.dark {
-  --background: oklch(0.17 0.012 260);
-  --foreground: oklch(0.93 0.006 260);
-  --card: oklch(0.22 0.012 260);
-  --card-foreground: oklch(0.93 0.006 260);
-  --popover: oklch(0.22 0.012 260);
-  --popover-foreground: oklch(0.93 0.006 260);
-  --muted-foreground: oklch(0.68 0.012 260);
-  --primary: oklch(0.92 0.008 260);
-  --primary-foreground: oklch(0.21 0.015 260);
-  --destructive: oklch(0.66 0.18 25);
-  --destructive-foreground: oklch(0.14 0.02 25);
-  --border: oklch(0.3 0.012 260);
-  --ring: oklch(0.6 0.02 260);
-  --sidebar: oklch(0.22 0.012 260);
-  --sidebar-foreground: oklch(0.93 0.006 260);
-  --sidebar-primary: oklch(0.92 0.008 260);
-  --sidebar-primary-foreground: oklch(0.21 0.015 260);
-  --sidebar-accent: color-mix(in oklab, var(--sidebar-foreground) 10%, var(--sidebar));
-  --sidebar-accent-foreground: oklch(0.93 0.006 260);
-  --sidebar-border: oklch(0.3 0.012 260);
-  --sidebar-ring: oklch(0.6 0.02 260);
-  /* Use these values to enable shadows:
-  --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
-  --shadow-sm:
-    0 1px 2px oklch(0 0 0 / 35%),
-    0 2px 8px -2px oklch(0 0 0 / 30%); */
-  --shadow-xs: 0 0 #0000;
-  --shadow-sm: 0 0 #0000;
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --background: oklch(0 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.212 0.004 286);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.141 0.004 286);
+    --popover-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.212 0.004 286);
+    --muted-foreground: oklch(0.712 0.013 286);
+    --primary: oklch(0.62 0.17 42);
+    --primary-foreground: oklch(0.21 0.006 286);
+    --destructive: oklch(0.596 0.237 29);
+    --destructive-foreground: oklch(0.985 0 0);
+    --border: oklch(0.274 0.005 286);
+    --input: oklch(0.212 0.004 286);
+    --ring: oklch(0.62 0.17 42);
+    --sidebar: oklch(0.21 0.006 286);
+    --sidebar-foreground: oklch(0.968 0.001 286);
+    --sidebar-primary: oklch(0.62 0.17 42);
+    --sidebar-primary-foreground: oklch(0.21 0.006 286);
+    --sidebar-accent: oklch(0.274 0.005 286);
+    --sidebar-accent-foreground: oklch(0.968 0.001 286);
+    --sidebar-border: oklch(0.274 0.005 286);
+    --sidebar-ring: oklch(0.62 0.17 42);
+    /* Use these values to enable shadows:
+    --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
+    --shadow-sm:
+      0 1px 2px oklch(0 0 0 / 35%),
+      0 2px 8px -2px oklch(0 0 0 / 30%); */
+    --shadow-xs: 0 0 #0000;
+    --shadow-sm: 0 0 #0000;
+  }
 }
 
 @layer base {
