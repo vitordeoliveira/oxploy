@@ -1,6 +1,11 @@
 //! The people who can sign in to the panel, stored in the database.
 
-use argon2::{Argon2, password_hash::PasswordHasher};
+use std::sync::LazyLock;
+
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
+};
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
@@ -25,6 +30,10 @@ pub struct User {
     pub password_hash: String,
 
     pub role: Role,
+
+    /// The organization to open after signing in. See
+    /// [`Organization::default_for`](super::organization::Organization::default_for).
+    pub default_organization_id: Option<u64>,
 }
 
 /// What a [`User`] is allowed to do.
@@ -79,6 +88,27 @@ impl User {
         .await?;
         Ok(true)
     }
+
+    /// Returns the user with this email and password, or `None` if either is wrong.
+    pub async fn authenticate(cx: &Cx, email: &str, password: &str) -> Result<Option<User>> {
+        let email = email.trim().to_lowercase();
+        let user = User::filter_by_email(&email)
+            .first()
+            .exec(&mut db(cx))
+            .await?;
+        let hash = user.as_ref().map(|user| user.password_hash.clone());
+        let matches = verify_password(hash, password.to_owned()).await?;
+        Ok(user.filter(|_| matches))
+    }
+
+    /// Makes `organization_id` the organization this user opens after signing in.
+    pub async fn set_default_organization(&mut self, cx: &Cx, organization_id: u64) -> Result<()> {
+        self.update()
+            .default_organization_id(Some(organization_id))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(())
+    }
 }
 
 /// Hashes `password` with a random salt. Argon2 is slow on purpose, so it runs on a
@@ -91,4 +121,28 @@ async fn hash_password(password: String) -> Result<String> {
     })
     .await??;
     Ok(hash)
+}
+
+/// Checks `password` against `hash`. Without a hash, it checks against a throwaway one
+/// and fails, so an unknown email takes as long to reject as a wrong password.
+async fn verify_password(hash: Option<String>, password: String) -> Result<bool> {
+    static UNKNOWN_USER: LazyLock<String> = LazyLock::new(|| {
+        Argon2::default()
+            .hash_password(b"no user has this password")
+            .expect("hashing a constant password succeeds")
+            .to_string()
+    });
+
+    let matches = tokio::task::spawn_blocking(move || {
+        let known = hash.is_some();
+        let hash = hash.unwrap_or_else(|| UNKNOWN_USER.clone());
+        let matches = PasswordHash::new(&hash).is_ok_and(|hash| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        });
+        known && matches
+    })
+    .await?;
+    Ok(matches)
 }

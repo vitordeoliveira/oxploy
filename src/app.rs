@@ -1,4 +1,6 @@
+mod dashboard;
 mod login;
+mod logout;
 mod onboarding;
 mod register;
 
@@ -6,17 +8,23 @@ use topcoat::{
     Result,
     asset::{AssetBundle, RouterBuilderAssetExt, asset},
     context::Cx,
+    cookie::RouterBuilderCookieExt,
     font::{Font, fontsource::fontsource_font},
+    icon::{IconData, iconify::iconify_icon},
     router::{
         RouterBuilder, RouterBuilderDiscoverExt, Slot, error::redirect, href, layout,
         module_router, page,
     },
     runtime::RouterBuilderRuntimeExt,
+    session::{RouterBuilderSessionExt, SessionConfig},
     tailwind,
     view::{View, view},
 };
 
-use crate::features::user::User;
+use crate::features::{session::UserSession, user::User};
+
+/// The oxploy logo, a cog like the one in the Rust logo.
+const LOGO: IconData = iconify_icon!("lucide:cog");
 
 /// The Inter font family, loaded from Fontsource.
 const INTER: Font = fontsource_font!(INTER, weight: [400, 500, 600], style: Normal);
@@ -29,6 +37,9 @@ pub fn router() -> RouterBuilder {
         // The runtime's procedures and shards, which have no place in the module tree.
         .discover()
         .assets(AssetBundle::load().unwrap())
+        // Sign-in sessions, carried in a cookie.
+        .cookies()
+        .sessions(SessionConfig::default())
         // Lets the browser runtime rerun pages; register it after other layers.
         .runtime()
 }
@@ -53,10 +64,13 @@ async fn root(slot: Slot<'_>) -> Result<impl View> {
     })
 }
 
-/// Sends visitors to setup until the server has its super admin, and to sign-in after.
+/// Sends visitors to setup until the server has its super admin, then to the dashboard
+/// or, when they are not signed in, to sign in.
 #[page]
 async fn home(cx: &Cx) -> Result<()> {
-    let target = if User::super_admin_exists(cx).await? {
+    let target = if UserSession::current(cx).await?.is_some() {
+        href!(dashboard::projects::page).resolve(cx)
+    } else if User::super_admin_exists(cx).await? {
         href!(login::page).resolve(cx)
     } else {
         href!(register::page).resolve(cx)

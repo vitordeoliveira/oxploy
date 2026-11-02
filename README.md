@@ -27,6 +27,10 @@ topcoat dev
 Then open <http://127.0.0.1:3000>. On a fresh database it asks you to create the super
 admin; after that it shows the sign-in page.
 
+The session cookie is `Secure`, which browsers accept over plain HTTP only on
+`localhost` and `127.0.0.1`. Anywhere else, serve the panel over HTTPS, or signing in
+will not stick.
+
 ## Project structure
 
 | Path | Contents |

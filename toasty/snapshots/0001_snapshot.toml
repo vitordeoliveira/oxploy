@@ -1,0 +1,170 @@
+version = 1
+
+[schema]
+
+[[schema.tables]]
+id = 0
+name = "user_sessions"
+primary_key = { columns = [{ table = 0, index = 0 }], index = { table = 0, index = 0 } }
+
+[[schema.tables.columns]]
+id = { table = 0, index = 0 }
+name = "id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 4 }
+auto_increment = true
+
+[[schema.tables.columns]]
+id = { table = 0, index = 1 }
+name = "token_hash"
+ty = "Bytes"
+storage_ty = "Blob"
+
+[[schema.tables.columns]]
+id = { table = 0, index = 2 }
+name = "user_id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 8 }
+
+[[schema.tables.columns]]
+id = { table = 0, index = 3 }
+name = "expires_at"
+ty = "I64"
+storage_ty = { Integer = 8 }
+
+[[schema.tables.columns]]
+id = { table = 0, index = 4 }
+name = "active_organization_id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 8 }
+nullable = true
+
+[[schema.tables.indices]]
+id = { table = 0, index = 0 }
+name = "index_user_sessions_by_id"
+on = 0
+columns = [{ column = { table = 0, index = 0 }, op = "Eq", scope = "Partition" }]
+unique = true
+primary_key = true
+
+[[schema.tables.indices]]
+id = { table = 0, index = 1 }
+name = "index_user_sessions_by_token_hash"
+on = 0
+columns = [{ column = { table = 0, index = 1 }, op = "Eq", scope = "Partition" }]
+unique = true
+
+[[schema.tables.indices]]
+id = { table = 0, index = 2 }
+name = "index_user_sessions_by_user_id"
+on = 0
+columns = [{ column = { table = 0, index = 2 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables]]
+id = 1
+name = "organizations"
+primary_key = { columns = [{ table = 1, index = 0 }], index = { table = 1, index = 0 } }
+
+[[schema.tables.columns]]
+id = { table = 1, index = 0 }
+name = "id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 4 }
+auto_increment = true
+
+[[schema.tables.columns]]
+id = { table = 1, index = 1 }
+name = "name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 1, index = 2 }
+name = "logo_url"
+ty = "String"
+storage_ty = "Text"
+nullable = true
+
+[[schema.tables.columns]]
+id = { table = 1, index = 3 }
+name = "owner_id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 8 }
+
+[[schema.tables.indices]]
+id = { table = 1, index = 0 }
+name = "index_organizations_by_id"
+on = 1
+columns = [{ column = { table = 1, index = 0 }, op = "Eq", scope = "Partition" }]
+unique = true
+primary_key = true
+
+[[schema.tables.indices]]
+id = { table = 1, index = 1 }
+name = "index_organizations_by_owner_id"
+on = 1
+columns = [{ column = { table = 1, index = 3 }, op = "Eq", scope = "Partition" }]
+
+[[schema.tables]]
+id = 2
+name = "users"
+primary_key = { columns = [{ table = 2, index = 0 }], index = { table = 2, index = 0 } }
+
+[[schema.tables.columns]]
+id = { table = 2, index = 0 }
+name = "id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 4 }
+auto_increment = true
+
+[[schema.tables.columns]]
+id = { table = 2, index = 1 }
+name = "first_name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 2, index = 2 }
+name = "last_name"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 2, index = 3 }
+name = "email"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 2, index = 4 }
+name = "password_hash"
+ty = "String"
+storage_ty = "Text"
+
+[[schema.tables.columns]]
+id = { table = 2, index = 5 }
+name = "role"
+ty = "String"
+storage_ty = { Enum = { name = "role", variants = [{ name = "super_admin" }] } }
+
+[[schema.tables.columns]]
+id = { table = 2, index = 6 }
+name = "default_organization_id"
+ty = "U64"
+storage_ty = { UnsignedInteger = 8 }
+nullable = true
+
+[[schema.tables.indices]]
+id = { table = 2, index = 0 }
+name = "index_users_by_id"
+on = 2
+columns = [{ column = { table = 2, index = 0 }, op = "Eq", scope = "Partition" }]
+unique = true
+primary_key = true
+
+[[schema.tables.indices]]
+id = { table = 2, index = 1 }
+name = "index_users_by_email"
+on = 2
+columns = [{ column = { table = 2, index = 3 }, op = "Eq", scope = "Partition" }]
+unique = true

@@ -5,3 +5,7 @@ id = 7181344770509367817
 name = "0000_create_users.sql"
 snapshot_name = "0000_snapshot.toml"
 
+[[migrations]]
+id = 3962199980783598538
+name = "0001_add_organizations_and_sessions.sql"
+snapshot_name = "0001_snapshot.toml"

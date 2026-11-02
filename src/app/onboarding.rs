@@ -2,13 +2,12 @@
 
 use topcoat::{
     Result,
-    icon::{IconData, icon, iconify::iconify_icon},
+    icon::{icon, iconify::iconify_icon},
     router::href,
     view::{Child, View, component, view},
 };
 
-/// The oxploy logo, a cog like the one in the Rust logo.
-const LOGO: IconData = iconify_icon!("lucide:cog");
+use super::LOGO;
 
 /// Shows `child`, usually a heading and a form, beside a panel that pitches oxploy.
 #[component]

@@ -1513,6 +1513,7 @@ name = "oxploy"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "jiff",
  "serde",
  "toasty",
  "toasty-cli",
@@ -2955,6 +2956,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror",
  "tokio",
+ "topcoat-cookie",
  "topcoat-core",
  "topcoat-router",
  "web-time",
