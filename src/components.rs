@@ -1,6 +1,7 @@
 pub mod alert_dialog;
 pub mod button;
 pub mod dialog;
+pub mod dropdown_menu;
 pub mod field;
 pub mod floating;
 pub mod input;
@@ -11,3 +12,5 @@ pub mod separator;
 pub mod sheet;
 pub mod sidebar;
 pub mod skeleton;
+pub mod tabs;
+pub mod textarea;

@@ -11,7 +11,7 @@ use topcoat::{
     icon::{icon, iconify::iconify_icon},
     router::{
         Slot,
-        error::{redirect, see_other},
+        error::{SeeOther, redirect, see_other},
         href, layout, page,
         request::uri,
     },
@@ -26,6 +26,7 @@ use crate::components::sidebar::{
     sidebar_group_label, sidebar_header, sidebar_inset, sidebar_menu, sidebar_menu_button,
     sidebar_menu_item, sidebar_provider, sidebar_rail, sidebar_trigger,
 };
+use crate::features::organization::Organization;
 use crate::features::session::{SignedIn, UserSession};
 use crate::features::user::{Role, User};
 use organizations::{OrganizationMenu, organization_dialogs, organization_switcher};
@@ -38,6 +39,27 @@ pub async fn require_sign_in(cx: &Cx) -> Result<SignedIn> {
     match UserSession::current(cx).await? {
         Some(signed_in) => Ok(signed_in),
         None => Err(see_other(href!(super::login::page).resolve(cx)).into()),
+    }
+}
+
+/// Returns the organization this browser is working in, or sends the browser to sign
+/// in.
+pub async fn require_organization(cx: &Cx) -> Result<Organization> {
+    let mut signed_in = require_sign_in(cx).await?;
+    let mut organizations = signed_in.organizations(cx).await?;
+    Ok(organizations.all.swap_remove(organizations.active))
+}
+
+/// Sends the browser back to the dashboard page a form was on. Anything else, such as
+/// another site, goes to the projects instead.
+fn back(cx: &Cx, return_to: &str) -> SeeOther {
+    let is_dashboard_page = return_to.starts_with("/dashboard")
+        && !return_to.contains("//")
+        && !return_to.contains('\\');
+    if is_dashboard_page {
+        see_other(return_to)
+    } else {
+        see_other(href!(projects::page).resolve(cx))
     }
 }
 
@@ -66,14 +88,19 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let monitoring_url = monitoring.resolve(cx);
     // Pages about the whole server are only for the user who owns it.
     let owns_server = signed_in.user.role == Role::SuperAdmin;
-    // The breadcrumb names what the page is about: the active organization, or the
-    // whole server.
     let on_server_page = monitoring.is_current(cx);
-    let (page_title, page_url) = if on_server_page {
-        ("Monitoring", monitoring_url.clone())
+    let path = uri(cx).path();
+    let in_projects = path == projects_url || path.starts_with(&format!("{projects_url}/"));
+    // The breadcrumb names what the page is about: the whole server, or the active
+    // organization's projects down to the open project and service.
+    let trail = if on_server_page {
+        vec![("Monitoring".to_owned(), monitoring_url.clone())]
     } else {
-        ("Projects", projects_url.clone())
+        let mut trail = vec![("Projects".to_owned(), projects_url.clone())];
+        trail.extend(projects::trail(cx).await?);
+        trail
     };
+    let last = trail.len() - 1;
 
     Ok(view! {
         sidebar_provider(
@@ -106,7 +133,7 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                             sidebar_menu_item(
                                 sidebar_menu_button(
                                     href: Some(&projects_url),
-                                    active: projects.is_current(cx),
+                                    active: in_projects,
                                     tooltip: Some("Projects"),
                                     attrs: attributes! { class=(CURRENT_PAGE) },
                                     icon(data: iconify_icon!("lucide:layers"))
@@ -155,17 +182,25 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     <nav aria-label="Breadcrumb" class="min-w-0 flex-1">
                         <ol class="flex min-w-0 items-center gap-1.5 text-sm">
                             if on_server_page {
-                                <li class="flex items-center gap-1.5 text-muted-foreground">
+                                <li class="flex items-center gap-1.5 text-muted-foreground max-sm:hidden">
                                     icon(data: iconify_icon!("lucide:server"), size: 14)
                                     "Server"
                                 </li>
                             } else {
-                                <li class="truncate text-muted-foreground">(&organization)</li>
+                                <li class="truncate text-muted-foreground max-sm:hidden">(&organization)</li>
                             }
-                            <li aria-hidden="true" class="text-muted-foreground/50">"/"</li>
-                            <li>
-                                <a class="font-medium" href=(&page_url) aria-current="page">(page_title)</a>
-                            </li>
+                            // Phones show only the current page.
+                            #[key(index)]
+                            for (index, (label, url)) in trail.iter().enumerate() {
+                                <li aria-hidden="true" class="text-muted-foreground/50 max-sm:hidden">"/"</li>
+                                <li class=(if index == last { "min-w-0" } else { "min-w-0 max-sm:hidden" })>
+                                    if index == last {
+                                        <a class="block truncate font-medium" href=(url) aria-current="page">(label)</a>
+                                    } else {
+                                        <a class="block truncate text-muted-foreground hover:text-foreground" href=(url)>(label)</a>
+                                    }
+                                </li>
+                            }
                         </ol>
                     </nav>
                     server_time()

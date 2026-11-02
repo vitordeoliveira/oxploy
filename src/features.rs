@@ -3,5 +3,7 @@
 
 pub mod monitoring;
 pub mod organization;
+pub mod project;
+pub mod service;
 pub mod session;
 pub mod user;

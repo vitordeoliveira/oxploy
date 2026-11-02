@@ -17,7 +17,7 @@ use topcoat::{
     view::{View, attributes, class, component, element_id, view},
 };
 
-use super::require_sign_in;
+use super::{back, require_sign_in};
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::dialog::{
@@ -515,7 +515,7 @@ async fn remove(cx: &Cx, Form(form): Form<OrganizationForm>) -> Result<SeeOther>
     if !organization.remove(cx, &mut signed_in.user).await? {
         return Err(bad_request("The last organization cannot be deleted").into());
     }
-    Ok(back(cx, &form.return_to))
+    Ok(back_outside_projects(cx, &form.return_to))
 }
 
 /// Makes one of the user's organizations the one they open after signing in.
@@ -536,7 +536,7 @@ async fn activate(cx: &Cx, Form(form): Form<OrganizationForm>) -> Result<SeeOthe
     let mut signed_in = require_sign_in(cx).await?;
     let organization = owned(cx, &signed_in, form.id).await?;
     signed_in.activate(cx, &organization).await?;
-    Ok(back(cx, &form.return_to))
+    Ok(back_outside_projects(cx, &form.return_to))
 }
 
 /// Returns the organization with this ID, or a not found error unless the signed-in
@@ -548,15 +548,14 @@ async fn owned(cx: &Cx, signed_in: &SignedIn, id: u64) -> Result<Organization> {
     Ok(organization)
 }
 
-/// Sends the browser back to the dashboard page a form was on. Anything else, such as
-/// another site, goes to the projects instead.
-fn back(cx: &Cx, return_to: &str) -> SeeOther {
-    let is_dashboard_page = return_to.starts_with("/dashboard")
-        && !return_to.contains("//")
-        && !return_to.contains('\\');
-    if is_dashboard_page {
-        see_other(return_to)
+/// Sends the browser back to the page a form was on, unless that page is inside a
+/// project: projects belong to one organization, so after switching or deleting one the
+/// project list opens instead.
+fn back_outside_projects(cx: &Cx, return_to: &str) -> SeeOther {
+    let projects = href!(super::projects::page).resolve(cx);
+    if return_to.starts_with(&format!("{projects}/")) {
+        see_other(projects)
     } else {
-        see_other(href!(super::projects::page).resolve(cx))
+        back(cx, return_to)
     }
 }

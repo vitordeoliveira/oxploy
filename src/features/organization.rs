@@ -2,6 +2,7 @@
 
 use topcoat::{Result, context::Cx};
 
+use super::project::Project;
 use super::user::User;
 use crate::db::db;
 
@@ -129,8 +130,8 @@ impl Organization {
         Ok(true)
     }
 
-    /// Deletes the organization. Returns `false`, deleting nothing, if it is the owner's
-    /// last one, since a user always has at least one.
+    /// Deletes the organization with its projects. Returns `false`, deleting nothing, if
+    /// it is the owner's last one, since a user always has at least one.
     ///
     /// When it was the owner's default, their oldest remaining organization takes over.
     pub async fn remove(self, cx: &Cx, owner: &mut User) -> Result<bool> {
@@ -146,6 +147,7 @@ impl Organization {
         if owner.default_organization_id == Some(self.id) {
             owner.set_default_organization(cx, oldest.id).await?;
         }
+        Project::remove_all_in(cx, self.id).await?;
         Organization::filter_by_id(self.id)
             .delete()
             .exec(&mut db(cx))
