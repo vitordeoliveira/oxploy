@@ -580,7 +580,7 @@ fn nice_rate_ceiling(rate: f64) -> f64 {
 }
 
 /// Formats a byte count with a binary unit, such as `2.36 GiB`.
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

@@ -12,4 +12,5 @@ pub mod project;
 pub mod runtime;
 pub mod service;
 pub mod session;
+pub mod storage;
 pub mod user;

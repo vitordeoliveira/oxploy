@@ -55,6 +55,12 @@ impl AppFiles {
         self.root.join("storage")
     }
 
+    /// Copies of the app's databases, one folder per database. They sit outside the
+    /// storage folder, so restoring one cannot overwrite them.
+    pub fn backups(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
     /// The cargo target folder every build of the app shares, so rebuilds only compile
     /// what changed.
     pub fn target(&self) -> PathBuf {
@@ -82,6 +88,22 @@ impl AppFiles {
     pub fn pid_file(&self) -> PathBuf {
         self.root.join("app.pid")
     }
+}
+
+/// Returns how many bytes the files in a folder take, with its subfolders. A folder
+/// that does not exist takes none.
+pub fn size_of(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => size_of(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |metadata| metadata.len()),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Returns the end of a log: its last `lines` lines, read from at most the last 256 KiB.

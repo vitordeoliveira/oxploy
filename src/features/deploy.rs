@@ -28,6 +28,7 @@ use super::github::GithubApp;
 use super::project::{Project, now};
 use super::runtime::{Launch, Readiness, Runtime, app_variables, system_env};
 use super::service::{BuildKind, Service};
+use super::storage;
 
 /// How long a new release may take to start listening on its port.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -197,6 +198,47 @@ impl Deployer {
             return Ok(Ok(()));
         };
         Ok(self.runtime.start(&launch))
+    }
+
+    /// Puts a backup in place of a database: stops the service, backs up the current
+    /// database, restores, and starts the service again if it should run. Returns what
+    /// went wrong instead, such as a deployment in progress.
+    pub async fn restore(
+        &self,
+        service: &Service,
+        database: &str,
+        backup: &str,
+    ) -> toasty::Result<Result<(), String>> {
+        if self.is_deploying(service.id) {
+            return Ok(Err("a deployment is in progress; restore once it ends".to_owned()));
+        }
+        let files = AppFiles::of(&service.app_name);
+        let _hold = self.runtime.hold(service.id);
+        self.runtime.stop(service.id, &files).await;
+        let (database, backup) = (database.to_owned(), backup.to_owned());
+        let restore = {
+            let files = files.clone();
+            move || {
+                // The database being replaced is kept, unless there is none yet.
+                if storage::database_file(&files, &database).is_some_and(|file| file.is_file()) {
+                    storage::back_up(&files, &database, "-before-restore")?;
+                }
+                storage::restore(&files, &database, &backup)
+            }
+        };
+        let restored = tokio::task::spawn_blocking(restore)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|restored| restored.map_err(|error| error.to_string()));
+        // Started again either way: a failed restore leaves the old database in place.
+        if service.release_id.is_some()
+            && service.stopped_at.is_none()
+            && let Some(launch) = Launch::of(&self.db, service).await?
+            && let Err(error) = self.runtime.start(&launch)
+        {
+            eprintln!("oxploy: could not start {} after a restore: {error}", service.app_name);
+        }
+        Ok(restored)
     }
 
     /// Stops the service and deletes its deployments and files, before the service

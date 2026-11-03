@@ -5,6 +5,7 @@ mod general;
 mod history;
 mod output;
 mod process;
+mod stored;
 pub mod tab;
 mod variables;
 
@@ -45,6 +46,7 @@ use general::general_tab;
 use history::deployments_tab;
 use output::logs_tab;
 use process::advanced_tab;
+use stored::storage_tab;
 use tab::Tab;
 use variables::{Draft, environment_tab};
 
@@ -309,6 +311,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         }
                         ServiceTab::Environment => {
                             environment_tab(service: &service, here: &return_to, draft: draft)
+                        }
+                        ServiceTab::Storage => {
+                            storage_tab(project: &project, service: &service)
                         }
                         ServiceTab::Deployments => {
                             deployments_tab(project: &project, service: &service, here: &return_to)
