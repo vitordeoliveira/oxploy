@@ -14,4 +14,5 @@ pub mod runtime;
 pub mod service;
 pub mod session;
 pub mod storage;
+pub mod usage;
 pub mod user;

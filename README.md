@@ -45,7 +45,9 @@ elsewhere. Each app also gets a storage folder that deploys keep, in
 `OXPLOY_STORAGE_DIR`, and can run a script after each build, before the new release
 starts, such as one that migrates its database. The Storage tab adds SQLite databases
 there and connects them to the app through a variable, a link in each release, or
-both, and backs them up and restores them.
+both, and backs them up and restores them. Each service's Monitoring tab shows the CPU,
+memory and disk its app takes, sampled every 2 seconds and kept for 10 minutes in
+memory.
 
 ## Project structure
 

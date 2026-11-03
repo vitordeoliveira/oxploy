@@ -3,7 +3,8 @@
 //! A process outlives the panel: it runs in a process group of its own, so stopping the
 //! panel does not stop it, and its PID is written next to its files, so a restarted
 //! panel takes it back instead of starting a second copy. While the panel runs, it
-//! starts a process again after it exits, waiting longer after each crash.
+//! starts a process again after it exits, waiting longer after each crash, and samples
+//! how much of the machine each process takes.
 //!
 //! This is the native runtime. A Docker runtime would run containers behind the same
 //! methods, published on the same port.
@@ -15,7 +16,8 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use toasty::Db;
@@ -25,6 +27,7 @@ use super::databases::{self, ManagedDatabase};
 use super::deployment::Deployment;
 use super::environment::{self, PORT_VARIABLE, STORAGE_VARIABLE};
 use super::service::Service;
+use super::usage::Usage;
 
 /// How often the panel checks that the apps that should run are running.
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
@@ -110,6 +113,17 @@ pub struct Runtime {
     /// Services a deployment or the user is starting or stopping, which the watcher
     /// leaves alone meanwhile.
     busy: Mutex<HashSet<u64>>,
+    exits: Mutex<HashMap<u64, Exits>>,
+    usage: Usage,
+}
+
+/// The times an app exited on its own since a deployment or the user last started it,
+/// as this run of the panel saw them.
+#[derive(Clone, Debug, Default)]
+pub struct Exits {
+    pub count: u32,
+    /// When it last exited, and how.
+    pub last: Option<(SystemTime, String)>,
 }
 
 /// A running app.
@@ -160,12 +174,20 @@ impl Runtime {
             db,
             processes: Mutex::default(),
             busy: Mutex::default(),
+            exits: Mutex::default(),
+            usage: Usage::new(),
         }
     }
 
     /// Starts checking, on a task of its own, that every service that should run does:
     /// taking back the ones a previous run of the panel started, and starting the rest.
+    /// Also starts sampling their usage, on a thread of its own.
     pub fn watch(self: Arc<Self>) {
+        let sampled = self.clone();
+        thread::Builder::new()
+            .name("app-usage".to_owned())
+            .spawn(move || sampled.usage.sample_forever(|| sampled.running()))
+            .expect("the app usage thread starts");
         tokio::spawn(async move {
             let mut crashes = HashMap::new();
             loop {
@@ -193,9 +215,43 @@ impl Runtime {
             .is_some_and(|process| process.exited().is_none())
     }
 
-    /// Starts the release in `launch`. Whatever ran for the service before must have
-    /// been stopped.
+    /// The recent usage of each app.
+    pub fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    /// Returns how often the service's app exited on its own since it was last started.
+    pub fn exits(&self, service_id: u64) -> Exits {
+        lock(&self.exits)
+            .get(&service_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Forgets the service's exits and usage, once it is deleted.
+    pub fn forget(&self, service_id: u64) {
+        lock(&self.exits).remove(&service_id);
+        self.usage.forget(service_id);
+    }
+
+    /// Starts the release in `launch`, for a deployment or the user, which counts its
+    /// exits again from none. Whatever ran for the service before must have been
+    /// stopped.
     pub fn start(&self, launch: &Launch) -> io::Result<()> {
+        lock(&self.exits).remove(&launch.service_id);
+        self.spawn(launch)
+    }
+
+    /// The services whose process runs, with its PID.
+    fn running(&self) -> Vec<(u64, u32)> {
+        lock(&self.processes)
+            .iter()
+            .map(|(service_id, process)| (*service_id, process.pid))
+            .collect()
+    }
+
+    /// Starts the release in `launch`.
+    fn spawn(&self, launch: &Launch) -> io::Result<()> {
         let log_path = launch.files.app_log();
         if let Some(logs) = log_path.parent() {
             fs::create_dir_all(logs)?;
@@ -337,13 +393,17 @@ impl Runtime {
                     &launch.files,
                     &format!("The app exited ({how}). Starting it again in {}s.", wait.as_secs()),
                 );
+                let mut exits = lock(&self.exits);
+                let exits = exits.entry(service.id).or_default();
+                exits.count += 1;
+                exits.last = Some((SystemTime::now(), how));
             } else if crash.retry_at.is_none() && self.take_back(&launch) {
                 continue;
             }
             if crash.retry_at.is_some_and(|retry_at| Instant::now() < retry_at) {
                 continue;
             }
-            if let Err(error) = self.start(&launch) {
+            if let Err(error) = self.spawn(&launch) {
                 crash.count += 1;
                 crash.retry_at = Some(Instant::now() + backoff(crash.count));
                 note(&launch.files, &format!("The app could not start: {error}"));

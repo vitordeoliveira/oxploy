@@ -7,6 +7,7 @@ mod output;
 mod process;
 mod stored;
 pub mod tab;
+mod usage;
 mod variables;
 
 use std::fmt;
@@ -48,6 +49,7 @@ use output::logs_tab;
 use process::advanced_tab;
 use stored::storage_tab;
 use tab::Tab;
+use usage::monitoring_tab;
 use variables::{Draft, environment_tab};
 
 /// How often the service's status refreshes on its page.
@@ -164,7 +166,7 @@ impl ServiceTab {
                 "Every build of this service with its commit and build log, and a way back to an earlier one."
             }
             Self::Logs => "What the running binary prints, as it prints it.",
-            Self::Monitoring => "The CPU, memory and network this service uses.",
+            Self::Monitoring => "The CPU, memory and disk the app takes while it runs.",
             Self::PreviewDeployments => {
                 "A temporary copy of the app for each pull request, on its own subdomain."
             }
@@ -320,6 +322,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         }
                         ServiceTab::Logs => {
                             logs_tab(service: &service)
+                        }
+                        ServiceTab::Monitoring => {
+                            monitoring_tab(service: &service)
                         }
                         ServiceTab::Advanced => {
                             advanced_tab(project: &project, service: &service, here: &return_to)

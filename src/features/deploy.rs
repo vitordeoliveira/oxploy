@@ -27,9 +27,10 @@ use super::deployment::{Deployment, DeploymentStatus};
 use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
 use super::github::GithubApp;
 use super::project::{Project, now};
-use super::runtime::{Launch, Readiness, Runtime, app_variables, system_env};
+use super::runtime::{Exits, Launch, Readiness, Runtime, app_variables, system_env};
 use super::service::{BuildKind, Service};
 use super::storage;
+use super::usage::Usage;
 
 /// How long a new release may take to start listening on its port.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -135,6 +136,17 @@ impl Deployer {
 
     pub fn is_deploying(&self, service_id: u64) -> bool {
         lock(&self.deploying).contains(&service_id)
+    }
+
+    /// The recent usage of each app.
+    pub fn usage(&self) -> &Usage {
+        self.runtime.usage()
+    }
+
+    /// How often the service's app exited on its own since a deployment or the user
+    /// last started it.
+    pub fn exits(&self, service_id: u64) -> Exits {
+        self.runtime.exits(service_id)
     }
 
     /// Starts deploying the service on a task of its own, and returns its deployment.
@@ -299,6 +311,7 @@ impl Deployer {
         let files = AppFiles::of(&service.app_name);
         let _hold = self.runtime.hold(service.id);
         self.runtime.stop(service.id, &files).await;
+        self.runtime.forget(service.id);
         Deployment::filter_by_service_id(service.id)
             .delete()
             .exec(&mut self.db.clone())

@@ -84,7 +84,7 @@ async fn host_facts(host: &Host) -> Result<impl View> {
 }
 
 #[component]
-async fn fact(data: IconData, label: &'static str, value: String) -> Result<impl View> {
+pub(super) async fn fact(data: IconData, label: &'static str, value: String) -> Result<impl View> {
     Ok(view! {
         <li class="flex items-center gap-1.5 rounded-md border border-border bg-muted/60 px-2.5 py-1">
             icon(data: data, size: 14, attrs: attributes! { class="text-muted-foreground" })
@@ -141,9 +141,9 @@ async fn metrics(samples: &[Sample]) -> Result<impl View> {
             .collect::<Vec<_>>(),
         rates.iter().map(|rate| rate.network_sent).collect(),
     ];
-    let disk_max = nice_rate_ceiling(disk_rates.iter().flatten().copied().fold(0.0, f64::max));
+    let disk_max = nice_bytes_ceiling(disk_rates.iter().flatten().copied().fold(0.0, f64::max));
     let network_max =
-        nice_rate_ceiling(network_rates.iter().flatten().copied().fold(0.0, f64::max));
+        nice_bytes_ceiling(network_rates.iter().flatten().copied().fold(0.0, f64::max));
     let memory_total = latest.memory_total as f64;
     let disk_total = latest.disk_total as f64;
 
@@ -258,7 +258,7 @@ async fn metrics(samples: &[Sample]) -> Result<impl View> {
 
 /// A card with a metric's name, its current value and what goes with it.
 #[component]
-async fn metric(
+pub(super) async fn metric(
     data: IconData,
     title: &'static str,
     value: String,
@@ -289,7 +289,7 @@ async fn metric(
 /// How much of a resource is taken, from 0 to 1. Past 90% it turns red and says
 /// `alert`; the percentage is followed by `unit`, as in `62% used`.
 #[component]
-async fn meter(share: f64, alert: &'static str, unit: &'static str) -> Result<impl View> {
+pub(super) async fn meter(share: f64, alert: &'static str, unit: &'static str) -> Result<impl View> {
     let share = share.clamp(0.0, 1.0);
     let critical = share >= 0.9;
 
@@ -328,7 +328,7 @@ async fn meter(share: f64, alert: &'static str, unit: &'static str) -> Result<im
 
 /// The names, colors and current values of a chart's series.
 #[component]
-async fn legend(entries: Vec<(&'static str, &'static str, String)>) -> Result<impl View> {
+pub(super) async fn legend(entries: Vec<(&'static str, &'static str, String)>) -> Result<impl View> {
     Ok(view! {
         <ul class="flex flex-wrap gap-x-4 gap-y-1 text-xs">
             for (color, name, value) in entries {
@@ -343,20 +343,20 @@ async fn legend(entries: Vec<(&'static str, &'static str, String)>) -> Result<im
 }
 
 /// One series of a chart, colored with a `text-*` class.
-struct Line {
-    color: &'static str,
-    values: Vec<f64>,
+pub(super) struct Line {
+    pub(super) color: &'static str,
+    pub(super) values: Vec<f64>,
 }
 
 /// Where the kept samples fall on a chart's ten-minute axis. Until the history fills
 /// up, the samples take only its right end.
-struct Window {
+pub(super) struct Window {
     /// The axis position of the oldest sample.
     start: usize,
 }
 
 impl Window {
-    fn new(samples: usize) -> Self {
+    pub(super) fn new(samples: usize) -> Self {
         Self {
             start: HISTORY - samples.min(HISTORY),
         }
@@ -374,7 +374,7 @@ const PLOT_WIDTH: usize = HISTORY - 1;
 /// A line chart over the last ten minutes, with gridlines at `ticks` (top, middle and
 /// bottom). A single series gets a faint area under its line.
 #[component]
-async fn chart(
+pub(super) async fn chart(
     window: &Window,
     fields: &'static str,
     description: &'static str,
@@ -538,7 +538,7 @@ fn tooltip_data(samples: &[Sample], rates: &[Rates]) -> String {
 }
 
 /// The time of day on the server's clock, such as `18:24:32`.
-fn server_clock(at: SystemTime) -> String {
+pub(super) fn server_clock(at: SystemTime) -> String {
     jiff::Timestamp::try_from(at)
         .map(|timestamp| {
             timestamp
@@ -550,7 +550,7 @@ fn server_clock(at: SystemTime) -> String {
 }
 
 /// The share of `total` that `used` is, from 0 to 1.
-fn share(used: u64, total: u64) -> f64 {
+pub(super) fn share(used: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
     } else {
@@ -559,18 +559,18 @@ fn share(used: u64, total: u64) -> f64 {
 }
 
 /// Labels for the top, middle and bottom gridlines of an axis from 0 to `max`.
-fn thirds(max: f64, format: impl Fn(f64) -> String) -> [String; 3] {
+pub(super) fn thirds(max: f64, format: impl Fn(f64) -> String) -> [String; 3] {
     [format(max), format(max / 2.0), format(0.0)]
 }
 
-/// The smallest round rate at or above `rate`, so the axis tops out at 1, 2 or 5 of a
-/// unit. A quiet server still gets a 1 KiB/s axis.
-fn nice_rate_ceiling(rate: f64) -> f64 {
+/// The smallest round byte count at or above `bytes`, or rate at or above a rate, so
+/// the axis tops out at 1, 2 or 5 of a unit. A quiet server still gets a 1 KiB/s axis.
+pub(super) fn nice_bytes_ceiling(bytes: f64) -> f64 {
     let mut unit = 1024.0;
-    while rate / unit >= 1000.0 {
+    while bytes / unit >= 1000.0 {
         unit *= 1024.0;
     }
-    let scaled = (rate / unit).max(1.0);
+    let scaled = (bytes / unit).max(1.0);
     let magnitude = 10f64.powf(scaled.log10().floor());
     let step = [1.0, 2.0, 5.0, 10.0]
         .into_iter()
@@ -599,26 +599,32 @@ pub(super) fn format_bytes(bytes: u64) -> String {
 }
 
 /// Formats a rate in bytes per second, such as `1.20 MiB/s`.
-fn format_rate(bytes_per_second: f64) -> String {
+pub(super) fn format_rate(bytes_per_second: f64) -> String {
     format!("{}/s", format_bytes(bytes_per_second.round() as u64))
 }
 
 /// Formats a rate for an axis label, without trailing zeros: `2 MiB/s`.
-fn format_rate_tick(bytes_per_second: f64) -> String {
-    let formatted = format_bytes(bytes_per_second.round() as u64);
+pub(super) fn format_rate_tick(bytes_per_second: f64) -> String {
+    format!("{}/s", format_bytes_tick(bytes_per_second))
+}
+
+/// Formats a byte count for an axis label, without trailing zeros: `2 MiB`.
+pub(super) fn format_bytes_tick(bytes: f64) -> String {
+    let formatted = format_bytes(bytes.round() as u64);
     let (number, unit) = formatted.split_once(' ').unwrap_or((&formatted, ""));
     let number = if number.contains('.') {
         number.trim_end_matches('0').trim_end_matches('.')
     } else {
         number
     };
-    format!("{number} {unit}/s")
+    format!("{number} {unit}")
 }
 
 /// Formats an uptime in seconds by its largest unit: `3 days`, `5 hours`, `12 minutes`.
-fn format_duration(seconds: u64) -> String {
+pub(super) fn format_duration(seconds: u64) -> String {
     let (count, unit) = match seconds {
-        0..3600 => (seconds / 60, "minute"),
+        0..60 => (seconds, "second"),
+        60..3600 => (seconds / 60, "minute"),
         3600..86_400 => (seconds / 3600, "hour"),
         _ => (seconds / 86_400, "day"),
     };
