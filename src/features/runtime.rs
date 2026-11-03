@@ -306,8 +306,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Stops the service's process, if it runs: asks it to exit, and kills it if it has
-    /// not after [`STOP_TIMEOUT`]. Anything it started in its group stops with it.
+    /// Stops the service's process, if it runs: asks it and what it started in its group
+    /// to exit, and kills them if they have not after [`STOP_TIMEOUT`].
     pub async fn stop(&self, service_id: u64, files: &AppFiles) {
         let process = lock(&self.processes)
             .remove(&service_id)
@@ -319,7 +319,8 @@ impl Runtime {
         if let Some(mut process) = process {
             signal_group(process.pid, libc::SIGTERM);
             let deadline = Instant::now() + STOP_TIMEOUT;
-            while process.exited().is_none() {
+            // The app may exit before what it started, which goes on running in its group.
+            while process.exited().is_none() || group_is_alive(process.pid) {
                 if Instant::now() >= deadline {
                     signal_group(process.pid, libc::SIGKILL);
                     deadline_wait(&mut process).await;
@@ -375,8 +376,16 @@ impl Runtime {
                             continue;
                         }
                         Some(how) => {
+                            // What the app started would go on running beside the next
+                            // start, so it goes too, as in a container whose main process
+                            // exits.
+                            let pid = process.pid;
                             processes.remove(&service.id);
-                            Some(how)
+                            let left = group_is_alive(pid);
+                            if left {
+                                signal_group(pid, libc::SIGKILL);
+                            }
+                            Some((how, left))
                         }
                     },
                 }
@@ -385,10 +394,13 @@ impl Runtime {
                 continue;
             };
             let crash = crashes.entry(service.id).or_default();
-            if let Some(how) = exited {
+            if let Some((how, left)) = exited {
                 crash.count += 1;
                 let wait = backoff(crash.count);
                 crash.retry_at = Some(Instant::now() + wait);
+                if left {
+                    note(&launch.files, "Stopped the processes the app left running.");
+                }
                 note(
                     &launch.files,
                     &format!("The app exited ({how}). Starting it again in {}s.", wait.as_secs()),
@@ -492,6 +504,16 @@ fn is_alive(pid: u32) -> bool {
     };
     // SAFETY: signal 0 sends nothing; it only checks that the process exists.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Returns whether a process still runs in the group the app with this PID led.
+fn group_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only checks that the group has a process. A
+    // group's ID is not given to a new process while the group has one.
+    unsafe { libc::kill(-pid, 0) == 0 }
 }
 
 /// Sends `signal` to the process group the app leads.
