@@ -1,0 +1,53 @@
+# Builds oxploy for Linux when a version tag is pushed, and publishes it as a release:
+# the binary with the assets folder it loads, as oxploy-x86_64-linux.tar.gz.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    # An older Ubuntu, so the binary also runs where glibc is older than on the runner.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Check the tag against the version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+
+      # It writes the files the binary declares with `asset!`, which it loads at runtime.
+      - name: Install the Topcoat CLI
+        run: cargo install topcoat-cli --version 0.11.0 --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Bundle the assets
+        run: topcoat asset bundle --release
+
+      - name: Package
+        run: |
+          tar czf oxploy-x86_64-linux.tar.gz -C target/release oxploy assets
+          sha256sum oxploy-x86_64-linux.tar.gz > oxploy-x86_64-linux.tar.gz.sha256
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          oxploy-x86_64-linux.tar.gz oxploy-x86_64-linux.tar.gz.sha256
+          --title "oxploy $GITHUB_REF_NAME" --generate-notes

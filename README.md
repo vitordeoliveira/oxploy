@@ -61,6 +61,38 @@ only at `HOST` and `PORT`, `127.0.0.1:3000` by default. On macOS, `brew services
 caddy` needs a Caddyfile at `/opt/homebrew/etc/Caddyfile`, and one with only
 `{ admin localhost:2019 }` in it is enough.
 
+## Running on a server
+
+Each [release](https://github.com/vitordeoliveira/oxploy/releases) has
+`oxploy-x86_64-linux.tar.gz`: the binary and the `assets` folder it loads, built on Ubuntu
+22.04. Pushing a tag such as `v0.2.0` that matches the version in `Cargo.toml` builds and
+publishes one. The server also needs `git`, Rust and a C compiler to build the apps, and
+Caddy for their domains. To install or update:
+
+```sh
+mkdir -p /opt/oxploy /var/lib/oxploy
+curl -L https://github.com/vitordeoliveira/oxploy/releases/latest/download/oxploy-x86_64-linux.tar.gz | tar xz -C /opt/oxploy
+```
+
+Run it as a systemd service, as a user whose `PATH` has the Rust that builds the apps.
+`KillMode=process` keeps the apps running while oxploy stops or restarts:
+
+```ini
+[Service]
+User=oxploy
+WorkingDirectory=/var/lib/oxploy
+ExecStart=/opt/oxploy/oxploy
+Environment=DATABASE_URL=sqlite:/var/lib/oxploy/oxploy.db
+Environment=OXPLOY_DATA_DIR=/var/lib/oxploy/data
+Environment=PATH=/var/lib/oxploy/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+KillMode=process
+```
+
+The panel listens on `127.0.0.1:3000`. Until it has a domain, reach it through an SSH
+tunnel, such as `ssh -L 3001:127.0.0.1:3000 root@server`, and open
+`http://localhost:3001`: the sign-in cookie needs HTTPS anywhere but localhost.
+
 ## Project structure
 
 | Path | Contents |
