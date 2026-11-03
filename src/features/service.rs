@@ -66,6 +66,10 @@ pub struct Service {
     /// The file the build script leaves in `OXPLOY_OUTPUT_DIR`, which oxploy starts.
     pub script_binary: Option<String>,
 
+    /// A shell script that runs after each build, before the new release starts, such
+    /// as one that migrates the database.
+    pub after_build: Option<String>,
+
     /// The environment variables, written like a `.env` file, as the user wrote them.
     /// See [`environment`].
     pub environment: Option<String>,
@@ -175,6 +179,7 @@ impl Service {
             build_kind: None,
             build_script: None,
             script_binary: None,
+            after_build: None,
             environment: None,
             port: None,
             release_id: None,
@@ -277,6 +282,19 @@ impl Service {
             .script_binary(Some(binary.to_owned()))
             .exec(&mut db(cx))
             .await?;
+        Ok(true)
+    }
+
+    /// Sets the script that runs after each build. An empty one means none. Returns
+    /// `false`, changing nothing, if it is too long.
+    pub async fn set_after_build(&mut self, cx: &Cx, script: &str) -> Result<bool> {
+        let script = script.replace("\r\n", "\n");
+        let script = script.trim();
+        if script.len() > MAX_SCRIPT_LEN {
+            return Ok(false);
+        }
+        let script = (!script.is_empty()).then(|| script.to_owned());
+        self.update().after_build(script).exec(&mut db(cx)).await?;
         Ok(true)
     }
 

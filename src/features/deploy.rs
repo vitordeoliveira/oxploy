@@ -23,6 +23,7 @@ use topcoat::context::{Cx, app_context};
 
 use super::app_files::AppFiles;
 use super::deployment::{Deployment, DeploymentStatus};
+use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
 use super::github::GithubApp;
 use super::project::{Project, now};
 use super::runtime::{Launch, Readiness, Runtime, app_variables, system_env};
@@ -367,6 +368,9 @@ impl Deployer {
             .exec(&mut db)
             .await
             .map_err(saved)?;
+        if let Some(script) = &service.after_build {
+            run_after_build(&build, script, &binary, port, log).await?;
+        }
 
         // Start.
         deployment
@@ -612,6 +616,39 @@ async fn build_with_script(build: &Build<'_>, log: &mut DeployLog) -> Result<Str
     }
     log.line(&format!("Built {name}"));
     Ok(name.clone())
+}
+
+/// Runs the service's script after the build, before the new release starts, as the
+/// app will run: in the same folder, with the same variables, and with its binary on
+/// the `PATH`. The release that runs keeps running if it fails.
+async fn run_after_build(
+    build: &Build<'_>,
+    script: &str,
+    binary: &Path,
+    port: u64,
+    log: &mut DeployLog,
+) -> Result<(), String> {
+    let storage = build.files.storage();
+    fs::create_dir_all(&storage).map_err(|error| error.to_string())?;
+    let bin = binary.parent().unwrap_or(binary);
+    let path = match std::env::var("PATH") {
+        Ok(path) => format!("{}:{path}", bin.display()),
+        Err(_) => bin.display().to_string(),
+    };
+    log.step("Running the script after the build");
+    let mut shell = build.command("sh");
+    shell
+        .args(["-e", "-c", script])
+        .env("PATH", path)
+        .env(PORT_VARIABLE, port.to_string())
+        .env(STORAGE_VARIABLE, &storage);
+    let status = run_logged(shell, log, |line| Some(line.to_owned()))
+        .await
+        .map_err(|error| format!("the script after the build could not run: {error}"))?;
+    if !status.success() {
+        return Err(format!("the script after the build failed ({status})"));
+    }
+    Ok(())
 }
 
 /// A deployment's log file.

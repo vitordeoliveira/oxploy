@@ -42,7 +42,8 @@ runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`.
 running when the panel stops or restarts, and the panel takes them back when it starts.
 Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them
 elsewhere. Each app also gets a storage folder that deploys keep, in
-`OXPLOY_STORAGE_DIR`.
+`OXPLOY_STORAGE_DIR`, and can run a script after each build, before the new release
+starts, such as one that migrates its database.
 
 ## Project structure
 

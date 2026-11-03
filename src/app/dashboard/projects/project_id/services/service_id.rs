@@ -4,6 +4,7 @@
 mod general;
 mod history;
 mod output;
+mod process;
 pub mod tab;
 mod variables;
 
@@ -43,6 +44,7 @@ use crate::features::service::Service;
 use general::general_tab;
 use history::deployments_tab;
 use output::logs_tab;
+use process::advanced_tab;
 use tab::Tab;
 use variables::{Draft, environment_tab};
 
@@ -167,7 +169,7 @@ impl ServiceTab {
             Self::Schedules => "Commands that run on a schedule, like cron jobs.",
             Self::Patches => "Changes applied to the repository before each build.",
             Self::Advanced => {
-                "The port the app listens on, resource limits, volumes and the command that starts it."
+                "How oxploy runs the app, and what runs after each build."
             }
         }
     }
@@ -313,6 +315,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         }
                         ServiceTab::Logs => {
                             logs_tab(service: &service)
+                        }
+                        ServiceTab::Advanced => {
+                            advanced_tab(project: &project, service: &service, here: &return_to)
                         }
                         _ => {
                             empty_state(
