@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::databases::{self, ManagedDatabase};
 use super::deploy::Deployer;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
@@ -258,7 +259,8 @@ impl Service {
     ) -> Result<Result<(), EnvironmentError>> {
         let text = text.replace("\r\n", "\n");
         let text = text.trim();
-        if let Err(error) = environment::parse(text) {
+        let databases = ManagedDatabase::of_service(cx, self.id).await?;
+        if let Err(error) = environment::parse(text, &databases::set_elsewhere(&databases)) {
             return Ok(Err(error));
         }
         let text = (!text.is_empty()).then(|| text.to_owned());

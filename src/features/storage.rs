@@ -233,7 +233,7 @@ pub fn backup_file(files: &AppFiles, database: &str, name: &str) -> Option<PathB
 }
 
 /// Returns whether the file at `path` is a SQLite database.
-fn is_database(path: &Path) -> bool {
+pub fn is_database(path: &Path) -> bool {
     let mut header = [0; 16];
     File::open(path)
         .and_then(|mut file| file.read_exact(&mut header))
@@ -329,7 +329,7 @@ fn open(file: &Path) -> Result<Connection, StorageError> {
 }
 
 /// Returns a database file and the files SQLite keeps next to it, in that order.
-fn with_companions(file: &Path) -> Vec<PathBuf> {
+pub fn with_companions(file: &Path) -> Vec<PathBuf> {
     let mut files = vec![file.to_path_buf()];
     files.extend(COMPANIONS.iter().map(|suffix| {
         let mut name = file.as_os_str().to_owned();
@@ -341,7 +341,7 @@ fn with_companions(file: &Path) -> Vec<PathBuf> {
 
 /// Returns whether `path` is a relative path that stays inside the folder it is joined
 /// to: no `..`, no empty or hidden parts.
-fn is_relative_path(path: &str) -> bool {
+pub fn is_relative_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 255
         && !path.contains('\\')

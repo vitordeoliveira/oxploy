@@ -76,7 +76,7 @@ pub async fn advanced_tab(
                                 id=(&after_build_id)
                                 name="script"
                                 class="min-h-32 font-mono leading-relaxed"
-                                placeholder="ln -sf \"$OXPLOY_STORAGE_DIR/data.db\" data.db\nmy-app migrate"
+                                placeholder="my-app migrate"
                                 maxlength=(MAX_SCRIPT_LEN.to_string())
                                 spellcheck="false"
                                 autocomplete="off"
@@ -86,7 +86,7 @@ pub async fn advanced_tab(
                             (service.after_build.as_deref().unwrap_or(""))
                         )
                         field_description(
-                            "Runs with sh -e where the app runs, with its environment variables, PORT and OXPLOY_STORAGE_DIR, and with the new binary on the PATH. Leave it empty to run nothing."
+                            "Runs with sh -e where the app runs, once the databases from the Storage tab are linked, with the app's environment variables and the new binary on the PATH. Leave it empty to run nothing."
                         )
                     )
                     <div class="flex justify-end">

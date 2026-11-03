@@ -39,3 +39,8 @@ snapshot_name = "0006_snapshot.toml"
 id = 8261204654736442177
 name = "0007_add_after_build_scripts.sql"
 snapshot_name = "0007_snapshot.toml"
+
+[[migrations]]
+id = 231101900083877468
+name = "0008_add_managed_databases.sql"
+snapshot_name = "0008_snapshot.toml"

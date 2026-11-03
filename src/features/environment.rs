@@ -48,9 +48,19 @@ impl fmt::Display for EnvironmentError {
     }
 }
 
+/// A variable oxploy sets for the app besides [`PORT_VARIABLE`] and
+/// [`STORAGE_VARIABLE`], such as the one a database connects through. Lines may use it
+/// as `${NAME}` but not set it.
+pub struct SetElsewhere<'a> {
+    pub name: &'a str,
+    /// What sets it, to end "NAME is set by …".
+    pub by: String,
+}
+
 /// Reads variables written like a `.env` file. Blank lines and lines starting with `#`
 /// are skipped, a leading `export ` is allowed, and quotes around a value are removed.
-pub fn parse(text: &str) -> Result<Vec<Variable>, EnvironmentError> {
+/// `elsewhere` lists the other variables oxploy sets.
+pub fn parse(text: &str, elsewhere: &[SetElsewhere<'_>]) -> Result<Vec<Variable>, EnvironmentError> {
     if text.len() > MAX_LEN {
         return Err(EnvironmentError {
             line: 0,
@@ -89,12 +99,16 @@ pub fn parse(text: &str) -> Result<Vec<Variable>, EnvironmentError> {
                 "{key} starts with OXPLOY_, which is for the variables oxploy sets"
             )));
         }
+        if let Some(set) = elsewhere.iter().find(|set| set.name == key) {
+            return Err(problem(format!("{key} is set by {}", set.by)));
+        }
         let value = value.trim();
         let expands = !(value.len() >= 2 && value.starts_with('\'') && value.ends_with('\''));
         let value = unquote(value);
         if expands {
             for name in references(value).map_err(problem)? {
-                if !PROVIDED.contains(&name) && !lines_by_key.contains_key(name) {
+                let provided = PROVIDED.contains(&name) || elsewhere.iter().any(|set| set.name == name);
+                if !provided && !lines_by_key.contains_key(name) {
                     return Err(problem(format!(
                         "${{{name}}} is not set on an earlier line, and oxploy does not set it"
                     )));
@@ -171,7 +185,7 @@ fn expand(value: &str, known: &HashMap<String, String>) -> String {
 }
 
 /// Returns whether `key` can name an environment variable.
-fn is_key(key: &str) -> bool {
+pub fn is_key(key: &str) -> bool {
     let mut chars = key.chars();
     key.len() <= 128
         && chars
@@ -198,7 +212,7 @@ mod tests {
     use super::*;
 
     fn pairs(text: &str) -> Vec<(String, String)> {
-        parse(text)
+        parse(text, &[])
             .unwrap()
             .into_iter()
             .map(|variable| (variable.key, variable.value))
@@ -210,7 +224,7 @@ mod tests {
             (PORT_VARIABLE, "10000".to_owned()),
             (STORAGE_VARIABLE, "/srv/shop".to_owned()),
         ];
-        resolve(parse(text).unwrap(), &provided)
+        resolve(parse(text, &[]).unwrap(), &provided)
     }
 
     #[test]
@@ -229,12 +243,25 @@ mod tests {
 
     #[test]
     fn names_the_line_with_a_problem() {
-        let error = |text| parse(text).unwrap_err().to_string();
+        let error = |text| parse(text, &[]).unwrap_err().to_string();
         assert_eq!(error("A=1\njust text"), "Line 2: Write it as KEY=value");
         assert!(error("1A=x").starts_with("Line 1: \"1A\" is not a variable name"));
         assert_eq!(error("A=1\n\nA=2"), "Line 3: A is already set on line 1");
         assert!(error("PORT=8080").contains("oxploy sets PORT itself"));
         assert!(error("OXPLOY_STORAGE_DIR=/tmp").contains("starts with OXPLOY_"));
+    }
+
+    #[test]
+    fn uses_but_does_not_set_what_a_database_sets() {
+        let database = [SetElsewhere {
+            name: "DATABASE_URL",
+            by: "the database data.db in the Storage tab".to_owned(),
+        }];
+        assert!(parse("BACKUP_URL=${DATABASE_URL}", &database).is_ok());
+        assert_eq!(
+            parse("DATABASE_URL=sqlite:x.db", &database).unwrap_err().to_string(),
+            "Line 1: DATABASE_URL is set by the database data.db in the Storage tab"
+        );
     }
 
     #[test]
@@ -253,7 +280,7 @@ mod tests {
 
     #[test]
     fn refuses_names_it_cannot_fill() {
-        let error = |text| parse(text).unwrap_err().to_string();
+        let error = |text| parse(text, &[]).unwrap_err().to_string();
         assert_eq!(
             error("A=${LATER}\nLATER=1"),
             "Line 1: ${LATER} is not set on an earlier line, and oxploy does not set it"

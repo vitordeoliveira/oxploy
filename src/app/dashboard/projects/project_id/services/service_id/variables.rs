@@ -12,6 +12,7 @@ use super::settings_card;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::field::{field, field_description, field_error, field_label};
 use crate::components::textarea::textarea;
+use crate::features::databases::{self, ManagedDatabase};
 use crate::features::environment::{self, MAX_LEN};
 use crate::features::service::Service;
 
@@ -32,7 +33,13 @@ pub async fn environment_tab(
     draft: Option<&Draft>,
 ) -> Result<impl View> {
     let saved = service.environment.as_deref().unwrap_or("");
-    let count = environment::parse(saved).map_or(0, |variables| variables.len());
+    let managed = ManagedDatabase::of_service(cx, service.id).await?;
+    let count = environment::parse(saved, &databases::set_elsewhere(&managed))
+        .map_or(0, |variables| variables.len());
+    let set_by_databases: Vec<_> = managed
+        .iter()
+        .filter_map(|database| Some((database.variable.clone()?, database.file.clone())))
+        .collect();
     let count = match count {
         1 => "1 variable".to_owned(),
         count => format!("{count} variables"),
@@ -47,6 +54,20 @@ pub async fn environment_tab(
         settings_card(
             title: "Environment variables",
             text: "Passed to cargo while it builds and to the binary when it runs. The app reads the ones it needs.",
+            if !set_by_databases.is_empty() {
+                <div class="flex flex-col gap-2 rounded-lg bg-muted px-4 py-3 text-sm">
+                    <span class="font-medium">"Set by oxploy"</span>
+                    <ul class="flex flex-col gap-1">
+                        #[key(name.clone())]
+                        for (name, file) in &set_by_databases {
+                            <li class="flex flex-wrap items-center gap-x-2">
+                                <code class="font-mono">(name)</code>
+                                <span class="text-muted-foreground">"to the database " <span class="font-mono">(file)</span> ", in the Storage tab"</span>
+                            </li>
+                        }
+                    </ul>
+                </div>
+            }
             <form method="post" action=(here) class="flex flex-col gap-4">
                 field(
                     <div class="flex items-center justify-between gap-2">

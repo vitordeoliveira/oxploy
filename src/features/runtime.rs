@@ -21,6 +21,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 use toasty::Db;
 
 use super::app_files::AppFiles;
+use super::databases::{self, ManagedDatabase};
 use super::deployment::Deployment;
 use super::environment::{self, PORT_VARIABLE, STORAGE_VARIABLE};
 use super::service::Service;
@@ -51,6 +52,8 @@ pub struct Launch {
     pub work_dir: PathBuf,
     pub port: u64,
     pub variables: Vec<(String, String)>,
+    /// The databases oxploy manages for the service, linked into the release at start.
+    pub databases: Vec<ManagedDatabase>,
 }
 
 impl Launch {
@@ -75,7 +78,8 @@ impl Launch {
             Some(path) => source.join(path),
             None => source,
         };
-        let variables = app_variables(service, &files, port);
+        let databases = ManagedDatabase::of_service_in(db, service.id).await?;
+        let variables = app_variables(service, &files, port, &databases);
         Ok(Some(Launch {
             service_id: service.id,
             binary: files.binary(release_id, binary),
@@ -84,6 +88,7 @@ impl Launch {
             work_dir,
             port,
             variables,
+            databases,
         }))
     }
 }
@@ -200,6 +205,10 @@ impl Runtime {
         }
         let storage = launch.files.storage();
         fs::create_dir_all(&storage)?;
+        // Databases added since the deploy get their links now.
+        if let Err(error) = databases::link_all(&launch.work_dir, &launch.files, &launch.databases) {
+            note(&launch.files, &format!("The databases could not be linked: {error}"));
+        }
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -364,17 +373,30 @@ impl Runtime {
     }
 }
 
-/// The service's variables as its app and builds get them, with each `${NAME}` filled
-/// in from what oxploy sets for the app or from an earlier line.
-pub fn app_variables(service: &Service, files: &AppFiles, port: u64) -> Vec<(String, String)> {
+/// The service's variables as its app and builds get them: those its databases set,
+/// then its own, with each `${NAME}` filled in from what oxploy sets for the app or
+/// from an earlier line.
+pub fn app_variables(
+    service: &Service,
+    files: &AppFiles,
+    port: u64,
+    managed: &[ManagedDatabase],
+) -> Vec<(String, String)> {
     // Saved variables always parse: a problem is refused when saving.
-    let variables =
-        environment::parse(service.environment.as_deref().unwrap_or("")).unwrap_or_default();
-    let provided = [
+    let own = environment::parse(
+        service.environment.as_deref().unwrap_or(""),
+        &databases::set_elsewhere(managed),
+    )
+    .unwrap_or_default();
+    let set_by_databases = databases::variables(managed, files);
+    let mut provided = vec![
         (PORT_VARIABLE, port.to_string()),
         (STORAGE_VARIABLE, files.storage().display().to_string()),
     ];
-    environment::resolve(variables, &provided)
+    provided.extend(set_by_databases.iter().map(|(name, value)| (name.as_str(), value.clone())));
+    let mut variables = set_by_databases.clone();
+    variables.extend(environment::resolve(own, &provided));
+    variables
 }
 
 /// The variables of the panel's own environment that programs need, such as `PATH`.

@@ -43,7 +43,9 @@ running when the panel stops or restarts, and the panel takes them back when it 
 Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them
 elsewhere. Each app also gets a storage folder that deploys keep, in
 `OXPLOY_STORAGE_DIR`, and can run a script after each build, before the new release
-starts, such as one that migrates its database.
+starts, such as one that migrates its database. The Storage tab adds SQLite databases
+there and connects them to the app through a variable, a link in each release, or
+both, and backs them up and restores them.
 
 ## Project structure
 

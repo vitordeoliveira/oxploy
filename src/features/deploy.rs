@@ -22,6 +22,7 @@ use toasty::Db;
 use topcoat::context::{Cx, app_context};
 
 use super::app_files::AppFiles;
+use super::databases::{self, ManagedDatabase};
 use super::deployment::{Deployment, DeploymentStatus};
 use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
 use super::github::GithubApp;
@@ -209,36 +210,87 @@ impl Deployer {
         database: &str,
         backup: &str,
     ) -> toasty::Result<Result<(), String>> {
+        let (database, backup) = (database.to_owned(), backup.to_owned());
+        self.with_app_stopped(service, move |files| {
+            // The database being replaced is kept, unless there is none yet.
+            if storage::database_file(files, &database).is_some_and(|file| file.is_file()) {
+                storage::back_up(files, &database, "-before-restore")?;
+            }
+            storage::restore(files, &database, &backup)
+        })
+        .await
+    }
+
+    /// Deletes a database oxploy manages, after backing it up: stops managing it, stops
+    /// the service, deletes the file and its link in the running release, and starts
+    /// the service again if it should run.
+    pub async fn delete_database(
+        &self,
+        service: &Service,
+        database: ManagedDatabase,
+    ) -> toasty::Result<Result<(), String>> {
+        let managed = ManagedDatabase::of_service_in(&self.db, service.id).await?;
+        if let Some(problem) = databases::still_used(service, &managed, &database) {
+            return Ok(Err(problem));
+        }
+        let (file, link) = (database.file.clone(), database.link.clone());
+        // The link goes from the release that runs, or SQLite would make a new, empty
+        // database through it.
+        let work_dir = match Launch::of(&self.db, service).await? {
+            Some(launch) => Some(launch.work_dir),
+            None => None,
+        };
+        // Unmanaged first, so the start that follows makes no link to it.
+        ManagedDatabase::filter_by_id(database.id)
+            .delete()
+            .exec(&mut self.db.clone())
+            .await?;
+        self.with_app_stopped(service, move |files| {
+            if storage::database_file(files, &file).is_some_and(|path| path.is_file()) {
+                storage::back_up(files, &file, "-before-delete")?;
+            }
+            if let Some(path) = storage::database_file(files, &file) {
+                for path in storage::with_companions(&path) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+            if let (Some(work_dir), Some(link)) = (&work_dir, &link) {
+                let _ = fs::remove_file(work_dir.join(link));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stops the service while `change` works on its files, then starts it again if it
+    /// should run. Returns what went wrong instead, such as a deployment in progress.
+    async fn with_app_stopped<T: Send + 'static>(
+        &self,
+        service: &Service,
+        change: impl FnOnce(&AppFiles) -> Result<T, storage::StorageError> + Send + 'static,
+    ) -> toasty::Result<Result<T, String>> {
         if self.is_deploying(service.id) {
-            return Ok(Err("a deployment is in progress; restore once it ends".to_owned()));
+            return Ok(Err("a deployment is in progress; try again once it ends".to_owned()));
         }
         let files = AppFiles::of(&service.app_name);
         let _hold = self.runtime.hold(service.id);
         self.runtime.stop(service.id, &files).await;
-        let (database, backup) = (database.to_owned(), backup.to_owned());
-        let restore = {
+        let changed = tokio::task::spawn_blocking({
             let files = files.clone();
-            move || {
-                // The database being replaced is kept, unless there is none yet.
-                if storage::database_file(&files, &database).is_some_and(|file| file.is_file()) {
-                    storage::back_up(&files, &database, "-before-restore")?;
-                }
-                storage::restore(&files, &database, &backup)
-            }
-        };
-        let restored = tokio::task::spawn_blocking(restore)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|restored| restored.map_err(|error| error.to_string()));
-        // Started again either way: a failed restore leaves the old database in place.
+            move || change(&files)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|changed| changed.map_err(|error| error.to_string()));
+        // Started again either way: a failed change leaves the files as they were.
         if service.release_id.is_some()
             && service.stopped_at.is_none()
             && let Some(launch) = Launch::of(&self.db, service).await?
             && let Err(error) = self.runtime.start(&launch)
         {
-            eprintln!("oxploy: could not start {} after a restore: {error}", service.app_name);
+            eprintln!("oxploy: could not start {} again: {error}", service.app_name);
         }
-        Ok(restored)
+        Ok(changed)
     }
 
     /// Stops the service and deletes its deployments and files, before the service
@@ -251,6 +303,7 @@ impl Deployer {
             .delete()
             .exec(&mut self.db.clone())
             .await?;
+        ManagedDatabase::disconnect_all(&self.db, service.id).await?;
         let _ = fs::remove_dir_all(files.root());
         Ok(())
     }
@@ -390,7 +443,10 @@ impl Deployer {
             Some(port) => port,
             None => self.assign_port(service).await?,
         };
-        let variables = app_variables(service, files, port);
+        let databases = ManagedDatabase::of_service_in(&self.db, service.id)
+            .await
+            .map_err(saved)?;
+        let variables = app_variables(service, files, port, &databases);
         let build = Build {
             service,
             files,
@@ -410,6 +466,11 @@ impl Deployer {
             .exec(&mut db)
             .await
             .map_err(saved)?;
+        let linked = databases::link_all(&work_dir, files, &databases)
+            .map_err(|error| format!("the databases could not be linked: {error}"))?;
+        for link in linked {
+            log.line(&format!("Linked {link} to the storage"));
+        }
         if let Some(script) = &service.after_build {
             run_after_build(&build, script, &binary, port, log).await?;
         }
@@ -436,6 +497,7 @@ impl Deployer {
             work_dir,
             port,
             variables,
+            databases,
         };
         let _hold = self.runtime.hold(service.id);
         let previous = match service.stopped_at {

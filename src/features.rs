@@ -2,6 +2,7 @@
 //! data and business rules, for the pages in `app` to use.
 
 pub mod app_files;
+pub mod databases;
 pub mod deploy;
 pub mod deployment;
 pub mod environment;
