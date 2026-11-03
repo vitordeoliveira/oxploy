@@ -34,3 +34,31 @@ Abriria espaço para opções próprias do Topcoat, como servir os assets de um 
 
 - se a aba "Cargo" continua gerando o bundle sozinha, ou só avisa que o app parece Topcoat;
 - como ela se relaciona com o suporte a qualquer versão, acima.
+
+## Monitoring
+
+### Tráfego de rede por app
+
+**Problema.** A aba Monitoring de cada serviço mostra CPU, memória e disco, mas não rede.
+Rodando direto na máquina, o app usa a rede da própria máquina, e o sistema conta bytes por
+interface, não por processo. O Docker consegue contar por container porque cada um tem a
+sua própria interface. A página Monitoring do servidor mostra a rede, mas da máquina inteira.
+
+**Objetivo.** Ver, por app, quanto tráfego ele recebe e envia, e de preferência como as
+requisições vão: quantas, quantas com erro e em quanto tempo respondem.
+
+**Caminhos já discutidos:**
+
+- **Pelo Caddy (o preferido).** Quando os domínios entrarem, todo o tráfego de um app passa
+  pelo Caddy, que já mede por host: requisições, bytes, status e latência. O oxploy lê isso
+  e mostra na aba. Para um app web, é mais útil do que bytes de rede. Fica de fora o
+  tráfego que o app faz por conta própria, como chamar uma API externa ou um banco remoto.
+- **Isolar cada app no Linux** (network namespace, cgroups ou eBPF). Dá números exatos,
+  incluindo o tráfego de saída, mas é bem mais trabalho, só funciona no Linux e, no fundo,
+  reconstrói parte do Docker.
+
+**A decidir:**
+
+- se os números do Caddy entram na mesma aba Monitoring ou numa aba própria, junto dos
+  domínios;
+- quanto tempo de histórico guardar, já que hoje tudo fica só 10 minutos em memória.
