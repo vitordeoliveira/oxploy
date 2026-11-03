@@ -498,10 +498,20 @@ fn running_from(files: &AppFiles) -> Option<(u32, u64)> {
 }
 
 /// Returns whether a process with this PID exists.
+///
+/// An app the panel started before an update ran the new version in its place is still
+/// its child. Once such an app exits, it is reaped here, or it would stay a zombie,
+/// which still exists.
 fn is_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
+    let mut status = 0;
+    // SAFETY: `WNOHANG` returns at once, and a process that is not a child of the panel
+    // only gets an error back.
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+        return false;
+    }
     // SAFETY: signal 0 sends nothing; it only checks that the process exists.
     unsafe { libc::kill(pid, 0) == 0 }
 }

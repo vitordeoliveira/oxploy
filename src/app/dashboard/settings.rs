@@ -1,5 +1,5 @@
 //! Settings of the whole server, which only its super admin sees: the panel's own
-//! domain, and the Caddy that serves it and the apps.
+//! domain, the Caddy that serves it and the apps, and the version of oxploy.
 
 use serde::Deserialize;
 use topcoat::{
@@ -17,6 +17,7 @@ use topcoat::{
 
 use super::proxy::{caddy_notice, resolution_label};
 use super::require_server_owner;
+use super::update::{update_dialog, version_card};
 use crate::app::dashboard::projects::project_id::services::service_id::settings_card;
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
@@ -40,6 +41,8 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
         .collect();
     let removing = signal(cx, || false);
     let open_removing = removing.clone();
+    let updating = signal(cx, || false);
+    let here = href!(page).resolve(cx);
     let host_id = element_id(cx);
     let set_url = href!(set_domain).resolve(cx);
     let remove_url = href!(remove_domain).resolve(cx);
@@ -138,7 +141,9 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
                     "Change them with OXPLOY_CADDY_ADMIN, OXPLOY_HTTP_PORT and OXPLOY_HTTPS_PORT. The Caddy belongs to oxploy, which replaces its whole configuration."
                 )
             )
+            version_card(open: &updating, return_to: &here)
         </div>
+        update_dialog(open: updating.clone(), return_to: here.clone())
         if let Some(panel) = &panel {
             remove_dialog(open: &removing, host: &panel.host, panel: &ports.panel, action: &remove_url)
         }

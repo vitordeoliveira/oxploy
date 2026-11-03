@@ -6,6 +6,7 @@ mod organizations;
 pub mod projects;
 mod proxy;
 pub mod settings;
+mod update;
 
 use topcoat::{
     Result,
@@ -31,8 +32,10 @@ use crate::components::sidebar::{
 };
 use crate::features::organization::Organization;
 use crate::features::session::{SignedIn, UserSession};
+use crate::features::update::{Updater, VERSION};
 use crate::features::user::{Role, User};
 use organizations::{OrganizationMenu, organization_dialogs, organization_switcher};
+use update::{update_button, update_dialog};
 
 /// Returns who is signed in, or sends the browser to sign in.
 ///
@@ -103,6 +106,12 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let settings_url = href!(settings::page).resolve(cx);
     // Pages about the whole server are only for the user who owns it.
     let owns_server = signed_in.user.role == Role::SuperAdmin;
+    // The update dialog, open while an update installs, as after starting one.
+    let updating = signal(cx, || owns_server && Updater::get(cx).is_installing());
+    let return_to = uri(cx)
+        .path_and_query()
+        .map_or_else(|| uri(cx).path().to_owned(), ToString::to_string);
+    let version_url = update::version_url(cx);
     let path = uri(cx).path();
     let within = |section: &str| path == section || path.starts_with(&format!("{section}/"));
     let in_monitoring = within(&monitoring_url);
@@ -207,7 +216,12 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                         )
                     }
                 )
-                sidebar_footer(account(user: &signed_in.user))
+                sidebar_footer(
+                    if owns_server {
+                        update_button(open: updating.clone())
+                    }
+                    account(user: &signed_in.user, version_url: &version_url)
+                )
                 sidebar_rail(open: $(open.get()), attrs: attributes! { @click=$(|_e: Event| open.toggle()) })
             )
             sidebar_inset(
@@ -256,12 +270,16 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
             )
         )
         organization_dialogs(menu: &menu)
+        if owns_server {
+            update_dialog(open: updating.clone(), return_to: return_to)
+            <script type="module" src=(asset!("assets/update.js"))></script>
+        }
     })
 }
 
-/// The signed-in user and a button to sign out.
+/// The signed-in user and a button to sign out, over the version the panel runs.
 #[component]
-async fn account(user: &User) -> Result<impl View> {
+async fn account(user: &User, version_url: &str) -> Result<impl View> {
     let initials: String = [&user.first_name, &user.last_name]
         .iter()
         .filter_map(|name| name.chars().next())
@@ -292,8 +310,14 @@ async fn account(user: &User) -> Result<impl View> {
                 )
             </form>
         </div>
-        <p class="px-2 text-[11px] text-muted-foreground md:group-data-[collapsible=icon]/sidebar:hidden">
-            "oxploy v" (env!("CARGO_PKG_VERSION"))
+        // `update.js` compares the version that rendered the page with the one at
+        // `version_url`, to reload the page after an update.
+        <p
+            class="px-2 text-[11px] text-muted-foreground md:group-data-[collapsible=icon]/sidebar:hidden"
+            data-panel-version=(VERSION)
+            data-version-url=(version_url)
+        >
+            "oxploy v" (VERSION)
         </p>
     })
 }

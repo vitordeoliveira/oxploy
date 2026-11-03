@@ -143,6 +143,11 @@ impl Deployer {
         lock(&self.deploying).contains(&service_id)
     }
 
+    /// How many deployments are queued or in progress.
+    pub fn deploying(&self) -> usize {
+        lock(&self.deploying).len()
+    }
+
     /// The recent usage of each app.
     pub fn usage(&self) -> &Usage {
         self.runtime.usage()

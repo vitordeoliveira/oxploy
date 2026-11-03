@@ -17,5 +17,6 @@ pub mod service;
 pub mod session;
 pub mod setup_code;
 pub mod storage;
+pub mod update;
 pub mod usage;
 pub mod user;

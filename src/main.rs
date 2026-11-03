@@ -7,6 +7,12 @@ mod features;
 
 #[tokio::main]
 async fn main() {
+    // An update runs `oxploy --version` to check the binary it downloaded.
+    if std::env::args().nth(1).is_some_and(|arg| arg == "--version") {
+        println!("oxploy {}", features::update::VERSION);
+        return;
+    }
+
     let db = db::connect().await.unwrap();
 
     // `cargo run -- toasty migration <command>` manages the database schema.
@@ -36,6 +42,8 @@ async fn main() {
     let setup_code = features::setup_code::SetupCode::start(&db, &open_at)
         .await
         .unwrap();
+    // Looks for a newer release, which the super admin can install from the panel.
+    let updater = features::update::Updater::start();
     topcoat::start(
         app::router()
             .app_context(db)
@@ -43,6 +51,7 @@ async fn main() {
             .app_context(deployer)
             .app_context(caddy)
             .app_context(setup_code)
+            .app_context(updater)
             .build(),
     )
     .await

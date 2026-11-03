@@ -280,7 +280,7 @@ async fn deploy_status(status: AppStatus) -> Result<impl View> {
 
 /// How long ago a moment was, such as `3 days ago`, with the exact time on hover.
 #[component]
-async fn created_at(seconds: i64) -> Result<impl View> {
+pub(super) async fn created_at(seconds: i64) -> Result<impl View> {
     let moment = jiff::Timestamp::from_second(seconds).unwrap_or_default();
     let elapsed = (jiff::Timestamp::now().as_second() - seconds).max(0);
     let (count, unit) = match elapsed {

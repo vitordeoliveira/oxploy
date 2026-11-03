@@ -73,11 +73,13 @@ Each [release](https://github.com/vitordeoliveira/oxploy/releases) has
 `oxploy-x86_64-linux.tar.gz`: the binary and the `assets` folder it loads, built on Ubuntu
 22.04. Pushing a tag such as `v0.2.0` that matches the version in `Cargo.toml` builds and
 publishes one. The server also needs `git`, Rust and a C compiler to build the apps, and
-Caddy for their domains. To install or update:
+Caddy for their domains. To install, giving the folders to the user the service below
+runs as, so that the panel can update itself:
 
 ```sh
 mkdir -p /opt/oxploy /var/lib/oxploy
 curl -L https://github.com/vitordeoliveira/oxploy/releases/latest/download/oxploy-x86_64-linux.tar.gz | tar xz -C /opt/oxploy
+chown -R oxploy: /opt/oxploy /var/lib/oxploy
 ```
 
 Run it as a systemd service, as a user whose `PATH` has the Rust that builds the apps.
@@ -102,6 +104,15 @@ warn about, if that fails. Behind NAT, where the machine does not see its public
 set `OXPLOY_PUBLIC_IP`. On the first run, oxploy writes a setup code to its log and to
 `setup-code` in its data folder, such as `/var/lib/oxploy/data/setup-code`: creating the
 super admin asks for it, so whoever opens the address first cannot take the server.
+
+oxploy looks for a new release on GitHub every hour, and shows the super admin **Update
+available** at the foot of the sidebar once one is out; **Settings** checks on demand.
+Updating downloads the release's build, checks it against its checksum and that it runs on
+the machine, and puts it in place of the binary and the `assets` folder, which it keeps in
+`previous` beside them. Then the panel restarts on it, with the same process ID, once the
+deployments in progress finish. The apps keep running. It needs the panel's user to own the
+folder it is installed in. To go back, stop oxploy, move `previous/oxploy` and
+`previous/assets` back in place, and start it.
 
 ## Project structure
 
