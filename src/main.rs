@@ -20,10 +20,12 @@ async fn main() {
     }
 
     let monitor = features::monitoring::Monitor::start().unwrap();
-    // Takes back the apps a previous run started, and starts the ones that should run.
-    let deployer = features::deploy::Deployer::start(db.clone()).await.unwrap();
     // Keeps Caddy's routes to the apps in step with their domains.
     let caddy = features::caddy::Caddy::start(db.clone());
+    // Takes back the apps a previous run started, and starts the ones that should run.
+    let deployer = features::deploy::Deployer::start(db.clone(), caddy.clone())
+        .await
+        .unwrap();
     // Until the super admin exists, creating it asks for a code from the log.
     let open_at = caddy
         .ports()

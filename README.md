@@ -56,10 +56,16 @@ oxploy builds every route from the database and loads them through Caddy's admin
 `127.0.0.1:2019` unless `OXPLOY_CADDY_ADMIN` says otherwise, and loads them again whenever
 Caddy loses them, as after a restart. Caddy serves ports 80 and 443 (`OXPLOY_HTTP_PORT` and
 `OXPLOY_HTTPS_PORT` change them) and gets each domain's certificate from Let's Encrypt.
-The panel itself gets a domain under **Settings**, always over HTTPS; until then it answers
-only at `HOST` and `PORT`, `127.0.0.1:3000` by default. On macOS, `brew services start
-caddy` needs a Caddyfile at `/opt/homebrew/etc/Caddyfile`, and one with only
-`{ admin localhost:2019 }` in it is enough.
+A service without a domain the first time it goes live gets one at the server's public
+IPv4 address through [sslip.io](https://sslip.io), such as
+`shop-api.203-0-113-7.sslip.io`, over HTTPS, so it opens without a DNS record. oxploy
+gives it only that once, so deleting it is for good. Let's Encrypt's limits for sslip.io
+are shared by everyone who uses it; if a certificate does not come, switch the domain to
+plain HTTP or add one of your own. The panel itself gets a domain under **Settings**,
+always over HTTPS; until then it answers only at `HOST` and `PORT`, `127.0.0.1:3000` by
+default. On macOS, `brew services start caddy` needs a Caddyfile at
+`/opt/homebrew/etc/Caddyfile`, and one with only `{ admin localhost:2019 }` in it is
+enough.
 
 ## Running on a server
 

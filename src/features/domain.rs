@@ -2,7 +2,7 @@
 //! to the app; see [`caddy`](super::caddy).
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use sysinfo::Networks;
@@ -75,6 +75,9 @@ const MAX_PATH_LEN: usize = 255;
 /// How long looking up a domain may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// The DNS service that generated domains go under.
+const GENERATED_DOMAIN: &str = "sslip.io";
+
 impl Domain {
     /// Returns the service's domains, oldest first.
     pub async fn of_service(cx: &Cx, service_id: u64) -> Result<Vec<Domain>> {
@@ -98,14 +101,37 @@ impl Domain {
     /// Adds a domain to the service. Returns what is wrong instead, if a field is
     /// invalid or another domain already takes the address.
     pub async fn add(cx: &Cx, service: &Service, new: &NewDomain<'_>) -> Result<Result<Domain, String>> {
-        let others = Self::all_in(&db(cx)).await?;
-        let panel = PanelDomain::get_in(&db(cx)).await?;
+        Ok(Self::add_in(&db(cx), service.id, new).await?)
+    }
+
+    /// Gives the service a domain at `address` through sslip.io, over HTTPS, such as
+    /// `shop-api.203-0-113-7.sslip.io`, so the app opens without a domain of the
+    /// user's. Returns what is wrong instead, if another domain already takes it.
+    pub async fn add_generated(
+        db: &Db,
+        service: &Service,
+        address: Ipv4Addr,
+    ) -> toasty::Result<Result<Domain, String>> {
+        let host = generated_host(&service.app_name, address);
+        let new = NewDomain {
+            host: &host,
+            path: "",
+            strip_path: false,
+            https: true,
+            redirect_www: false,
+        };
+        Self::add_in(db, service.id, &new).await
+    }
+
+    async fn add_in(db: &Db, service_id: u64, new: &NewDomain<'_>) -> toasty::Result<Result<Domain, String>> {
+        let others = Self::all_in(db).await?;
+        let panel = PanelDomain::get_in(db).await?;
         let checked = match check(new, &others, panel.as_ref().map(|panel| panel.host.as_str())) {
             Ok(checked) => checked,
             Err(problem) => return Ok(Err(problem)),
         };
         let domain = toasty::create!(Domain {
-            service_id: service.id,
+            service_id,
             host: checked.host,
             path: checked.path,
             strip_path: checked.strip_path,
@@ -113,9 +139,18 @@ impl Domain {
             redirect_www: checked.redirect_www,
             created_at: now(),
         })
-        .exec(&mut db(cx))
+        .exec(&mut db.clone())
         .await?;
         Ok(Ok(domain))
+    }
+
+    /// Whether the service has any domain.
+    pub async fn any_of_service(db: &Db, service_id: u64) -> toasty::Result<bool> {
+        let first = Domain::filter_by_service_id(service_id)
+            .first()
+            .exec(&mut db.clone())
+            .await?;
+        Ok(first.is_some())
     }
 
     /// Changes the domain. Returns what is wrong instead, as [`add`](Self::add) does.
@@ -375,6 +410,26 @@ pub fn is_reachable(address: &IpAddr) -> bool {
         && !is_link_local(address)
 }
 
+/// The address a generated domain points to: the first of the server's public
+/// addresses that is an IPv4 one the internet reaches, so Let's Encrypt can certify
+/// the domain. `None` when there is none, as on a laptop or behind NAT without
+/// `OXPLOY_PUBLIC_IP`.
+pub fn generated_address(public_ips: &[IpAddr]) -> Option<Ipv4Addr> {
+    public_ips.iter().find_map(|address| match address {
+        IpAddr::V4(v4) if is_reachable(address) => Some(*v4),
+        _ => None,
+    })
+}
+
+/// The hostname of the app's generated domain at `address`, such as
+/// `shop-api.203-0-113-7.sslip.io`. sslip.io answers any name under it with the
+/// address it carries, so it points to the server without a DNS record. App names
+/// are already valid DNS labels.
+pub fn generated_host(app_name: &str, address: Ipv4Addr) -> String {
+    let [a, b, c, d] = address.octets();
+    format!("{app_name}.{a}-{b}-{c}-{d}.{GENERATED_DOMAIN}")
+}
+
 /// The addresses a domain should point to: this machine's public ones, or the others
 /// when it has none, as on a local network.
 pub fn addresses_to_point_at() -> Vec<IpAddr> {
@@ -442,6 +497,21 @@ mod tests {
         for address in ["127.0.0.1", "10.0.0.5", "192.168.1.2", "100.64.0.1", "169.254.1.1", "203.0.113.7", "0.0.0.0", "fd00::1", "::1"] {
             assert!(!is_reachable(&address.parse().unwrap()), "{address}");
         }
+    }
+
+    #[test]
+    fn generated_domains_carry_the_public_ipv4_address() {
+        let addresses: Vec<IpAddr> = ["10.0.0.5", "2606:4700::1", "203.0.114.7", "8.8.8.8"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let address = generated_address(&addresses).unwrap();
+        assert_eq!(address, Ipv4Addr::new(203, 0, 114, 7));
+        let host = generated_host("shop-api", address);
+        assert_eq!(host, "shop-api.203-0-114-7.sslip.io");
+        assert_eq!(normalize_host(&host), Some(host.clone()));
+        assert_eq!(generated_address(&["10.0.0.5".parse().unwrap(), "::1".parse().unwrap()]), None);
+        assert_eq!(generated_address(&[]), None);
     }
 
     #[test]

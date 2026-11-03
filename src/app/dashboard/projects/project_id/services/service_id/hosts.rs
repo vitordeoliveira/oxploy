@@ -42,6 +42,10 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
         .iter()
         .map(ToString::to_string)
         .collect();
+    // The domain the next deployment gives the app, if it would give one.
+    let generated = domain::generated_address(&caddy.ports().public_ips)
+        .filter(|_| service.domain_offered_at.is_none())
+        .map(|address| domain::generated_host(&service.app_name, address));
     let adding = signal(cx, || false);
     let open_adding = adding.clone();
     // Keyed by domain, so each one gets dialogs of its own.
@@ -84,7 +88,13 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
                 </div>
                 if domains.is_empty() {
                     <p class="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                        "No domain yet. Without one, the app answers only on 127.0.0.1, on this machine."
+                        if let Some(host) = &generated {
+                            "No domain yet. The next deployment gives the app "
+                            <span class="font-mono break-all text-foreground">(host)</span>
+                            ", which points to this server through sslip.io, unless it has a domain by then."
+                        } else {
+                            "No domain yet. Without one, the app answers only on 127.0.0.1, on this machine."
+                        }
                     </p>
                 } else {
                     <ul class="divide-y divide-border rounded-lg border border-border">

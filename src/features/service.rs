@@ -87,6 +87,12 @@ pub struct Service {
     /// When the user stopped the app, in seconds since the Unix epoch. `None` while it
     /// should run.
     pub stopped_at: Option<i64>,
+
+    /// When oxploy decided whether the app needed a domain at the server's address, in
+    /// seconds since the Unix epoch: the first time it went live while the server had
+    /// a public address. It gives one only if the service had no domain then, and only
+    /// that once, so a domain the user removes stays removed.
+    pub domain_offered_at: Option<i64>,
 }
 
 /// How a service is built.
@@ -187,6 +193,7 @@ impl Service {
             port: None,
             release_id: None,
             stopped_at: None,
+            domain_offered_at: None,
         })
         .exec(&mut db(cx))
         .await?;

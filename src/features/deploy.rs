@@ -22,8 +22,10 @@ use toasty::Db;
 use topcoat::context::{Cx, app_context};
 
 use super::app_files::AppFiles;
+use super::caddy::Caddy;
 use super::databases::{self, ManagedDatabase};
 use super::deployment::{Deployment, DeploymentStatus};
+use super::domain::{self, Domain};
 use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
 use super::github::GithubApp;
 use super::project::{Project, now};
@@ -71,6 +73,7 @@ pub enum Refusal {
 #[derive(Clone)]
 pub struct Deployer {
     db: Db,
+    caddy: Caddy,
     runtime: Arc<Runtime>,
     builds: Arc<Semaphore>,
     /// The services with a deployment in progress.
@@ -79,8 +82,9 @@ pub struct Deployer {
 
 impl Deployer {
     /// Marks the deployments a previous run of the panel left unfinished as failed,
-    /// then starts watching the apps that should run.
-    pub async fn start(db: Db) -> toasty::Result<Deployer> {
+    /// then starts watching the apps that should run. A release that goes live tells
+    /// `caddy`, so its domains reach it right away.
+    pub async fn start(db: Db, caddy: Caddy) -> toasty::Result<Deployer> {
         for status in [DeploymentStatus::Queued, DeploymentStatus::Building, DeploymentStatus::Starting] {
             let unfinished = Deployment::filter(Deployment::fields().status().eq(status))
                 .exec(&mut db.clone())
@@ -108,6 +112,7 @@ impl Deployer {
         runtime.clone().watch();
         Ok(Deployer {
             db,
+            caddy,
             runtime,
             builds: Arc::new(Semaphore::new(1)),
             deploying: Arc::default(),
@@ -557,8 +562,41 @@ impl Deployer {
             .exec(&mut db)
             .await
             .map_err(saved)?;
+        // The release is live either way, so a domain that cannot be given only shows
+        // in the log.
+        if let Err(error) = self.offer_domain(&mut service, log).await {
+            log.line(&format!("No domain was added: the database could not be updated: {error}"));
+        }
+        self.caddy.changed();
         prune(files, deployment.id);
         Ok(())
+    }
+
+    /// Gives the service a domain at the server's address, if it has none the first
+    /// time it goes live with an address to give, so the app opens from the internet
+    /// without setting one up. See [`Service::domain_offered_at`].
+    async fn offer_domain(&self, service: &mut Service, log: &mut DeployLog) -> toasty::Result<()> {
+        if service.domain_offered_at.is_some() {
+            return Ok(());
+        }
+        // Without one, a later deployment tries again.
+        let Some(address) = domain::generated_address(&self.caddy.ports().public_ips) else {
+            return Ok(());
+        };
+        if !Domain::any_of_service(&self.db, service.id).await? {
+            match Domain::add_generated(&self.db, service, address).await? {
+                Ok(domain) => log.line(&format!("Added the domain {}", domain.url())),
+                Err(problem) => {
+                    log.line(&format!("No domain was added: {problem}"));
+                    return Ok(());
+                }
+            }
+        }
+        service
+            .update()
+            .domain_offered_at(Some(now()))
+            .exec(&mut self.db.clone())
+            .await
     }
 
     /// The service's GitHub App, if it still exists in the service's organization.
