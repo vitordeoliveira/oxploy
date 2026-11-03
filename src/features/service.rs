@@ -307,14 +307,11 @@ impl Service {
 
     /// The cargo command that builds the service.
     pub fn build_command(&self) -> String {
-        let mut command = "cargo build --release".to_owned();
-        if let Some(binary) = &self.cargo_bin {
-            command += &format!(" --bin {binary}");
-        }
-        if let Some(features) = &self.cargo_features {
-            command += &format!(" --features {features}");
-        }
-        command
+        cargo_command(
+            self.rust_version.as_deref().unwrap_or(""),
+            self.cargo_bin.as_deref().unwrap_or(""),
+            self.cargo_features.as_deref().unwrap_or(""),
+        )
     }
 
     /// Stops the service and deletes it, with its deployments and files.
@@ -457,6 +454,29 @@ fn is_target_name(name: &str) -> bool {
     name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The cargo command a build runs, from the Build card's fields as typed. The Rust
+/// version shows as rustup's `+toolchain`, which picks the same toolchain as the
+/// `RUSTUP_TOOLCHAIN` the build sets, and the features as they are saved. The Build
+/// card repeats this in JavaScript to update it while the user types.
+pub fn cargo_command(rust_version: &str, binary: &str, features: &str) -> String {
+    let mut command = "cargo".to_owned();
+    if !rust_version.trim().is_empty() {
+        command += &format!(" +{}", rust_version.trim());
+    }
+    command += " build --release";
+    if !binary.trim().is_empty() {
+        command += &format!(" --bin {}", binary.trim());
+    }
+    let features: Vec<_> = features
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|feature| !feature.is_empty())
+        .collect();
+    if !features.is_empty() {
+        command += &format!(" --features {}", features.join(","));
+    }
+    command
+}
+
 /// Returns the features as a comma separated list, `None` for no features, or no
 /// answer if one is not a feature name. Features may be separated by commas or spaces,
 /// and may name a dependency's feature, as in `serde/derive`.
@@ -517,6 +537,15 @@ mod tests {
             Some(Some("postgres,tls,serde/derive".to_owned()))
         );
         assert_eq!(normalize_features("bad;feature"), None);
+    }
+
+    #[test]
+    fn cargo_commands_show_the_typed_fields() {
+        assert_eq!(cargo_command("", " ", ""), "cargo build --release");
+        assert_eq!(
+            cargo_command(" 1.85 ", "api", "postgres, tls  serde/derive,"),
+            "cargo +1.85 build --release --bin api --features postgres,tls,serde/derive"
+        );
     }
 
     #[test]

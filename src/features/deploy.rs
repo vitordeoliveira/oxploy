@@ -625,11 +625,7 @@ async fn build_with_cargo(build: &Build<'_>, log: &mut DeployLog) -> Result<Stri
         let path = service.build_path.as_deref().unwrap_or("");
         return Err(format!("there is no Cargo.toml in /{path}"));
     }
-    let toolchain = match &service.rust_version {
-        Some(version) => format!(" (Rust {version})"),
-        None => String::new(),
-    };
-    log.step(&format!("Building with {}{toolchain}", service.build_command()));
+    log.step(&format!("Building with {}", service.build_command()));
     let mut cargo = build.command("cargo");
     cargo.args(["build", "--release", "--message-format=json-render-diagnostics"]);
     if let Some(binary) = &service.cargo_bin {

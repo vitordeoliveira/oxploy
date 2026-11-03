@@ -30,7 +30,9 @@ use crate::features::deploy::{AppStatus, Deployer, Refusal};
 use crate::features::deployment::Deployment;
 use crate::features::github::{Branches, GithubApp, Repository};
 use crate::features::project::Project;
-use crate::features::service::{BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, Service, Source};
+use crate::features::service::{
+    BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, Service, Source, cargo_command,
+};
 
 /// The service's source and build settings.
 #[component]
@@ -177,6 +179,17 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
     let features_id = element_id(cx);
     let script_id = element_id(cx);
     let script_binary_id = element_id(cx);
+    let saved_features = service
+        .cargo_features
+        .as_deref()
+        .map(|features| features.replace(',', ", "))
+        .unwrap_or_default();
+    // The cargo fields as typed, for the command under them.
+    let typed_version = signal(cx, || service.rust_version.clone().unwrap_or_default());
+    let typed_binary = signal(cx, || service.cargo_bin.clone().unwrap_or_default());
+    let typed_features = signal(cx, || saved_features.clone());
+    let (type_version, type_binary, type_features) =
+        (typed_version.clone(), typed_binary.clone(), typed_features.clone());
     let tabs = [
         (BuildKind::Cargo, "cargo", "Cargo", iconify_icon!("lucide:package")),
         (BuildKind::Script, "script", "Script", iconify_icon!("lucide:square-terminal")),
@@ -235,6 +248,7 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                                 placeholder="From rust-toolchain.toml"
                                 maxlength="32"
                                 autocomplete="off"
+                                @input=$(|e: Event| type_version.set(e.target.value))
                             }
                         )
                         field_description("A channel such as stable, or a release such as 1.85. Empty uses the repository's toolchain file, or stable.")
@@ -249,6 +263,7 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                                 placeholder="The package's only binary"
                                 maxlength="64"
                                 autocomplete="off"
+                                @input=$(|e: Event| type_binary.set(e.target.value))
                             }
                         )
                         field_description("Which binary to build, for packages with more than one.")
@@ -259,9 +274,10 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                             attrs: attributes! {
                                 id=(&features_id)
                                 name="features"
-                                value=(service.cargo_features.as_deref().map(|features| features.replace(',', ", ")).unwrap_or_default())
+                                value=(&saved_features)
                                 placeholder="None"
                                 autocomplete="off"
+                                @input=$(|e: Event| type_features.set(e.target.value))
                             }
                         )
                         field_description("Separated by commas, such as postgres, tls.")
@@ -270,7 +286,23 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                         <span class="text-sm font-medium">"Build command"</span>
                         <code class="overflow-x-auto rounded-md bg-muted px-3 py-2.5 font-mono text-sm whitespace-nowrap">
                             <span class="text-muted-foreground select-none">"$ "</span>
-                            (service.build_command())
+                            $({
+                                let version = typed_version.get();
+                                let binary = typed_binary.get();
+                                let features = typed_features.get();
+                                // `cargo_command`, in JavaScript.
+                                raw!(
+                                    r"cx.hydrate(((version, binary, features) =>
+                                        'cargo' + (version ? ' +' + version : '') + ' build --release'
+                                        + (binary ? ' --bin ' + binary : '')
+                                        + (features.length ? ' --features ' + features.join(',') : ''))(
+                                        ${version}.trim().toString(),
+                                        ${binary}.trim().toString(),
+                                        ${features}.toString().split(/[\s,]+/u).filter((feature) => feature),
+                                    ))",
+                                    cargo_command(&version, &binary, &features)
+                                )
+                            })
                         </code>
                         field_description("Topcoat apps also get their assets bundled, as topcoat asset bundle does.")
                     </div>
