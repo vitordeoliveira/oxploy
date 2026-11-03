@@ -50,6 +50,15 @@ memory and disk its app takes, and the server's Monitoring page shows the machin
 in its oxploy tab, the panel's and its builds', all sampled every 2 seconds and kept for
 10 minutes in memory.
 
+Domains go through [Caddy](https://caddyserver.com), which runs on the same machine as a
+service of its own, such as the one its packages install. The Caddy belongs to oxploy:
+oxploy builds every route from the database and loads them through Caddy's admin API, at
+`127.0.0.1:2019` unless `OXPLOY_CADDY_ADMIN` says otherwise, and loads them again whenever
+Caddy loses them, as after a restart. Caddy serves ports 80 and 443 (`OXPLOY_HTTP_PORT` and
+`OXPLOY_HTTPS_PORT` change them) and gets each domain's certificate from Let's Encrypt.
+On macOS, `brew services start caddy` needs a Caddyfile at `/opt/homebrew/etc/Caddyfile`,
+and one with only `{ admin localhost:2019 }` in it is enough.
+
 ## Project structure
 
 | Path | Contents |

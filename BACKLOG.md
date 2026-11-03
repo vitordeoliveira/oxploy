@@ -62,3 +62,30 @@ requisições vão: quantas, quantas com erro e em quanto tempo respondem.
 - se os números do Caddy entram na mesma aba Monitoring ou numa aba própria, junto dos
   domínios;
 - quanto tempo de histórico guardar, já que hoje tudo fica só 10 minutos em memória.
+
+## Caddy
+
+### O oxploy cuidar do Caddy sozinho
+
+**Problema.** Hoje o Caddy roda por fora: quem instala o oxploy também instala o Caddy e
+deixa ele rodando como serviço da máquina. Para quem quer um binário que faz tudo, é um
+passo a mais.
+
+**Objetivo.** Quem instala o oxploy não instalar mais nada.
+
+**Caminho já discutido:** na primeira vez, o oxploy baixa uma versão fixa do Caddy para
+`data/caddy`, conferindo o checksum, e inicia ele no grupo de processos dele, como já faz
+com os apps: o Caddy sobrevive ao painel reiniciar, e o painel retoma ele quando volta. A
+configuração continua indo pela API de admin. Uma variável como `OXPLOY_CADDY` aponta
+para um Caddy já instalado, para servidor sem internet ou para quem preferir.
+
+Descartado: rodar o Caddy no Docker. Troca a instalação do Caddy pela do Docker, que é
+maior, e um container não alcança os apps em `127.0.0.1` sem rede `host`, que não funciona
+igual no Mac.
+
+**A decidir:**
+
+- o que fazer se o Caddy cair enquanto o painel está fora; com o oxploy rodando pelo
+  systemd, ele volta em segundos;
+- como o Caddy ganha as portas 80 e 443 sem rodar como root, por exemplo com
+  `AmbientCapabilities` no serviço do systemd do oxploy.

@@ -3,8 +3,10 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::caddy::Caddy;
 use super::databases::{self, ManagedDatabase};
 use super::deploy::Deployer;
+use super::domain::Domain;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
 use super::project::{Details, Project, now};
@@ -317,6 +319,8 @@ impl Service {
     /// Stops the service and deletes it, with its deployments and files.
     pub async fn remove(self, cx: &Cx) -> Result<()> {
         Deployer::get(cx).forget(&self).await?;
+        Domain::remove_all(&db(cx), self.id).await?;
+        Caddy::get(cx).changed();
         Service::filter_by_id(self.id)
             .delete()
             .exec(&mut db(cx))

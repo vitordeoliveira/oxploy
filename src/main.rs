@@ -22,11 +22,14 @@ async fn main() {
     let monitor = features::monitoring::Monitor::start().unwrap();
     // Takes back the apps a previous run started, and starts the ones that should run.
     let deployer = features::deploy::Deployer::start(db.clone()).await.unwrap();
+    // Keeps Caddy's routes to the apps in step with their domains.
+    let caddy = features::caddy::Caddy::start(db.clone());
     topcoat::start(
         app::router()
             .app_context(db)
             .app_context(monitor)
             .app_context(deployer)
+            .app_context(caddy)
             .build(),
     )
     .await

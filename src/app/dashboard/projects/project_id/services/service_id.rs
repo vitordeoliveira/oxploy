@@ -3,6 +3,7 @@
 
 mod general;
 mod history;
+mod hosts;
 mod output;
 mod process;
 mod stored;
@@ -41,10 +42,12 @@ use crate::app::dashboard::projects::{
 use crate::components::button::{ButtonSize, ButtonVariant, button, button_variants};
 use crate::components::tabs::{tabs, tabs_content, tabs_list, tabs_trigger};
 use crate::features::deploy::{AppStatus, Deployer};
+use crate::features::domain::Domain;
 use crate::features::project::Project;
 use crate::features::service::Service;
 use general::general_tab;
 use history::deployments_tab;
+use hosts::domains_tab;
 use output::logs_tab;
 use process::advanced_tab;
 use stored::storage_tab;
@@ -317,6 +320,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         ServiceTab::Storage => {
                             storage_tab(project: &project, service: &service)
                         }
+                        ServiceTab::Domains => {
+                            domains_tab(project: &project, service: &service)
+                        }
                         ServiceTab::Deployments => {
                             deployments_tab(project: &project, service: &service, here: &return_to)
                         }
@@ -383,12 +389,16 @@ async fn service_status(cx: &Cx, project_id: u64, service_id: u64, local: bool) 
                     .await?
                     .ok_or_not_found()?;
                 let status = Deployer::get(cx).status(&service);
-                // The app listens on 127.0.0.1, which only a browser on the same machine
-                // reaches.
-                let open = service
-                    .port
-                    .filter(|_| local && status == AppStatus::Running)
-                    .map(|port| format!("http://127.0.0.1:{port}"));
+                let domains = Domain::of_service(cx, service.id).await?;
+                // A domain reaches the app from anywhere. Without one, the app listens
+                // on 127.0.0.1, which only a browser on the same machine reaches.
+                let open = match domains.first() {
+                    Some(domain) if status == AppStatus::Running => Some(domain.url()),
+                    _ => service
+                        .port
+                        .filter(|_| local && status == AppStatus::Running)
+                        .map(|port| format!("http://127.0.0.1:{port}")),
+                };
                 let token = emit! { status_line(status: status, open: open.as_deref()) }?;
                 if !connected(cx) {
                     break Ok(token);

@@ -2,9 +2,11 @@
 //! data and business rules, for the pages in `app` to use.
 
 pub mod app_files;
+pub mod caddy;
 pub mod databases;
 pub mod deploy;
 pub mod deployment;
+pub mod domain;
 pub mod environment;
 pub mod github;
 pub mod monitoring;

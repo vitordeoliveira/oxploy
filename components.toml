@@ -64,6 +64,10 @@ file = "src/components/sidebar.rs"
 hash = "sha256:3b6d99ca9aef02697ce1142903bd49062ef9f2bd4ecbb1e6b82be0ea6554d1a5"
 file = "src/components/skeleton.rs"
 
+[registries.topcoat.components.switch]
+hash = "sha256:ce9a0c7be3ac7187f0935c193bec82f8587953c8a85fdbaf29c08d9593365c36"
+file = "src/components/switch.rs"
+
 [registries.topcoat.components.tabs]
 hash = "sha256:a9553fe4b7845c6023cfbfd098e084740b4517bcf671ee371095286c36f0fbfc"
 file = "src/components/tabs.rs"
