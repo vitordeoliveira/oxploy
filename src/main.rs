@@ -24,12 +24,23 @@ async fn main() {
     let deployer = features::deploy::Deployer::start(db.clone()).await.unwrap();
     // Keeps Caddy's routes to the apps in step with their domains.
     let caddy = features::caddy::Caddy::start(db.clone());
+    // Until the super admin exists, creating it asks for a code from the log.
+    let open_at = caddy
+        .ports()
+        .panel_urls()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| format!("http://{}", caddy.ports().panel));
+    let setup_code = features::setup_code::SetupCode::start(&db, &open_at)
+        .await
+        .unwrap();
     topcoat::start(
         app::router()
             .app_context(db)
             .app_context(monitor)
             .app_context(deployer)
             .app_context(caddy)
+            .app_context(setup_code)
             .build(),
     )
     .await

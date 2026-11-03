@@ -6,7 +6,12 @@
 //! builds its whole configuration from the database and loads it through Caddy's admin
 //! API. It checks every few seconds that Caddy still runs that configuration, and
 //! loads it again when Caddy lost it, as after a restart, or when something changed.
+//!
+//! The panel also answers at the server's public address, with a short-lived
+//! certificate for the address, so a fresh install can be set up over HTTPS before it
+//! has a domain.
 
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -15,7 +20,7 @@ use tokio::sync::Notify;
 use toasty::Db;
 use topcoat::context::{Cx, app_context};
 
-use super::domain::{Domain, PanelDomain};
+use super::domain::{self, Domain, PanelDomain};
 use super::service::Service;
 
 /// How often oxploy checks that Caddy runs its configuration.
@@ -42,11 +47,16 @@ pub struct Ports {
     pub https: u16,
     /// Where Caddy reaches the panel, such as `127.0.0.1:3000`.
     pub panel: String,
+    /// The server's public addresses, where the panel answers over HTTPS with or
+    /// without a domain.
+    pub public_ips: Vec<IpAddr>,
 }
 
 impl Ports {
     /// `OXPLOY_CADDY_ADMIN`, `OXPLOY_HTTP_PORT` and `OXPLOY_HTTPS_PORT`, or 127.0.0.1:2019,
-    /// 80 and 443. The panel listens at `HOST` and `PORT`, as Topcoat reads them.
+    /// 80 and 443. The panel listens at `HOST` and `PORT`, as Topcoat reads them. The
+    /// public addresses are `OXPLOY_PUBLIC_IP`, separated by commas, for a server
+    /// behind NAT, or else the machine's own public IPv4 addresses.
     fn from_env() -> Ports {
         let port = |name: &str, default: u16| {
             std::env::var(name)
@@ -62,7 +72,31 @@ impl Ports {
                 std::env::var("HOST").ok().as_deref(),
                 port("PORT", 3000),
             ),
+            public_ips: match std::env::var("OXPLOY_PUBLIC_IP") {
+                Ok(listed) => listed
+                    .split(',')
+                    .filter_map(|address| address.trim().parse().ok())
+                    .collect(),
+                Err(_) => domain::public_ipv4_addresses(),
+            },
         }
+    }
+
+    /// The addresses the panel opens at by the server's public addresses, such as
+    /// `https://203.0.114.7`.
+    pub fn panel_urls(&self) -> Vec<String> {
+        let port = if self.https == 443 {
+            String::new()
+        } else {
+            format!(":{}", self.https)
+        };
+        self.public_ips
+            .iter()
+            .map(|address| match address {
+                IpAddr::V4(_) => format!("https://{address}{port}"),
+                IpAddr::V6(_) => format!("https://[{address}]{port}"),
+            })
+            .collect()
     }
 }
 
@@ -255,9 +289,22 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
 /// with HTTPS, whose certificates and redirects from HTTP Caddy manages on its own, and
 /// one on the HTTP port for the others. On each host, longer paths come first, and a
 /// host with only paths answers the others with 404, which Caddy would otherwise
-/// answer with an empty page or a redirect to HTTPS.
+/// answer with an empty page or a redirect to HTTPS. The panel answers at the server's
+/// public addresses too.
 pub fn config(ports: &Ports, sites: &[Site]) -> Value {
-    let mut sites: Vec<&Site> = sites.iter().collect();
+    let by_address: Vec<Site> = ports
+        .public_ips
+        .iter()
+        .map(|address| Site {
+            host: address.to_string(),
+            path: None,
+            strip_path: false,
+            https: true,
+            redirect_www: false,
+            upstream: Upstream::Panel,
+        })
+        .collect();
+    let mut sites: Vec<&Site> = sites.iter().chain(&by_address).collect();
     sites.sort_by(|a, b| {
         let depth = |site: &Site| site.path.as_deref().map_or(0, str::len);
         a.host.cmp(&b.host).then(depth(b).cmp(&depth(a)))
@@ -286,7 +333,7 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
             );
         }
     }
-    json!({
+    let mut config = json!({
         "admin": { "listen": ports.admin },
         "apps": {
             "http": {
@@ -299,7 +346,39 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
             // a password. `caddy trust` does it by hand.
             "pki": { "certificate_authorities": { "local": { "install_trust": false } } },
         }
-    })
+    });
+    let policies = address_policies(&ports.public_ips);
+    if !policies.is_empty() {
+        config["apps"]["tls"] = json!({ "automation": { "policies": policies } });
+    }
+    config
+}
+
+/// How the server's addresses get their certificates. Let's Encrypt certifies a public
+/// address only with its short-lived profile, of six days, which Caddy renews; should
+/// that fail, Caddy's own authority signs one, which browsers warn about. Other
+/// addresses, which no public authority certifies, get Caddy's own.
+fn address_policies(addresses: &[IpAddr]) -> Vec<Value> {
+    let (reachable, other): (Vec<&IpAddr>, Vec<&IpAddr>) = addresses
+        .iter()
+        .partition(|address| domain::is_reachable(address));
+    let subjects = |addresses: &[&IpAddr]| -> Vec<String> {
+        addresses.iter().map(ToString::to_string).collect()
+    };
+    let mut policies = Vec::new();
+    if !reachable.is_empty() {
+        policies.push(json!({
+            "subjects": subjects(&reachable),
+            "issuers": [{ "module": "acme", "profile": "shortlived" }, { "module": "internal" }],
+        }));
+    }
+    if !other.is_empty() {
+        policies.push(json!({
+            "subjects": subjects(&other),
+            "issuers": [{ "module": "internal" }],
+        }));
+    }
+    policies
 }
 
 /// The routes of one domain: to its app, and from `www.` when it redirects.
@@ -367,6 +446,7 @@ mod tests {
             http: 80,
             https: 443,
             panel: "127.0.0.1:3000".to_owned(),
+            public_ips: Vec::new(),
         }
     }
 
@@ -425,6 +505,27 @@ mod tests {
         let config = config(&ports(), &[site("panel.com", None, true, Upstream::Panel)]);
         let route = &config["apps"]["http"]["servers"]["https"]["routes"][0];
         assert_eq!(route["handle"][0]["upstreams"][0]["dial"], "127.0.0.1:3000");
+    }
+
+    #[test]
+    fn the_panel_answers_at_the_public_addresses() {
+        let with_addresses = Ports {
+            public_ips: vec!["203.0.114.7".parse().unwrap(), "10.0.0.5".parse().unwrap()],
+            ..ports()
+        };
+        assert_eq!(with_addresses.panel_urls(), ["https://203.0.114.7", "https://10.0.0.5"]);
+        let built = config(&with_addresses, &[]);
+        // Hosts sort as text, so 10.0.0.5 comes first.
+        let route = &built["apps"]["http"]["servers"]["https"]["routes"][1];
+        assert_eq!(route["match"][0]["host"], json!(["203.0.114.7"]));
+        assert_eq!(route["handle"][0]["upstreams"][0]["dial"], "127.0.0.1:3000");
+        let policies = &built["apps"]["tls"]["automation"]["policies"];
+        assert_eq!(policies[0]["subjects"], json!(["203.0.114.7"]));
+        assert_eq!(policies[0]["issuers"][0]["profile"], "shortlived");
+        assert_eq!(policies[1]["subjects"], json!(["10.0.0.5"]));
+        assert_eq!(policies[1]["issuers"], json!([{ "module": "internal" }]));
+        // Without public addresses, the configuration stays as it was.
+        assert_eq!(config(&ports(), &[])["apps"].get("tls"), None);
     }
 
     #[test]

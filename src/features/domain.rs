@@ -349,6 +349,32 @@ pub fn machine_addresses() -> Vec<IpAddr> {
         .collect()
 }
 
+/// This machine's public IPv4 addresses, which the internet reaches it at, unless it
+/// sits behind NAT.
+pub fn public_ipv4_addresses() -> Vec<IpAddr> {
+    let mut found: Vec<IpAddr> = machine_addresses()
+        .into_iter()
+        .filter(|address| address.is_ipv4() && is_reachable(address))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Whether the internet can reach `address`: a public one, not loopback, link-local,
+/// unspecified, broadcast or kept for documentation.
+pub fn is_reachable(address: &IpAddr) -> bool {
+    let reserved = match address {
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_documentation() || v4.octets()[0] == 0,
+        IpAddr::V6(_) => false,
+    };
+    is_public(address)
+        && !reserved
+        && !address.is_loopback()
+        && !address.is_unspecified()
+        && !is_link_local(address)
+}
+
 /// The addresses a domain should point to: this machine's public ones, or the others
 /// when it has none, as on a local network.
 pub fn addresses_to_point_at() -> Vec<IpAddr> {
@@ -405,6 +431,16 @@ mod tests {
             https,
             redirect_www,
             created_at: 0,
+        }
+    }
+
+    #[test]
+    fn only_public_addresses_are_reachable() {
+        for address in ["203.0.114.7", "8.8.8.8", "2606:4700::1"] {
+            assert!(is_reachable(&address.parse().unwrap()), "{address}");
+        }
+        for address in ["127.0.0.1", "10.0.0.5", "192.168.1.2", "100.64.0.1", "169.254.1.1", "203.0.113.7", "0.0.0.0", "fd00::1", "::1"] {
+            assert!(!is_reachable(&address.parse().unwrap()), "{address}");
         }
     }
 

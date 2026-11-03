@@ -13,15 +13,17 @@ use topcoat::{
 
 use super::onboarding::onboarding;
 use crate::components::button::{ButtonSize, button};
-use crate::components::field::{field, field_error, field_label};
+use crate::components::field::{field, field_description, field_error, field_label};
 use crate::components::input::input;
 use crate::components::password_input::password_input;
+use crate::features::setup_code::SetupCode;
 use crate::features::user::{MIN_PASSWORD_LEN, NewUser, User};
 
 /// The setup form, as the browser submits it.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct SetupForm {
+    setup_code: String,
     first_name: String,
     last_name: String,
     email: String,
@@ -32,6 +34,7 @@ struct SetupForm {
 /// What to fix in each field of a [`SetupForm`], if anything.
 #[derive(Default)]
 struct SetupErrors {
+    setup_code: Option<&'static str>,
     first_name: Option<&'static str>,
     last_name: Option<&'static str>,
     email: Option<&'static str>,
@@ -41,7 +44,8 @@ struct SetupErrors {
 
 impl SetupErrors {
     fn is_empty(&self) -> bool {
-        self.first_name.is_none()
+        self.setup_code.is_none()
+            && self.first_name.is_none()
             && self.last_name.is_none()
             && self.email.is_none()
             && self.password.is_none()
@@ -68,7 +72,7 @@ async fn submit(cx: &Cx, Form(mut form): Form<SetupForm>) -> Result<impl View> {
         return Err(see_other(login).into());
     }
 
-    let errors = validate(&form);
+    let errors = validate(&form, SetupCode::get(cx).accepts(&form.setup_code));
     if errors.is_empty() {
         // Setup is done either way: by this request, or by one that finished first.
         User::create_super_admin(
@@ -81,6 +85,7 @@ async fn submit(cx: &Cx, Form(mut form): Form<SetupForm>) -> Result<impl View> {
             },
         )
         .await?;
+        SetupCode::get(cx).used();
         return Err(see_other(login).into());
     }
 
@@ -90,9 +95,18 @@ async fn submit(cx: &Cx, Form(mut form): Form<SetupForm>) -> Result<impl View> {
     Ok(view! { setup(form: form, errors: errors) })
 }
 
-fn validate(form: &SetupForm) -> SetupErrors {
+/// What to fix in the form. `code_matches` tells whether its setup code is the one in
+/// oxploy's log.
+fn validate(form: &SetupForm, code_matches: bool) -> SetupErrors {
     let email = form.email.trim();
     SetupErrors {
+        setup_code: if form.setup_code.trim().is_empty() {
+            Some("Setup code is required")
+        } else if !code_matches {
+            Some("This is not the code in oxploy's log")
+        } else {
+            None
+        },
         first_name: form
             .first_name
             .trim()
@@ -137,6 +151,11 @@ fn looks_like_email(email: &str) -> bool {
 /// The setup page: the form filled with `form`, and `errors` under its fields.
 #[component]
 async fn setup(form: SetupForm, errors: SetupErrors) -> Result<impl View> {
+    let where_kept = format!(
+        "oxploy wrote it to its log when it started. On the server, journalctl -u oxploy shows it, and so does {}.",
+        SetupCode::path().display()
+    );
+
     Ok(view! {
         onboarding(
             <div class="flex flex-col gap-2">
@@ -149,6 +168,21 @@ async fn setup(form: SetupForm, errors: SetupErrors) -> Result<impl View> {
                 </p>
             </div>
             <form class="flex flex-col gap-4" method="post">
+                setup_field(
+                    label: "Setup code",
+                    error: errors.setup_code,
+                    hint: Some(where_kept.as_str()),
+                    attrs: attributes! {
+                        name="setup_code"
+                        value=(&form.setup_code)
+                        placeholder="XXXX-XXXX-XXXX"
+                        autocomplete="off"
+                        autocapitalize="characters"
+                        spellcheck="false"
+                        class="font-mono"
+                        required=""
+                    }
+                )
                 <div class="grid gap-4 sm:grid-cols-2">
                     setup_field(
                         label: "First name",
@@ -219,12 +253,14 @@ async fn setup(form: SetupForm, errors: SetupErrors) -> Result<impl View> {
     })
 }
 
-/// A labelled input of the setup form, with `error` below it. `attrs` go to the input.
+/// A labelled input of the setup form, with `hint` and `error` below it. `attrs` go to
+/// the input.
 #[component]
 async fn setup_field(
     cx: &Cx,
     label: &'static str,
     error: Option<&'static str>,
+    #[default] hint: Option<&str>,
     #[default] password: bool,
     #[default] attrs: Attributes,
 ) -> Result<impl View> {
@@ -242,6 +278,9 @@ async fn setup_field(
                 password_input(attrs: attrs)
             } else {
                 input(attrs: attrs)
+            }
+            if let Some(hint) = hint {
+                field_description((hint))
             }
             if let Some(error) = error {
                 field_error((error))

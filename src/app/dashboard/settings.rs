@@ -43,10 +43,18 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
     let host_id = element_id(cx);
     let set_url = href!(set_domain).resolve(cx);
     let remove_url = href!(remove_domain).resolve(cx);
-    let panel_text = format!(
-        "The address the panel answers at, over HTTPS through Caddy. Without one, it answers only at {} on this machine.",
-        ports.panel
-    );
+    let by_address = ports.panel_urls();
+    let panel_text = if by_address.is_empty() {
+        format!(
+            "The address the panel answers at, over HTTPS through Caddy. Without one, it answers only at {} on this machine.",
+            ports.panel
+        )
+    } else {
+        format!(
+            "The address the panel answers at, over HTTPS through Caddy. With or without one, it also answers at {}, the server's address.",
+            by_address.join(" and ")
+        )
+    };
     let caddy_state = match &status {
         CaddyStatus::Running => "Running",
         CaddyStatus::Unknown => "Checking…",

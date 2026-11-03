@@ -89,9 +89,13 @@ Restart=always
 KillMode=process
 ```
 
-The panel listens on `127.0.0.1:3000`. Until it has a domain, reach it through an SSH
-tunnel, such as `ssh -L 3001:127.0.0.1:3000 root@server`, and open
-`http://localhost:3001`: the sign-in cookie needs HTTPS anywhere but localhost.
+The panel listens on `127.0.0.1:3000`, and Caddy serves it at `https://` and the
+server's public IPv4 address, with or without a domain: Let's Encrypt certifies the
+address for six days at a time, and Caddy renews it, or signs one itself, which browsers
+warn about, if that fails. Behind NAT, where the machine does not see its public address,
+set `OXPLOY_PUBLIC_IP`. On the first run, oxploy writes a setup code to its log and to
+`setup-code` in its data folder, such as `/var/lib/oxploy/data/setup-code`: creating the
+super admin asks for it, so whoever opens the address first cannot take the server.
 
 ## Project structure
 

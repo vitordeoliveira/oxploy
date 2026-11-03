@@ -6,6 +6,7 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
+use toasty::Db;
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
@@ -61,9 +62,15 @@ static SETUP: Mutex<()> = Mutex::const_new(());
 impl User {
     /// Returns whether the server has its super admin, which means setup is done.
     pub async fn super_admin_exists(cx: &Cx) -> Result<bool> {
+        Ok(Self::super_admin_exists_in(&db(cx)).await?)
+    }
+
+    /// Like [`super_admin_exists`](Self::super_admin_exists), for work done outside a
+    /// request.
+    pub async fn super_admin_exists_in(db: &Db) -> toasty::Result<bool> {
         let super_admin = User::filter(User::fields().role().eq(Role::SuperAdmin))
             .first()
-            .exec(&mut db(cx))
+            .exec(&mut db.clone())
             .await?;
         Ok(super_admin.is_some())
     }
