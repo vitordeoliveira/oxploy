@@ -49,3 +49,8 @@ snapshot_name = "0008_snapshot.toml"
 id = 5113996706084723955
 name = "0009_add_domains.sql"
 snapshot_name = "0009_snapshot.toml"
+
+[[migrations]]
+id = 7100350049505518510
+name = "0010_add_panel_domain.sql"
+snapshot_name = "0010_snapshot.toml"

@@ -485,7 +485,7 @@ fn log_line_class(line: &str) -> &'static str {
 
 /// A card with a heading over one group of settings.
 #[component]
-async fn settings_card(title: &str, text: &str, #[default] child: Child<'_>) -> Result<impl View> {
+pub(crate) async fn settings_card(title: &str, text: &str, #[default] child: Child<'_>) -> Result<impl View> {
     Ok(view! {
         <section class="flex flex-col rounded-xl border border-border bg-card">
             <header class="flex flex-col gap-0.5 border-b border-border px-5 py-4">

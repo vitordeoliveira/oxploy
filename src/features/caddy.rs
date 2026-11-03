@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 use toasty::Db;
 use topcoat::context::{Cx, app_context};
 
-use super::domain::Domain;
+use super::domain::{Domain, PanelDomain};
 use super::service::Service;
 
 /// How often oxploy checks that Caddy runs its configuration.
@@ -33,18 +33,20 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
-/// Where Caddy listens, from oxploy's environment.
+/// Where Caddy listens, and where the panel does, from oxploy's environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ports {
     /// The admin API's address, such as `127.0.0.1:2019`.
     pub admin: String,
     pub http: u16,
     pub https: u16,
+    /// Where Caddy reaches the panel, such as `127.0.0.1:3000`.
+    pub panel: String,
 }
 
 impl Ports {
     /// `OXPLOY_CADDY_ADMIN`, `OXPLOY_HTTP_PORT` and `OXPLOY_HTTPS_PORT`, or 127.0.0.1:2019,
-    /// 80 and 443.
+    /// 80 and 443. The panel listens at `HOST` and `PORT`, as Topcoat reads them.
     fn from_env() -> Ports {
         let port = |name: &str, default: u16| {
             std::env::var(name)
@@ -56,7 +58,21 @@ impl Ports {
             admin: std::env::var("OXPLOY_CADDY_ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.to_owned()),
             http: port("OXPLOY_HTTP_PORT", 80),
             https: port("OXPLOY_HTTPS_PORT", 443),
+            panel: panel_address(
+                std::env::var("HOST").ok().as_deref(),
+                port("PORT", 3000),
+            ),
         }
+    }
+}
+
+/// Where Caddy reaches a panel that listens at `host` and `port`: on 127.0.0.1 when it
+/// listens on every address.
+fn panel_address(host: Option<&str>, port: u16) -> String {
+    match host.map(|host| host.trim_start_matches('[').trim_end_matches(']')) {
+        None | Some("" | "0.0.0.0" | "::") => format!("127.0.0.1:{port}"),
+        Some(host) if host.contains(':') => format!("[{host}]:{port}"),
+        Some(host) => format!("{host}:{port}"),
     }
 }
 
@@ -186,6 +202,8 @@ pub enum Upstream {
     NotDeployed,
     /// Nowhere: the user stopped the service.
     Stopped,
+    /// To the panel itself.
+    Panel,
 }
 
 /// A domain with where its requests go.
@@ -199,10 +217,18 @@ pub struct Site {
     pub upstream: Upstream,
 }
 
-/// Every domain on the server, with where its requests go.
+/// Every domain on the server, the panel's included, with where its requests go.
 async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
     let domains = Domain::all_in(db).await?;
     let services = Service::all().exec(&mut db.clone()).await?;
+    let panel = PanelDomain::get_in(db).await?.map(|panel| Site {
+        host: panel.host,
+        path: None,
+        strip_path: false,
+        https: true,
+        redirect_www: false,
+        upstream: Upstream::Panel,
+    });
     Ok(domains
         .into_iter()
         .filter_map(|domain| {
@@ -221,6 +247,7 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
                 upstream,
             })
         })
+        .chain(panel)
         .collect())
 }
 
@@ -292,6 +319,10 @@ fn routes(site: &Site, ports: &Ports) -> Vec<Value> {
                 "upstreams": [{ "dial": format!("127.0.0.1:{port}") }],
             }));
         }
+        Upstream::Panel => handle.push(json!({
+            "handler": "reverse_proxy",
+            "upstreams": [{ "dial": ports.panel }],
+        })),
         Upstream::NotDeployed => handle.push(unavailable("This app has not been deployed yet.")),
         Upstream::Stopped => handle.push(unavailable("This app is stopped.")),
     }
@@ -335,6 +366,7 @@ mod tests {
             admin: "127.0.0.1:2019".to_owned(),
             http: 80,
             https: 443,
+            panel: "127.0.0.1:3000".to_owned(),
         }
     }
 
@@ -382,6 +414,17 @@ mod tests {
         assert_eq!(routes[0]["handle"][0]["strip_path_prefix"], "/api");
         assert_eq!(routes[1]["match"][0].get("path"), None);
         assert_eq!(routes.as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn the_panel_is_reached_where_it_listens() {
+        assert_eq!(panel_address(None, 3000), "127.0.0.1:3000");
+        assert_eq!(panel_address(Some("0.0.0.0"), 8000), "127.0.0.1:8000");
+        assert_eq!(panel_address(Some("10.0.0.5"), 3000), "10.0.0.5:3000");
+        assert_eq!(panel_address(Some("::1"), 3000), "[::1]:3000");
+        let config = config(&ports(), &[site("panel.com", None, true, Upstream::Panel)]);
+        let route = &config["apps"]["http"]["servers"]["https"]["routes"][0];
+        assert_eq!(route["handle"][0]["upstreams"][0]["dial"], "127.0.0.1:3000");
     }
 
     #[test]

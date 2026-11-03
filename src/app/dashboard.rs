@@ -4,6 +4,8 @@ pub mod git;
 pub mod monitoring;
 mod organizations;
 pub mod projects;
+mod proxy;
+pub mod settings;
 
 use topcoat::{
     Result,
@@ -12,7 +14,7 @@ use topcoat::{
     icon::{icon, iconify::iconify_icon},
     router::{
         Slot,
-        error::{SeeOther, redirect, see_other},
+        error::{SeeOther, not_found, redirect, see_other},
         href, layout, page,
         request::uri,
     },
@@ -49,6 +51,16 @@ pub async fn require_organization(cx: &Cx) -> Result<Organization> {
     let mut signed_in = require_sign_in(cx).await?;
     let mut organizations = signed_in.organizations(cx).await?;
     Ok(organizations.all.swap_remove(organizations.active))
+}
+
+/// Returns the super admin, or a not found error for anyone else: the pages about the
+/// whole server are only for the user who owns it.
+pub async fn require_server_owner(cx: &Cx) -> Result<SignedIn> {
+    let signed_in = require_sign_in(cx).await?;
+    if signed_in.user.role != Role::SuperAdmin {
+        return Err(not_found().into());
+    }
+    Ok(signed_in)
 }
 
 /// Sends the browser back to the dashboard page a form was on. Anything else, such as
@@ -88,16 +100,21 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let git_url = href!(git::page).resolve(cx);
     let monitoring_url = href!(monitoring::page).resolve(cx);
     let oxploy_url = href!(monitoring::oxploy::page).resolve(cx);
+    let settings_url = href!(settings::page).resolve(cx);
     // Pages about the whole server are only for the user who owns it.
     let owns_server = signed_in.user.role == Role::SuperAdmin;
     let path = uri(cx).path();
     let within = |section: &str| path == section || path.starts_with(&format!("{section}/"));
-    let on_server_page = within(&monitoring_url);
+    let in_monitoring = within(&monitoring_url);
+    let in_settings = within(&settings_url);
+    let on_server_page = in_monitoring || in_settings;
     let in_projects = within(&projects_url);
     let in_git = within(&git_url);
     // The breadcrumb names what the page is about: the whole server, or something of
     // the active organization, down to the open project and service.
-    let trail = if on_server_page {
+    let trail = if in_settings {
+        vec![("Settings".to_owned(), settings_url.clone())]
+    } else if in_monitoring {
         let mut trail = vec![("Monitoring".to_owned(), monitoring_url.clone())];
         if within(&oxploy_url) {
             trail.push(("oxploy".to_owned(), oxploy_url.clone()));
@@ -169,11 +186,21 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                 sidebar_menu_item(
                                     sidebar_menu_button(
                                         href: Some(&monitoring_url),
-                                        active: on_server_page,
+                                        active: in_monitoring,
                                         tooltip: Some("Monitoring"),
                                         attrs: attributes! { class=(CURRENT_PAGE) },
                                         icon(data: iconify_icon!("lucide:activity"))
                                         <span>"Monitoring"</span>
+                                    )
+                                )
+                                sidebar_menu_item(
+                                    sidebar_menu_button(
+                                        href: Some(&settings_url),
+                                        active: in_settings,
+                                        tooltip: Some("Settings"),
+                                        attrs: attributes! { class=(CURRENT_PAGE) },
+                                        icon(data: iconify_icon!("lucide:settings"))
+                                        <span>"Settings"</span>
                                     )
                                 )
                             )

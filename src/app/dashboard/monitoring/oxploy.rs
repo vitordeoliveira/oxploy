@@ -20,8 +20,9 @@ use topcoat::{
 use super::{
     Line, Section, Window, chart, fact, format_bytes, format_bytes_tick, format_duration,
     format_rate, format_rate_tick, legend, metric, nice_bytes_ceiling, nice_percent_ceiling,
-    page_heading, require_server_owner, server_clock, share, thirds,
+    page_heading, server_clock, share, thirds,
 };
+use crate::app::dashboard::require_server_owner;
 use crate::db;
 use crate::features::app_files::{Footprint, data_dir};
 use crate::features::deploy::Deployer;

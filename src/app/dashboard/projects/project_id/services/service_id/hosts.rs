@@ -16,6 +16,7 @@ use topcoat::{
 
 use super::super::super::ProjectId;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
+use crate::app::dashboard::proxy::{caddy_notice, resolution_label};
 use crate::app::dashboard::require_organization;
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
@@ -25,8 +26,8 @@ use crate::components::dialog::{
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
 use crate::components::switch::switch;
-use crate::features::caddy::{Caddy, CaddyStatus};
-use crate::features::domain::{self, Domain, NewDomain, Resolution};
+use crate::features::caddy::Caddy;
+use crate::features::domain::{self, Domain, NewDomain};
 use crate::features::project::Project;
 use crate::features::service::Service;
 
@@ -106,43 +107,6 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
         for (index, domain) in domains.iter().enumerate() {
             domain_dialog(open: &dialogs[index].0, action: &edit_url, domain: Some(domain))
             delete_dialog(open: &dialogs[index].1, domain: domain, action: &delete_url)
-        }
-    })
-}
-
-/// What keeps the domains from working, if Caddy does not run oxploy's routes.
-#[component]
-async fn caddy_notice(status: &CaddyStatus, admin: &str) -> Result<impl View> {
-    let problem = match status {
-        CaddyStatus::Unreachable(error) => Some((
-            "Caddy is not running".to_owned(),
-            format!(
-                "The domains work once Caddy runs on this machine. Install it and run it as a service; oxploy gives it the routes on its own, through its admin API at {admin}."
-            ),
-            error.clone(),
-        )),
-        CaddyStatus::Refused(message) => Some((
-            "Caddy refused the routes".to_owned(),
-            "Caddy runs, but would not load the routes oxploy gave it.".to_owned(),
-            message.clone(),
-        )),
-        CaddyStatus::Unknown | CaddyStatus::Running => None,
-    };
-
-    Ok(view! {
-        if let Some((title, text, detail)) = problem {
-            <div class="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
-                icon(
-                    data: iconify_icon!("lucide:triangle-alert"),
-                    size: 16,
-                    attrs: attributes! { class="mt-0.5 shrink-0 text-amber-700 dark:text-amber-400" }
-                )
-                <div class="flex min-w-0 flex-col gap-1">
-                    <p class="font-medium">(title)</p>
-                    <p class="text-muted-foreground">(text)</p>
-                    <p class="font-mono text-xs break-all text-muted-foreground">(detail)</p>
-                </div>
-            </div>
         }
     })
 }
@@ -249,33 +213,9 @@ async fn dns_status(cx: &Cx, project_id: u64, service_id: u64, host: String) -> 
     } else {
         None
     };
-    let (symbol, color, text) = match &resolution {
-        None => (iconify_icon!("lucide:loader"), "text-muted-foreground", "checking DNS…".to_owned()),
-        Some(Resolution::Here) => (
-            iconify_icon!("lucide:circle-check"),
-            "text-emerald-600 dark:text-emerald-400",
-            "points here".to_owned(),
-        ),
-        Some(Resolution::Elsewhere(addresses)) => (
-            iconify_icon!("lucide:triangle-alert"),
-            "text-amber-700 dark:text-amber-400",
-            format!(
-                "points to {}",
-                addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-            ),
-        ),
-        Some(Resolution::Nowhere) => (
-            iconify_icon!("lucide:triangle-alert"),
-            "text-amber-700 dark:text-amber-400",
-            "has no DNS record".to_owned(),
-        ),
-    };
 
     Ok(view! {
-        <span class=(class!("inline-flex items-center gap-1", color))>
-            icon(data: symbol, size: 12, attrs: attributes! { class="shrink-0" })
-            <span class="break-all">(host) " " (text)</span>
-        </span>
+        resolution_label(host: &host, resolution: resolution.as_ref())
     })
 }
 

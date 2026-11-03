@@ -42,6 +42,21 @@ pub struct Domain {
     pub created_at: i64,
 }
 
+/// The address the panel itself answers at, always over HTTPS, since its sign-in
+/// cookie travels only over HTTPS away from localhost. There is at most one.
+#[derive(Debug, toasty::Model)]
+pub struct PanelDomain {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    /// The hostname, in lowercase, such as `panel.example.com`.
+    pub host: String,
+
+    /// When it was set, in seconds since the Unix epoch.
+    pub created_at: i64,
+}
+
 /// A domain as the user filled the form.
 pub struct NewDomain<'a> {
     pub host: &'a str,
@@ -84,7 +99,8 @@ impl Domain {
     /// invalid or another domain already takes the address.
     pub async fn add(cx: &Cx, service: &Service, new: &NewDomain<'_>) -> Result<Result<Domain, String>> {
         let others = Self::all_in(&db(cx)).await?;
-        let checked = match check(new, &others) {
+        let panel = PanelDomain::get_in(&db(cx)).await?;
+        let checked = match check(new, &others, panel.as_ref().map(|panel| panel.host.as_str())) {
             Ok(checked) => checked,
             Err(problem) => return Ok(Err(problem)),
         };
@@ -109,7 +125,8 @@ impl Domain {
             .into_iter()
             .filter(|other| other.id != self.id)
             .collect();
-        let checked = match check(new, &others) {
+        let panel = PanelDomain::get_in(&db(cx)).await?;
+        let checked = match check(new, &others, panel.as_ref().map(|panel| panel.host.as_str())) {
             Ok(checked) => checked,
             Err(problem) => return Ok(Err(problem)),
         };
@@ -150,6 +167,47 @@ impl Domain {
     }
 }
 
+impl PanelDomain {
+    /// Returns the panel's domain, if it has one.
+    pub async fn get_in(db: &Db) -> toasty::Result<Option<PanelDomain>> {
+        PanelDomain::all().first().exec(&mut db.clone()).await
+    }
+
+    /// Gives the panel `host`, in place of the domain it had. Returns what is wrong
+    /// instead, if it is not a hostname or an app already answers at it.
+    pub async fn set(cx: &Cx, host: &str) -> Result<Result<PanelDomain, String>> {
+        let Some(host) = normalize_host(host) else {
+            return Ok(Err(format!("{} is not a hostname, such as panel.example.com", host.trim())));
+        };
+        let apps = Domain::all_in(&db(cx)).await?;
+        if apps
+            .iter()
+            .any(|app| app.host == host || app.www().as_deref() == Some(host.as_str()))
+        {
+            return Ok(Err(format!("{host} already reaches an app")));
+        }
+        Self::remove(cx).await?;
+        let domain = toasty::create!(PanelDomain {
+            host,
+            created_at: now(),
+        })
+        .exec(&mut db(cx))
+        .await?;
+        Ok(Ok(domain))
+    }
+
+    /// Takes the panel's domain away.
+    pub async fn remove(cx: &Cx) -> Result<()> {
+        PanelDomain::all().delete().exec(&mut db(cx)).await?;
+        Ok(())
+    }
+
+    /// The address the panel opens at, such as `https://panel.example.com`.
+    pub fn url(&self) -> String {
+        format!("https://{}", self.host)
+    }
+}
+
 /// A domain's fields as they are stored.
 #[derive(Debug, PartialEq, Eq)]
 struct Checked {
@@ -159,10 +217,10 @@ struct Checked {
     redirect_www: bool,
 }
 
-/// Checks a domain against the others on the server, and returns its fields as they are
-/// stored. Stripping applies only with a path, and redirecting www only without one,
-/// as the form shows them.
-fn check(new: &NewDomain<'_>, others: &[Domain]) -> Result<Checked, String> {
+/// Checks a domain against the others on the server and the panel's, and returns its
+/// fields as they are stored. Stripping applies only with a path, and redirecting www
+/// only without one, as the form shows them.
+fn check(new: &NewDomain<'_>, others: &[Domain], panel: Option<&str>) -> Result<Checked, String> {
     let host = normalize_host(new.host)
         .ok_or_else(|| format!("{} is not a hostname, such as shop.example.com", new.host.trim()))?;
     let path = normalize_path(new.path)
@@ -172,6 +230,11 @@ fn check(new: &NewDomain<'_>, others: &[Domain]) -> Result<Checked, String> {
         return Err(format!("{host} already starts with www."));
     }
     let www = format!("www.{host}");
+    if let Some(panel) = panel
+        && (host == panel || (redirect_www && www == panel))
+    {
+        return Err(format!("{panel} is the panel's domain"));
+    }
     for other in others {
         if other.host == host && other.path == path {
             return Err(format!("{} is already a domain", other.url()));
@@ -372,11 +435,11 @@ mod tests {
             domain("shop.com", None, true, true),
             domain("api.com", Some("/v1"), false, false),
         ];
-        assert!(check(&new("shop.com", "/"), &others).is_err());
-        assert!(check(&new("www.shop.com", ""), &others).is_err());
-        assert!(check(&new("api.com", "/v2"), &others).is_err(), "api.com is plain HTTP");
+        assert!(check(&new("shop.com", "/"), &others, None).is_err());
+        assert!(check(&new("www.shop.com", ""), &others, None).is_err());
+        assert!(check(&new("api.com", "/v2"), &others, None).is_err(), "api.com is plain HTTP");
         assert_eq!(
-            check(&NewDomain { https: false, ..new("api.com", "/v2") }, &others),
+            check(&NewDomain { https: false, ..new("api.com", "/v2") }, &others, None),
             Ok(Checked {
                 host: "api.com".to_owned(),
                 path: Some("/v2".to_owned()),
@@ -384,7 +447,10 @@ mod tests {
                 redirect_www: false,
             })
         );
+        assert!(check(&new("panel.com", ""), &[], Some("panel.com")).is_err());
+        let www = NewDomain { redirect_www: true, ..new("panel.com", "") };
+        assert!(check(&www, &[], Some("www.panel.com")).is_err());
         let with_path = NewDomain { redirect_www: true, ..new("shop.com", "/api") };
-        assert_eq!(check(&with_path, &[]).map(|checked| checked.redirect_www), Ok(false));
+        assert_eq!(check(&with_path, &[], None).map(|checked| checked.redirect_www), Ok(false));
     }
 }

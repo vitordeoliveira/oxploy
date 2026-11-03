@@ -15,15 +15,14 @@ use topcoat::{
     asset::asset,
     context::Cx,
     icon::{IconData, icon, iconify::iconify_icon},
-    router::{error::not_found, href, page},
+    router::{href, page},
     runtime::connected,
     view::{Child, View, attributes, class, component, emit, live, view},
 };
 
-use super::require_sign_in;
+use super::require_server_owner;
 use crate::components::tabs::{tabs_list, tabs_trigger};
 use crate::features::monitoring::{HISTORY, Host, INTERVAL, Monitor, Rates, Sample};
-use crate::features::user::Role;
 
 #[page]
 pub async fn page(cx: &Cx) -> Result<impl View> {
@@ -54,16 +53,6 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
         </div>
         <script type="module" src=(asset!("assets/monitoring.js"))></script>
     })
-}
-
-/// Refuses users other than the super admin. The numbers describe the whole server,
-/// so only the user who owns it sees them.
-async fn require_server_owner(cx: &Cx) -> Result<()> {
-    let signed_in = require_sign_in(cx).await?;
-    if signed_in.user.role != Role::SuperAdmin {
-        return Err(not_found().into());
-    }
-    Ok(())
 }
 
 /// A tab of the monitoring pages.

@@ -56,8 +56,10 @@ oxploy builds every route from the database and loads them through Caddy's admin
 `127.0.0.1:2019` unless `OXPLOY_CADDY_ADMIN` says otherwise, and loads them again whenever
 Caddy loses them, as after a restart. Caddy serves ports 80 and 443 (`OXPLOY_HTTP_PORT` and
 `OXPLOY_HTTPS_PORT` change them) and gets each domain's certificate from Let's Encrypt.
-On macOS, `brew services start caddy` needs a Caddyfile at `/opt/homebrew/etc/Caddyfile`,
-and one with only `{ admin localhost:2019 }` in it is enough.
+The panel itself gets a domain under **Settings**, always over HTTPS; until then it answers
+only at `HOST` and `PORT`, `127.0.0.1:3000` by default. On macOS, `brew services start
+caddy` needs a Caddyfile at `/opt/homebrew/etc/Caddyfile`, and one with only
+`{ admin localhost:2019 }` in it is enough.
 
 ## Project structure
 
