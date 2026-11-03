@@ -29,6 +29,7 @@
      --sidebar-ring            sidebar focus rings
      --chart-1                 the first series of a chart with several (blue)
      --chart-2                 the second series of a chart with several (rust)
+     --chart-3                 the third series of a chart with several (aqua)
      --shadow-xs               a subtle shadow for raised controls
      --shadow-sm               a shadow for raised surfaces: cards, menus
 
@@ -84,6 +85,7 @@
   --color-sidebar-ring: var(--sidebar-ring);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
   --shadow-xs: var(--shadow-xs);
   --shadow-sm: var(--shadow-sm);
 }
@@ -116,6 +118,8 @@
   /* Checked together for color-vision deficiencies and contrast on the cards. */
   --chart-1: #2a78d6;
   --chart-2: #bb4717;
+  /* Under 3:1 on the cards: its values must also show as text, in a legend or table. */
+  --chart-3: #1baf7a;
   /* Use these values to enable shadows:
   --shadow-xs: 0 1px 2px oklch(0.24 0.02 260 / 12%);
   --shadow-sm:
@@ -153,6 +157,7 @@
     --sidebar-ring: oklch(0.64 0.17 42);
     --chart-1: #3987e5;
     --chart-2: #de6129;
+    --chart-3: #199e70;
     /* Use these values to enable shadows:
     --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
     --shadow-sm:

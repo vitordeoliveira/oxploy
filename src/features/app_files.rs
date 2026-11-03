@@ -73,20 +73,74 @@ impl AppFiles {
         self.root.join("asset-cache")
     }
 
+    /// What the app and its deployments printed.
+    pub fn logs(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
     /// What one deployment printed while fetching, building and starting.
     pub fn deploy_log(&self, deployment_id: u64) -> PathBuf {
-        self.root.join("logs").join(format!("deploy-{deployment_id}.log"))
+        self.logs().join(format!("deploy-{deployment_id}.log"))
     }
 
     /// What the running app prints.
     pub fn app_log(&self) -> PathBuf {
-        self.root.join("logs").join("app.log")
+        self.logs().join("app.log")
     }
 
     /// The running process and the release it runs, so a restarted panel can take it
     /// back.
     pub fn pid_file(&self) -> PathBuf {
         self.root.join("app.pid")
+    }
+}
+
+/// The folder for everything oxploy writes besides its database.
+pub fn data_dir() -> &'static Path {
+    &DATA_DIR
+}
+
+/// What the files oxploy keeps for every app take, by kind.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Footprint {
+    pub releases: u64,
+    pub build_caches: u64,
+    pub storage: u64,
+    pub backups: u64,
+    pub logs: u64,
+    pub asset_caches: u64,
+}
+
+impl Footprint {
+    /// Measures the files of every app in the data folder, reading through all of them,
+    /// which takes a while with large build caches.
+    pub fn measure() -> Footprint {
+        let mut footprint = Footprint::default();
+        let Ok(apps) = std::fs::read_dir(DATA_DIR.join("apps")) else {
+            return footprint;
+        };
+        for app in apps.filter_map(Result::ok) {
+            let Some(name) = app.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let files = AppFiles::of(&name);
+            footprint.releases += size_of(&files.releases());
+            footprint.build_caches += size_of(&files.target());
+            footprint.storage += size_of(&files.storage());
+            footprint.backups += size_of(&files.backups());
+            footprint.logs += size_of(&files.logs());
+            footprint.asset_caches += size_of(&files.asset_cache());
+        }
+        footprint
+    }
+
+    pub fn total(&self) -> u64 {
+        self.releases
+            + self.build_caches
+            + self.storage
+            + self.backups
+            + self.logs
+            + self.asset_caches
     }
 }
 

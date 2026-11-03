@@ -19,7 +19,8 @@ use topcoat::{
 
 use crate::app::dashboard::monitoring::{
     Line, Window, chart, fact, format_bytes, format_bytes_tick, format_duration, format_rate,
-    format_rate_tick, legend, meter, metric, nice_bytes_ceiling, server_clock, share, thirds,
+    format_rate_tick, legend, meter, metric, nice_bytes_ceiling, nice_percent_ceiling,
+    server_clock, share, thirds,
 };
 use crate::features::app_files::{AppFiles, size_of};
 use crate::features::usage::UsageSample;
@@ -272,12 +273,4 @@ fn tooltip_data(samples: &[UsageSample]) -> String {
         })
         .collect();
     serde_json::Value::Array(rows).to_string()
-}
-
-/// The smallest of 1, 2, 5, 10, 20, 50 and 100 percent at or above `percent`.
-fn nice_percent_ceiling(percent: f64) -> f64 {
-    [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
-        .into_iter()
-        .find(|step| *step >= percent)
-        .unwrap_or(100.0)
 }

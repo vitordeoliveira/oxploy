@@ -46,8 +46,9 @@ elsewhere. Each app also gets a storage folder that deploys keep, in
 starts, such as one that migrates its database. The Storage tab adds SQLite databases
 there and connects them to the app through a variable, a link in each release, or
 both, and backs them up and restores them. Each service's Monitoring tab shows the CPU,
-memory and disk its app takes, sampled every 2 seconds and kept for 10 minutes in
-memory.
+memory and disk its app takes, and the server's Monitoring page shows the machine's and,
+in its oxploy tab, the panel's and its builds', all sampled every 2 seconds and kept for
+10 minutes in memory.
 
 ## Project structure
 

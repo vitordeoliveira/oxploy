@@ -86,19 +86,23 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let projects = href!(projects::page);
     let projects_url = projects.resolve(cx);
     let git_url = href!(git::page).resolve(cx);
-    let monitoring = href!(monitoring::page);
-    let monitoring_url = monitoring.resolve(cx);
+    let monitoring_url = href!(monitoring::page).resolve(cx);
+    let oxploy_url = href!(monitoring::oxploy::page).resolve(cx);
     // Pages about the whole server are only for the user who owns it.
     let owns_server = signed_in.user.role == Role::SuperAdmin;
-    let on_server_page = monitoring.is_current(cx);
     let path = uri(cx).path();
     let within = |section: &str| path == section || path.starts_with(&format!("{section}/"));
+    let on_server_page = within(&monitoring_url);
     let in_projects = within(&projects_url);
     let in_git = within(&git_url);
     // The breadcrumb names what the page is about: the whole server, or something of
     // the active organization, down to the open project and service.
     let trail = if on_server_page {
-        vec![("Monitoring".to_owned(), monitoring_url.clone())]
+        let mut trail = vec![("Monitoring".to_owned(), monitoring_url.clone())];
+        if within(&oxploy_url) {
+            trail.push(("oxploy".to_owned(), oxploy_url.clone()));
+        }
+        trail
     } else if in_git {
         vec![("Git".to_owned(), git_url.clone())]
     } else {

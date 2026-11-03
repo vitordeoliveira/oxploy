@@ -1,12 +1,14 @@
-//! How much of the machine each running app takes, sampled in the background as often
-//! as the server's usage in [`monitoring`](super::monitoring) and kept as long, in
-//! memory.
+//! How much of the machine oxploy and the apps it runs take, sampled in the background
+//! as often as the server's usage in [`monitoring`](super::monitoring) and kept as long,
+//! in memory.
 //!
-//! An app's usage adds up its process and every process it started. Its network traffic
-//! is not measured: the app shares the machine's network, which counts bytes per
-//! interface, not per process.
+//! An app's usage adds up its process and every process it started. oxploy's is its
+//! own process, and apart from it the builds it runs: every process it started other
+//! than the apps. Network traffic is not measured: processes share the machine's
+//! network, which counts bytes per interface, not per process.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Add;
 use std::sync::{RwLock, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -28,6 +30,19 @@ pub struct Load {
     /// Bytes per second read from and written to the disks.
     pub disk_read: f64,
     pub disk_written: f64,
+}
+
+impl Add for Load {
+    type Output = Load;
+
+    fn add(self, other: Load) -> Load {
+        Load {
+            cpu: (self.cpu + other.cpu).min(100.0),
+            memory: self.memory + other.memory,
+            disk_read: self.disk_read + other.disk_read,
+            disk_written: self.disk_written + other.disk_written,
+        }
+    }
 }
 
 /// One reading of an app's usage.
@@ -53,18 +68,43 @@ pub struct AppProcess {
     pub disk_written: u64,
 }
 
-/// The recent samples of every app, by service.
+/// One reading of oxploy's own usage, with what the apps it runs took beside it.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelSample {
+    pub at: SystemTime,
+    /// The server's memory.
+    pub memory_total: u64,
+    /// The panel's own process.
+    pub panel: Load,
+    /// The builds it runs, such as git and cargo.
+    pub builds: Load,
+    /// How many processes the builds run.
+    pub build_processes: usize,
+    /// Every app it runs, together.
+    pub apps: Load,
+}
+
+/// The recent samples of oxploy and of every app, by service.
 pub struct Usage {
+    started_at: SystemTime,
     apps: RwLock<HashMap<u64, VecDeque<UsageSample>>>,
+    panel: RwLock<VecDeque<PanelSample>>,
     sampled: broadcast::Sender<()>,
 }
 
 impl Usage {
     pub fn new() -> Usage {
         Usage {
+            started_at: SystemTime::now(),
             apps: RwLock::default(),
+            panel: RwLock::new(VecDeque::with_capacity(HISTORY)),
             sampled: broadcast::channel(1).0,
         }
+    }
+
+    /// When the panel started, give or take its first moments.
+    pub fn started_at(&self) -> SystemTime {
+        self.started_at
     }
 
     /// Returns the service's kept samples, oldest first. A service that stopped keeps
@@ -78,6 +118,28 @@ impl Usage {
             .unwrap_or_default()
     }
 
+    /// Returns the latest sample of each app that runs, by service.
+    pub fn running_apps(&self) -> Vec<(u64, UsageSample)> {
+        self.apps
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|(service_id, samples)| {
+                let latest = samples.back()?;
+                latest.process.map(|_| (*service_id, *latest))
+            })
+            .collect()
+    }
+
+    /// Returns oxploy's kept samples, oldest first.
+    pub fn panel(&self) -> Vec<PanelSample> {
+        let samples = self
+            .panel
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        samples.iter().copied().collect()
+    }
+
     /// Returns a receiver that gets a message after each round of samples.
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.sampled.subscribe()
@@ -88,9 +150,9 @@ impl Usage {
         self.write_apps().remove(&service_id);
     }
 
-    /// Samples, every [`INTERVAL`] and on the thread that calls it, the apps `running`
-    /// returns, as service IDs with the PID of their process. Returns only if this
-    /// platform cannot report the usage of processes.
+    /// Samples, every [`INTERVAL`] and on the thread that calls it, oxploy and the apps
+    /// `running` returns, as service IDs with the PID of their process. Returns only if
+    /// this platform cannot report the usage of processes.
     pub fn sample_forever(&self, running: impl Fn() -> Vec<(u64, u32)>) {
         let mut system = match System::new() {
             Ok(system) => system,
@@ -103,6 +165,7 @@ impl Usage {
         let cpus = system.cpus().len().max(1);
         system.refresh_memory();
         let memory_total = system.total_memory();
+        let panel = Pid::from_u32(std::process::id());
         // CPU usage and disk rates are measured between two refreshes.
         refresh(&mut system);
         let mut refreshed = Instant::now();
@@ -114,12 +177,14 @@ impl Usage {
 
             let at = SystemTime::now();
             let children = children(&system);
-            let sampled: HashMap<u64, UsageSample> = running()
+            let running = running();
+            let apps: HashSet<Pid> = running.iter().map(|(_, pid)| Pid::from_u32(*pid)).collect();
+            let sampled: HashMap<u64, UsageSample> = running
                 .into_iter()
                 .map(|(service_id, pid)| {
                     let pid = Pid::from_u32(pid);
                     let process = system.process(pid).filter(|process| !is_zombie(process));
-                    let reading = Reading::of(&system, &children, pid);
+                    let reading = Reading::of(&system, &children, [pid], &HashSet::new());
                     let sample = UsageSample {
                         at,
                         memory_total,
@@ -135,14 +200,36 @@ impl Usage {
                     (service_id, sample)
                 })
                 .collect();
+            let mut own = Reading::default();
+            if let Some(process) = system.process(panel) {
+                own.add(process);
+            }
+            let builds = Reading::of(
+                &system,
+                &children,
+                children.get(&panel).into_iter().flatten().copied(),
+                &apps,
+            );
+            let apps = sampled
+                .values()
+                .map(|sample| sample.load)
+                .fold(Load::default(), Load::add);
             self.record(at, memory_total, sampled);
+            self.record_panel(PanelSample {
+                at,
+                memory_total,
+                panel: own.load(cpus, seconds),
+                builds: builds.load(cpus, seconds),
+                build_processes: builds.count,
+                apps,
+            });
             // Nobody may be watching, which is fine.
             let _ = self.sampled.send(());
         }
     }
 
-    /// Adds a round of samples. A service that stopped gets an idle sample instead, so
-    /// its charts go on to show that, until its whole history is idle.
+    /// Adds a round of the apps' samples. A service that stopped gets an idle sample
+    /// instead, so its charts go on to show that, until its whole history is idle.
     fn record(&self, at: SystemTime, memory_total: u64, mut sampled: HashMap<u64, UsageSample>) {
         let mut apps = self.write_apps();
         for (service_id, history) in apps.iter_mut() {
@@ -163,6 +250,17 @@ impl Usage {
             history.push_back(sample);
             apps.insert(service_id, history);
         }
+    }
+
+    fn record_panel(&self, sample: PanelSample) {
+        let mut samples = self
+            .panel
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if samples.len() == HISTORY {
+            samples.pop_front();
+        }
+        samples.push_back(sample);
     }
 
     fn write_apps(&self) -> RwLockWriteGuard<'_, HashMap<u64, VecDeque<UsageSample>>> {
@@ -188,14 +286,20 @@ struct Reading {
 }
 
 impl Reading {
-    /// Adds up the process `pid` and every process it started.
-    fn of(system: &System, children: &HashMap<Pid, Vec<Pid>>, pid: Pid) -> Reading {
+    /// Adds up the processes in `roots` and every process they started, leaving out the
+    /// ones in `skip` with what those started.
+    fn of(
+        system: &System,
+        children: &HashMap<Pid, Vec<Pid>>,
+        roots: impl IntoIterator<Item = Pid>,
+        skip: &HashSet<Pid>,
+    ) -> Reading {
         let mut reading = Reading::default();
         // A PID reused while the processes were listed could make a loop.
         let mut seen = HashSet::new();
-        let mut pending = vec![pid];
+        let mut pending: Vec<Pid> = roots.into_iter().collect();
         while let Some(pid) = pending.pop() {
-            if !seen.insert(pid) {
+            if skip.contains(&pid) || !seen.insert(pid) {
                 continue;
             }
             let Some(process) = system.process(pid) else {

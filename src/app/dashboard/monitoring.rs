@@ -1,7 +1,10 @@
-//! Usage of the whole server, which only its super admin sees.
+//! Usage of the whole server, which only its super admin sees, with a tab for oxploy's
+//! own.
 //!
 //! Each new sample re-renders the readings over the page's WebSocket. The charts are
 //! drawn here as SVG; `monitoring.js` adds the readout under the pointer.
+
+pub mod oxploy;
 
 use std::time::SystemTime;
 
@@ -12,35 +15,28 @@ use topcoat::{
     asset::asset,
     context::Cx,
     icon::{IconData, icon, iconify::iconify_icon},
-    router::{error::not_found, page},
+    router::{error::not_found, href, page},
     runtime::connected,
     view::{Child, View, attributes, class, component, emit, live, view},
 };
 
 use super::require_sign_in;
+use crate::components::tabs::{tabs_list, tabs_trigger};
 use crate::features::monitoring::{HISTORY, Host, INTERVAL, Monitor, Rates, Sample};
 use crate::features::user::Role;
 
 #[page]
 pub async fn page(cx: &Cx) -> Result<impl View> {
-    let signed_in = require_sign_in(cx).await?;
-    // The numbers describe the whole server, so only the user who owns it sees them.
-    if signed_in.user.role != Role::SuperAdmin {
-        return Err(not_found().into());
-    }
+    require_server_owner(cx).await?;
     let host = Monitor::get(cx).host().clone();
 
     Ok(view! {
         <div class="flex flex-1 flex-col gap-6">
-            <div class="flex flex-col gap-3">
-                <div class="flex flex-col gap-1">
-                    <h1 class="text-2xl font-semibold tracking-tight">"Server monitoring"</h1>
-                    <p class="max-w-2xl text-sm text-muted-foreground">
-                        "Usage of the machine oxploy runs on. Apps from every organization share it, so these numbers are the same whichever organization is active."
-                    </p>
-                </div>
+            page_heading(
+                current: Section::Machine,
+                text: "Usage of the machine oxploy runs on. Apps from every organization share it, so these numbers are the same whichever organization is active.",
                 host_facts(host: &host)
-            </div>
+            )
             (live! {
                 let monitor = Monitor::get(cx);
                 let mut sampled = monitor.subscribe();
@@ -57,6 +53,55 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
             })
         </div>
         <script type="module" src=(asset!("assets/monitoring.js"))></script>
+    })
+}
+
+/// Refuses users other than the super admin. The numbers describe the whole server,
+/// so only the user who owns it sees them.
+async fn require_server_owner(cx: &Cx) -> Result<()> {
+    let signed_in = require_sign_in(cx).await?;
+    if signed_in.user.role != Role::SuperAdmin {
+        return Err(not_found().into());
+    }
+    Ok(())
+}
+
+/// A tab of the monitoring pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// The whole machine.
+    Machine,
+    /// oxploy's own process, builds and files.
+    Oxploy,
+}
+
+/// The title of the monitoring pages, with a tab for the machine and one for oxploy,
+/// over what the open tab is about.
+#[component]
+async fn page_heading(cx: &Cx, current: Section, text: &'static str, #[default] child: Child<'_>) -> Result<impl View> {
+    let sections = [
+        (Section::Machine, "Machine", iconify_icon!("lucide:server"), href!(page).resolve(cx)),
+        (Section::Oxploy, "oxploy", iconify_icon!("lucide:cog"), href!(oxploy::page).resolve(cx)),
+    ];
+
+    Ok(view! {
+        <div class="flex flex-col gap-4">
+            <h1 class="text-2xl font-semibold tracking-tight">"Server monitoring"</h1>
+            tabs_list(
+                for (section, label, symbol, url) in sections {
+                    tabs_trigger(
+                        active: section == current,
+                        attrs: attributes! { href=(url) },
+                        icon(data: symbol, size: 14)
+                        (label)
+                    )
+                }
+            )
+            <div class="flex flex-col gap-3">
+                <p class="max-w-2xl text-sm text-muted-foreground">(text)</p>
+                (child)
+            </div>
+        </div>
     })
 }
 
@@ -577,6 +622,15 @@ pub(super) fn nice_bytes_ceiling(bytes: f64) -> f64 {
         .find(|step| step * magnitude >= scaled)
         .unwrap_or(10.0);
     step * magnitude * unit
+}
+
+/// The smallest of 1, 2, 5, 10, 20, 50 and 100 percent at or above `percent`, for the
+/// axis of something that takes a sliver of the server.
+pub(super) fn nice_percent_ceiling(percent: f64) -> f64 {
+    [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+        .into_iter()
+        .find(|step| *step >= percent)
+        .unwrap_or(100.0)
 }
 
 /// Formats a byte count with a binary unit, such as `2.36 GiB`.
