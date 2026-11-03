@@ -36,6 +36,14 @@ registers a private GitHub App on it that can only read code. The app sends the 
 back to the address the panel was opened at, so connect from the address you will keep
 using.
 
+Deploying runs `git` and `cargo` from the panel's `PATH`, on the machine itself, or a
+build script of your own that leaves the binary in `OXPLOY_OUTPUT_DIR`. Each app
+runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`. Apps keep
+running when the panel stops or restarts, and the panel takes them back when it starts.
+Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them
+elsewhere. Each app also gets a storage folder that deploys keep, in
+`OXPLOY_STORAGE_DIR`.
+
 ## Project structure
 
 | Path | Contents |

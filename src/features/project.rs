@@ -124,7 +124,7 @@ impl Project {
 }
 
 /// Returns the current time in seconds since the Unix epoch.
-pub(super) fn now() -> i64 {
+pub fn now() -> i64 {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());

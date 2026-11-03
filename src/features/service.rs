@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::deploy::Deployer;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
 use super::project::{Details, Project, now};
@@ -55,10 +56,50 @@ pub struct Service {
     /// The features to enable, comma separated, passed to `cargo build --features`.
     pub cargo_features: Option<String>,
 
+    /// How the service is built. `None` is cargo, as for services made before build
+    /// scripts.
+    pub build_kind: Option<BuildKind>,
+
+    /// The shell script that builds the service, when it builds with a script.
+    pub build_script: Option<String>,
+
+    /// The file the build script leaves in `OXPLOY_OUTPUT_DIR`, which oxploy starts.
+    pub script_binary: Option<String>,
+
     /// The environment variables, written like a `.env` file, as the user wrote them.
     /// See [`environment`].
     pub environment: Option<String>,
+
+    /// The port on 127.0.0.1 the app listens on, passed to it as `PORT`. Chosen the
+    /// first time the app starts, and kept.
+    pub port: Option<u64>,
+
+    /// The deployment whose build runs: the latest one that went live.
+    pub release_id: Option<u64>,
+
+    /// When the user stopped the app, in seconds since the Unix epoch. `None` while it
+    /// should run.
+    pub stopped_at: Option<i64>,
 }
+
+/// How a service is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, toasty::Embed)]
+pub enum BuildKind {
+    /// `cargo build --release`, with the options in the cargo settings.
+    Cargo,
+    /// A shell script the user writes.
+    Script,
+}
+
+/// A build script, as the user wrote it.
+pub struct BuildScript<'a> {
+    pub script: &'a str,
+    /// The file the script leaves in `OXPLOY_OUTPUT_DIR`.
+    pub binary: &'a str,
+}
+
+/// The most bytes a build script may take.
+pub const MAX_SCRIPT_LEN: usize = 16 * 1024;
 
 /// Where a service's code comes from, as the user chose it.
 pub struct Source<'a> {
@@ -131,7 +172,13 @@ impl Service {
             rust_version: None,
             cargo_bin: None,
             cargo_features: None,
+            build_kind: None,
+            build_script: None,
+            script_binary: None,
             environment: None,
+            port: None,
+            release_id: None,
+            stopped_at: None,
         })
         .exec(&mut db(cx))
         .await?;
@@ -188,6 +235,7 @@ impl Service {
         }
         let optional = |value: &str| (!value.is_empty()).then(|| value.to_owned());
         self.update()
+            .build_kind(Some(BuildKind::Cargo))
             .rust_version(optional(rust_version))
             .cargo_bin(optional(binary))
             .cargo_features(features)
@@ -213,6 +261,30 @@ impl Service {
         Ok(Ok(()))
     }
 
+    /// Makes the service build with a script. Returns `false`, changing nothing, if the
+    /// script is empty or too long, or the binary is not a plain file name.
+    pub async fn set_build_script(&mut self, cx: &Cx, build: &BuildScript<'_>) -> Result<bool> {
+        let script = build.script.replace("\r\n", "\n");
+        let script = script.trim();
+        let binary = build.binary.trim();
+        let valid = !script.is_empty() && script.len() <= MAX_SCRIPT_LEN && is_file_name(binary);
+        if !valid {
+            return Ok(false);
+        }
+        self.update()
+            .build_kind(Some(BuildKind::Script))
+            .build_script(Some(script.to_owned()))
+            .script_binary(Some(binary.to_owned()))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(true)
+    }
+
+    /// How the service is built.
+    pub fn builds_with(&self) -> BuildKind {
+        self.build_kind.unwrap_or(BuildKind::Cargo)
+    }
+
     /// The cargo command that builds the service.
     pub fn build_command(&self) -> String {
         let mut command = "cargo build --release".to_owned();
@@ -225,8 +297,9 @@ impl Service {
         command
     }
 
-    /// Deletes the service.
+    /// Stops the service and deletes it, with its deployments and files.
     pub async fn remove(self, cx: &Cx) -> Result<()> {
+        Deployer::get(cx).forget(&self).await?;
         Service::filter_by_id(self.id)
             .delete()
             .exec(&mut db(cx))
@@ -234,12 +307,11 @@ impl Service {
         Ok(())
     }
 
-    /// Deletes every service of a project.
+    /// Deletes every service of a project, as [`remove`](Self::remove) does.
     pub async fn remove_all_in(cx: &Cx, project_id: u64) -> Result<()> {
-        Service::filter_by_project_id(project_id)
-            .delete()
-            .exec(&mut db(cx))
-            .await?;
+        for service in Self::in_project(cx, project_id).await? {
+            service.remove(cx).await?;
+        }
         Ok(())
     }
 }
@@ -350,6 +422,16 @@ fn is_rust_version(version: &str) -> bool {
     }
 }
 
+/// Returns whether `name` is a plain file name, without folders, that is not hidden.
+fn is_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Returns whether `name` is a valid name for a cargo target, such as a binary.
 fn is_target_name(name: &str) -> bool {
     name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -415,6 +497,16 @@ mod tests {
             Some(Some("postgres,tls,serde/derive".to_owned()))
         );
         assert_eq!(normalize_features("bad;feature"), None);
+    }
+
+    #[test]
+    fn script_binaries_are_plain_file_names() {
+        assert!(is_file_name("api"));
+        assert!(is_file_name("shop-api.bin"));
+        assert!(!is_file_name("../api"));
+        assert!(!is_file_name("bin/api"));
+        assert!(!is_file_name(".hidden"));
+        assert!(!is_file_name(""));
     }
 
     #[test]

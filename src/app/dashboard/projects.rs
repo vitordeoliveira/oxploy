@@ -14,7 +14,7 @@ use topcoat::{
         href, page, raw_path_params, route,
     },
     runtime::{Event, Signal, signal},
-    view::{Child, View, attributes, component, element_id, view},
+    view::{Child, View, attributes, class, component, element_id, view},
 };
 
 use super::require_organization;
@@ -31,6 +31,7 @@ use crate::components::field::{field, field_label};
 use crate::components::floating::FloatingAlign;
 use crate::components::input::input;
 use crate::components::textarea::textarea;
+use crate::features::deploy::AppStatus;
 use crate::features::project::{Details, MAX_DESCRIPTION_LEN, MAX_NAME_LEN, Project};
 use crate::features::service::Service;
 use project_id::ProjectId;
@@ -258,14 +259,21 @@ async fn empty_state(
     })
 }
 
-/// Whether a service is running. Nothing deploys yet, so every service shows as not
-/// deployed.
+/// Where a service stands, as a dot and a word.
 #[component]
-async fn deploy_status() -> Result<impl View> {
+async fn deploy_status(status: AppStatus) -> Result<impl View> {
+    let (label, dot) = match status {
+        AppStatus::NotDeployed => ("Not deployed", "bg-muted-foreground/60"),
+        AppStatus::Deploying => ("Deploying", "animate-pulse bg-primary"),
+        AppStatus::Running => ("Running", "bg-emerald-500"),
+        AppStatus::Restarting => ("Restarting", "animate-pulse bg-amber-500"),
+        AppStatus::Stopped => ("Stopped", "bg-muted-foreground/60"),
+    };
+
     Ok(view! {
         <span class="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border px-2 py-0.5 text-xs whitespace-nowrap text-muted-foreground">
-            <span class="size-1.5 rounded-full bg-muted-foreground/60"></span>
-            "Not deployed"
+            <span class=(class!("size-1.5 rounded-full", dot))></span>
+            (label)
         </span>
     })
 }

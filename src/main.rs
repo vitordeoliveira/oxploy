@@ -20,7 +20,15 @@ async fn main() {
     }
 
     let monitor = features::monitoring::Monitor::start().unwrap();
-    topcoat::start(app::router().app_context(db).app_context(monitor).build())
-        .await
-        .unwrap();
+    // Takes back the apps a previous run started, and starts the ones that should run.
+    let deployer = features::deploy::Deployer::start(db.clone()).await.unwrap();
+    topcoat::start(
+        app::router()
+            .app_context(db)
+            .app_context(monitor)
+            .app_context(deployer)
+            .build(),
+    )
+    .await
+    .unwrap();
 }

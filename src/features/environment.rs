@@ -1,6 +1,10 @@
 //! A service's environment variables, written like a `.env` file: one `KEY=value` per
 //! line. oxploy passes them to cargo while it builds and to the binary when it runs, and
 //! the app decides which ones it reads.
+//!
+//! A value can use `${NAME}` for a variable oxploy sets, such as
+//! `DATABASE_URL=sqlite:${OXPLOY_STORAGE_DIR}/data.db`, or for one set on an earlier
+//! line.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -8,14 +12,23 @@ use std::fmt;
 /// The most bytes a service's variables may take, as written.
 pub const MAX_LEN: usize = 64 * 1024;
 
-/// The variable oxploy sets itself, to the port Caddy sends the app's traffic to.
-const RESERVED: &str = "PORT";
+/// The variable with the port Caddy sends the app's traffic to.
+pub const PORT_VARIABLE: &str = "PORT";
+
+/// The variable with the service's storage folder, which survives deploys.
+pub const STORAGE_VARIABLE: &str = "OXPLOY_STORAGE_DIR";
+
+/// The variables oxploy sets for every app, which values can use.
+const PROVIDED: [&str; 2] = [PORT_VARIABLE, STORAGE_VARIABLE];
 
 /// One variable.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Variable {
     pub key: String,
     pub value: String,
+    /// Whether `${NAME}` in the value is replaced. Single quotes around a value turn it
+    /// off, as in a `.env` file.
+    pub expands: bool,
 }
 
 /// Why variables could not be read, and on which line.
@@ -66,20 +79,95 @@ pub fn parse(text: &str) -> Result<Vec<Variable>, EnvironmentError> {
                 "{key:?} is not a variable name: use letters, digits and _, not starting with a digit"
             )));
         }
-        if key == RESERVED {
+        if key == PORT_VARIABLE {
             return Err(problem(
                 "oxploy sets PORT itself, to the port Caddy sends traffic to".to_owned(),
             ));
+        }
+        if key.starts_with("OXPLOY_") {
+            return Err(problem(format!(
+                "{key} starts with OXPLOY_, which is for the variables oxploy sets"
+            )));
+        }
+        let value = value.trim();
+        let expands = !(value.len() >= 2 && value.starts_with('\'') && value.ends_with('\''));
+        let value = unquote(value);
+        if expands {
+            for name in references(value).map_err(problem)? {
+                if !PROVIDED.contains(&name) && !lines_by_key.contains_key(name) {
+                    return Err(problem(format!(
+                        "${{{name}}} is not set on an earlier line, and oxploy does not set it"
+                    )));
+                }
+            }
         }
         if let Some(first) = lines_by_key.insert(key.to_owned(), number) {
             return Err(problem(format!("{key} is already set on line {first}")));
         }
         variables.push(Variable {
             key: key.to_owned(),
-            value: unquote(value.trim()).to_owned(),
+            value: value.to_owned(),
+            expands,
         });
     }
     Ok(variables)
+}
+
+/// Replaces `${NAME}` in the values with what oxploy sets, in `provided`, or with an
+/// earlier variable, and returns the variables to pass on.
+pub fn resolve(variables: Vec<Variable>, provided: &[(&str, String)]) -> Vec<(String, String)> {
+    let mut known: HashMap<String, String> = provided
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect();
+    let mut resolved = Vec::with_capacity(variables.len());
+    for variable in variables {
+        let value = if variable.expands {
+            expand(&variable.value, &known)
+        } else {
+            variable.value
+        };
+        known.insert(variable.key.clone(), value.clone());
+        resolved.push((variable.key, value));
+    }
+    resolved
+}
+
+/// Returns the names a value uses as `${NAME}`, or why it cannot be read.
+fn references(value: &str) -> Result<Vec<&str>, String> {
+    let mut names = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or("${ is not closed with }")?;
+        let name = &after[..end];
+        if !is_key(name) {
+            return Err(format!("${{{name}}} is not a variable name"));
+        }
+        names.push(name);
+        rest = &after[end + 1..];
+    }
+    Ok(names)
+}
+
+/// Replaces each `${NAME}` in `value` with its value in `known`.
+fn expand(value: &str, known: &HashMap<String, String>) -> String {
+    let mut expanded = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        match known.get(&after[..end]) {
+            Some(value) => expanded.push_str(value),
+            None => expanded.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    expanded.push_str(rest);
+    expanded
 }
 
 /// Returns whether `key` can name an environment variable.
@@ -117,6 +205,14 @@ mod tests {
             .collect()
     }
 
+    fn resolved(text: &str) -> Vec<(String, String)> {
+        let provided = [
+            (PORT_VARIABLE, "10000".to_owned()),
+            (STORAGE_VARIABLE, "/srv/shop".to_owned()),
+        ];
+        resolve(parse(text).unwrap(), &provided)
+    }
+
     #[test]
     fn reads_a_dotenv_file() {
         let text = "# Database\nDATABASE_URL=postgres://db/shop?ssl=true\n\nexport RUST_LOG = info\nGREETING=\"hello world\"\nEMPTY=\n";
@@ -138,6 +234,33 @@ mod tests {
         assert!(error("1A=x").starts_with("Line 1: \"1A\" is not a variable name"));
         assert_eq!(error("A=1\n\nA=2"), "Line 3: A is already set on line 1");
         assert!(error("PORT=8080").contains("oxploy sets PORT itself"));
+        assert!(error("OXPLOY_STORAGE_DIR=/tmp").contains("starts with OXPLOY_"));
+    }
+
+    #[test]
+    fn uses_what_oxploy_sets_and_earlier_lines() {
+        let text = "DATABASE_URL=sqlite:${OXPLOY_STORAGE_DIR}/data.db\nHOST=127.0.0.1\nPUBLIC_URL=http://${HOST}:${PORT}/\nLITERAL='${HOST}'";
+        assert_eq!(
+            resolved(text),
+            [
+                ("DATABASE_URL".to_owned(), "sqlite:/srv/shop/data.db".to_owned()),
+                ("HOST".to_owned(), "127.0.0.1".to_owned()),
+                ("PUBLIC_URL".to_owned(), "http://127.0.0.1:10000/".to_owned()),
+                ("LITERAL".to_owned(), "${HOST}".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_names_it_cannot_fill() {
+        let error = |text| parse(text).unwrap_err().to_string();
+        assert_eq!(
+            error("A=${LATER}\nLATER=1"),
+            "Line 1: ${LATER} is not set on an earlier line, and oxploy does not set it"
+        );
+        assert_eq!(error("A=${HOME"), "Line 1: ${ is not closed with }");
+        assert_eq!(error("A=${1X}"), "Line 1: ${1X} is not a variable name");
+        assert_eq!(pairs("PRICE=$5"), [("PRICE".to_owned(), "$5".to_owned())]);
     }
 
     #[test]

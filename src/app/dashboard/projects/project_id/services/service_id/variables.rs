@@ -91,7 +91,7 @@ pub async fn environment_tab(
                     } else {
                         field_description(
                             attrs: attributes! { id=(&hint_id) },
-                            "One KEY=value per line, like a .env file. Lines starting with # are comments. oxploy sets PORT itself."
+                            "One KEY=value per line, like a .env file; lines starting with # are comments. Values can use ${PORT}, ${OXPLOY_STORAGE_DIR} or a variable from an earlier line, as in DATABASE_URL=sqlite:${OXPLOY_STORAGE_DIR}/data.db."
                         )
                     }
                 )

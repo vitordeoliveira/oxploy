@@ -1,0 +1,466 @@
+//! Runs each service's release as a process on this machine, listening on 127.0.0.1.
+//!
+//! A process outlives the panel: it runs in a process group of its own, so stopping the
+//! panel does not stop it, and its PID is written next to its files, so a restarted
+//! panel takes it back instead of starting a second copy. While the panel runs, it
+//! starts a process again after it exits, waiting longer after each crash.
+//!
+//! This is the native runtime. A Docker runtime would run containers behind the same
+//! methods, published on the same port.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use sysinfo::{Pid, ProcessesToUpdate, System};
+use toasty::Db;
+
+use super::app_files::AppFiles;
+use super::deployment::Deployment;
+use super::environment::{self, PORT_VARIABLE, STORAGE_VARIABLE};
+use super::service::Service;
+
+/// How often the panel checks that the apps that should run are running.
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long an app may take to exit after being asked to, before it is killed.
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long an app must run before its earlier crashes stop lengthening the wait
+/// before the next restart.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// The longest wait before starting a crashed app again.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The largest an app's log grows before the next start moves it aside.
+const MAX_LOG_LEN: u64 = 10 * 1024 * 1024;
+
+/// What starting a service's release takes.
+pub struct Launch {
+    pub service_id: u64,
+    pub files: AppFiles,
+    pub release_id: u64,
+    pub binary: PathBuf,
+    /// The folder the binary runs in: the build path in the release's code.
+    pub work_dir: PathBuf,
+    pub port: u64,
+    pub variables: Vec<(String, String)>,
+}
+
+impl Launch {
+    /// Returns how to start the service's release, or `None` if it has none.
+    pub async fn of(db: &Db, service: &Service) -> toasty::Result<Option<Launch>> {
+        let (Some(release_id), Some(port)) = (service.release_id, service.port) else {
+            return Ok(None);
+        };
+        let Some(release) = Deployment::filter_by_id(release_id)
+            .first()
+            .exec(&mut db.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(binary) = &release.binary else {
+            return Ok(None);
+        };
+        let files = AppFiles::of(&service.app_name);
+        let source = files.source(release_id);
+        let work_dir = match &release.build_path {
+            Some(path) => source.join(path),
+            None => source,
+        };
+        let variables = app_variables(service, &files, port);
+        Ok(Some(Launch {
+            service_id: service.id,
+            binary: files.binary(release_id, binary),
+            files,
+            release_id,
+            work_dir,
+            port,
+            variables,
+        }))
+    }
+}
+
+/// What became of an app that was just started.
+pub enum Readiness {
+    /// It accepts connections on its port.
+    Listening,
+    /// It still runs but nothing answers on its port, as with a worker.
+    NotListening,
+    /// It exited, as described.
+    Exited(String),
+}
+
+/// The processes of the services that run on this machine.
+pub struct Runtime {
+    db: Db,
+    processes: Mutex<HashMap<u64, Process>>,
+    /// Services a deployment or the user is starting or stopping, which the watcher
+    /// leaves alone meanwhile.
+    busy: Mutex<HashSet<u64>>,
+}
+
+/// A running app.
+struct Process {
+    pid: u32,
+    /// The child, when this run of the panel started it. A process taken back after the
+    /// panel restarted is not its child.
+    child: Option<Child>,
+    started: Instant,
+}
+
+impl Process {
+    /// Describes how the process exited, or returns `None` while it runs.
+    fn exited(&mut self) -> Option<String> {
+        match &mut self.child {
+            Some(child) => match child.try_wait() {
+                Ok(None) => None,
+                Ok(Some(status)) => Some(status.to_string()),
+                Err(error) => Some(error.to_string()),
+            },
+            None => (!is_alive(self.pid)).then(|| "it exited".to_owned()),
+        }
+    }
+}
+
+/// Keeps the watcher away from a service until dropped.
+pub struct Hold<'a> {
+    runtime: &'a Runtime,
+    service_id: u64,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        lock(&self.runtime.busy).remove(&self.service_id);
+    }
+}
+
+/// The restarts of a service that keeps exiting.
+#[derive(Default)]
+struct Crashes {
+    count: u32,
+    retry_at: Option<Instant>,
+}
+
+impl Runtime {
+    pub fn new(db: Db) -> Runtime {
+        Runtime {
+            db,
+            processes: Mutex::default(),
+            busy: Mutex::default(),
+        }
+    }
+
+    /// Starts checking, on a task of its own, that every service that should run does:
+    /// taking back the ones a previous run of the panel started, and starting the rest.
+    pub fn watch(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut crashes = HashMap::new();
+            loop {
+                if let Err(error) = self.check(&mut crashes).await {
+                    eprintln!("oxploy: could not check the running apps: {error}");
+                }
+                tokio::time::sleep(WATCH_INTERVAL).await;
+            }
+        });
+    }
+
+    /// Keeps the watcher away from the service while the returned value lives.
+    pub fn hold(&self, service_id: u64) -> Hold<'_> {
+        lock(&self.busy).insert(service_id);
+        Hold {
+            runtime: self,
+            service_id,
+        }
+    }
+
+    /// Returns whether the service's process runs.
+    pub fn is_running(&self, service_id: u64) -> bool {
+        lock(&self.processes)
+            .get_mut(&service_id)
+            .is_some_and(|process| process.exited().is_none())
+    }
+
+    /// Starts the release in `launch`. Whatever ran for the service before must have
+    /// been stopped.
+    pub fn start(&self, launch: &Launch) -> io::Result<()> {
+        let log_path = launch.files.app_log();
+        if let Some(logs) = log_path.parent() {
+            fs::create_dir_all(logs)?;
+        }
+        if fs::metadata(&log_path).is_ok_and(|metadata| metadata.len() > MAX_LOG_LEN) {
+            let _ = fs::rename(&log_path, log_path.with_extension("log.1"));
+        }
+        let storage = launch.files.storage();
+        fs::create_dir_all(&storage)?;
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        writeln!(
+            log,
+            "==> {} Starting release #{} on 127.0.0.1:{}",
+            jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S"),
+            launch.release_id,
+            launch.port,
+        )?;
+
+        let child = Command::new(&launch.binary)
+            .current_dir(&launch.work_dir)
+            .env_clear()
+            .envs(system_env())
+            .envs(launch.variables.iter().map(|(key, value)| (key, value)))
+            .env(PORT_VARIABLE, launch.port.to_string())
+            .env(STORAGE_VARIABLE, &storage)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            // A group of its own keeps the app running when the panel stops, as with
+            // Ctrl+C in the panel's terminal.
+            .process_group(0)
+            .spawn()?;
+        fs::write(
+            launch.files.pid_file(),
+            format!("{}\n{}\n", child.id(), launch.release_id),
+        )?;
+        lock(&self.processes).insert(
+            launch.service_id,
+            Process {
+                pid: child.id(),
+                child: Some(child),
+                started: Instant::now(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Stops the service's process, if it runs: asks it to exit, and kills it if it has
+    /// not after [`STOP_TIMEOUT`]. Anything it started in its group stops with it.
+    pub async fn stop(&self, service_id: u64, files: &AppFiles) {
+        let process = lock(&self.processes)
+            .remove(&service_id)
+            .or_else(|| running_from(files).map(|(pid, _)| Process {
+                pid,
+                child: None,
+                started: Instant::now(),
+            }));
+        if let Some(mut process) = process {
+            signal_group(process.pid, libc::SIGTERM);
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while process.exited().is_none() {
+                if Instant::now() >= deadline {
+                    signal_group(process.pid, libc::SIGKILL);
+                    deadline_wait(&mut process).await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let _ = fs::remove_file(files.pid_file());
+    }
+
+    /// Waits up to `timeout` for the service's new process to accept connections on its
+    /// port.
+    pub async fn wait_until_ready(&self, service_id: u64, port: u64, timeout: Duration) -> Readiness {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let exited = lock(&self.processes)
+                .get_mut(&service_id)
+                .map_or_else(|| Some("it is gone".to_owned()), Process::exited);
+            if let Some(how) = exited {
+                return Readiness::Exited(how);
+            }
+            let address = ("127.0.0.1", u16::try_from(port).unwrap_or(u16::MAX));
+            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                return Readiness::Listening;
+            }
+            if Instant::now() >= deadline {
+                return Readiness::NotListening;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Makes sure each service that should run does, once.
+    async fn check(&self, crashes: &mut HashMap<u64, Crashes>) -> toasty::Result<()> {
+        let services = Service::all().exec(&mut self.db.clone()).await?;
+        for service in services {
+            let should_run = service.release_id.is_some() && service.stopped_at.is_none();
+            if !should_run || lock(&self.busy).contains(&service.id) {
+                crashes.remove(&service.id);
+                continue;
+            }
+
+            let exited = {
+                let mut processes = lock(&self.processes);
+                match processes.get_mut(&service.id) {
+                    None => None,
+                    Some(process) => match process.exited() {
+                        None => {
+                            if process.started.elapsed() > STABLE_AFTER {
+                                crashes.remove(&service.id);
+                            }
+                            continue;
+                        }
+                        Some(how) => {
+                            processes.remove(&service.id);
+                            Some(how)
+                        }
+                    },
+                }
+            };
+            let Some(launch) = Launch::of(&self.db, &service).await? else {
+                continue;
+            };
+            let crash = crashes.entry(service.id).or_default();
+            if let Some(how) = exited {
+                crash.count += 1;
+                let wait = backoff(crash.count);
+                crash.retry_at = Some(Instant::now() + wait);
+                note(
+                    &launch.files,
+                    &format!("The app exited ({how}). Starting it again in {}s.", wait.as_secs()),
+                );
+            } else if crash.retry_at.is_none() && self.take_back(&launch) {
+                continue;
+            }
+            if crash.retry_at.is_some_and(|retry_at| Instant::now() < retry_at) {
+                continue;
+            }
+            if let Err(error) = self.start(&launch) {
+                crash.count += 1;
+                crash.retry_at = Some(Instant::now() + backoff(crash.count));
+                note(&launch.files, &format!("The app could not start: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tracks the process a previous run of the panel started for `launch`, if it still
+    /// runs that release.
+    fn take_back(&self, launch: &Launch) -> bool {
+        let Some((pid, release_id)) = running_from(&launch.files) else {
+            return false;
+        };
+        if release_id != launch.release_id {
+            return false;
+        }
+        lock(&self.processes).insert(
+            launch.service_id,
+            Process {
+                pid,
+                child: None,
+                started: Instant::now(),
+            },
+        );
+        true
+    }
+}
+
+/// The service's variables as its app and builds get them, with each `${NAME}` filled
+/// in from what oxploy sets for the app or from an earlier line.
+pub fn app_variables(service: &Service, files: &AppFiles, port: u64) -> Vec<(String, String)> {
+    // Saved variables always parse: a problem is refused when saving.
+    let variables =
+        environment::parse(service.environment.as_deref().unwrap_or("")).unwrap_or_default();
+    let provided = [
+        (PORT_VARIABLE, port.to_string()),
+        (STORAGE_VARIABLE, files.storage().display().to_string()),
+    ];
+    environment::resolve(variables, &provided)
+}
+
+/// The variables of the panel's own environment that programs need, such as `PATH`.
+/// The rest, such as the panel's `DATABASE_URL`, stay with the panel.
+pub fn system_env() -> impl Iterator<Item = (&'static str, String)> {
+    const PASSED: [&str; 8] = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+    PASSED
+        .into_iter()
+        .filter_map(|name| Some((name, std::env::var(name).ok()?)))
+}
+
+/// Returns the process in the app's PID file and the release it runs, if it is alive
+/// and runs one of the app's binaries, which rules out a PID since reused by another
+/// program.
+fn running_from(files: &AppFiles) -> Option<(u32, u64)> {
+    let text = fs::read_to_string(files.pid_file()).ok()?;
+    let mut lines = text.lines();
+    let pid: u32 = lines.next()?.parse().ok()?;
+    let release_id: u64 = lines.next()?.parse().ok()?;
+    let releases = fs::canonicalize(files.releases()).ok()?;
+    let mut system = System::new().ok()?;
+    let process_id = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[process_id]), true);
+    let exe = system.process(process_id)?.exe()?;
+    let exe = fs::canonicalize(exe).ok()?;
+    exe.starts_with(&releases).then_some((pid, release_id))
+}
+
+/// Returns whether a process with this PID exists.
+fn is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Sends `signal` to the process group the app leads.
+fn signal_group(pid: u32, signal: libc::c_int) {
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        // SAFETY: a negative PID addresses the app's process group, which oxploy made
+        // when it started the app.
+        unsafe {
+            libc::kill(-pid, signal);
+        }
+    }
+}
+
+/// Waits a moment for a killed process to be gone, so its port is free again.
+async fn deadline_wait(process: &mut Process) {
+    for _ in 0..20 {
+        if process.exited().is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// How long to wait before the next start, after `crashes` crashes in a row: one
+/// second, doubling up to [`MAX_BACKOFF`].
+fn backoff(crashes: u32) -> Duration {
+    let seconds = 1u64 << crashes.saturating_sub(1).min(6);
+    Duration::from_secs(seconds).min(MAX_BACKOFF)
+}
+
+/// Adds a line from oxploy to the app's log, between the app's own lines.
+fn note(files: &AppFiles, text: &str) {
+    let log = OpenOptions::new().create(true).append(true).open(files.app_log());
+    if let Ok(mut log) = log {
+        let now = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(log, "==> {now} {text}");
+    }
+}
+
+/// Locks a mutex, carrying on if a panic poisoned it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarts_wait_longer_after_each_crash() {
+        let waits: Vec<_> = (1..=9).map(|crashes| backoff(crashes).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+}

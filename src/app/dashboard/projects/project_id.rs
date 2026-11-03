@@ -21,6 +21,7 @@ use crate::app::dashboard::projects::{
 };
 use crate::app::dashboard::{back, require_organization};
 use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::features::deploy::Deployer;
 use crate::features::project::Project;
 use crate::features::service::Service;
 use services::service_id::{self, ServiceId};
@@ -147,7 +148,9 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
 
 /// A service in the grid. The whole card opens it.
 #[component]
-async fn service_card(project: &Project, service: &Service) -> Result<impl View> {
+async fn service_card(cx: &Cx, project: &Project, service: &Service) -> Result<impl View> {
+    let status = Deployer::get(cx).status(service);
+
     Ok(view! {
         <li class="relative flex min-h-36 flex-col gap-3 rounded-xl border border-border bg-card p-4 transition-colors hover:border-primary/50">
             <div class="flex items-start gap-3">
@@ -164,7 +167,7 @@ async fn service_card(project: &Project, service: &Service) -> Result<impl View>
                     </a>
                     <span class="truncate font-mono text-xs text-muted-foreground">(&service.app_name)</span>
                 </div>
-                deploy_status()
+                deploy_status(status: status)
             </div>
             if let Some(description) = &service.description {
                 <p class="line-clamp-2 text-sm text-muted-foreground">(description)</p>

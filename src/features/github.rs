@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,7 @@ pub struct Repository {
 }
 
 /// The branches of a repository.
+#[derive(Clone)]
 pub struct Branches {
     pub default: String,
     pub names: Vec<String>,
@@ -276,11 +278,18 @@ impl GithubApp {
         Ok(Ok(()))
     }
 
-    /// Returns the repositories the installation can read, sorted by name.
+    /// Returns the repositories the installation can read, sorted by name. The list is
+    /// reused for [`LIST_REUSE`].
     pub async fn repositories(&self) -> Result<Vec<Repository>, GithubError> {
         #[derive(Deserialize)]
         struct Page {
             repositories: Vec<Repository>,
+        }
+        static LISTED: LazyLock<Kept<u64, Vec<Repository>>> = LazyLock::new(Default::default);
+
+        let installation = self.installation_id.ok_or(GithubError::NotInstalled)?;
+        if let Some(repositories) = recent(&LISTED, &installation) {
+            return Ok(repositories);
         }
         let token = self.installation_token().await?;
         let mut repositories = Vec::new();
@@ -294,10 +303,12 @@ impl GithubApp {
             }
         }
         repositories.sort_by_key(|repository| repository.full_name.to_lowercase());
+        remember(&LISTED, installation, repositories.clone());
         Ok(repositories)
     }
 
-    /// Returns the branches of a repository the installation can read.
+    /// Returns the branches of a repository the installation can read. They are reused
+    /// for [`LIST_REUSE`].
     pub async fn branches(&self, repository: &str) -> Result<Branches, GithubError> {
         #[derive(Deserialize)]
         struct Details {
@@ -307,11 +318,18 @@ impl GithubApp {
         struct Branch {
             name: String,
         }
+        static LISTED: LazyLock<Kept<(u64, String), Branches>> = LazyLock::new(Default::default);
+
         if !is_repository_name(repository) {
             return Err(GithubError::Rejected {
                 status: 404,
                 message: "Not Found".to_owned(),
             });
+        }
+        let installation = self.installation_id.ok_or(GithubError::NotInstalled)?;
+        let key = (installation, repository.to_owned());
+        if let Some(branches) = recent(&LISTED, &key) {
+            return Ok(branches);
         }
         let token = self.installation_token().await?;
         let details: Details =
@@ -326,10 +344,12 @@ impl GithubApp {
                 break;
             }
         }
-        Ok(Branches {
+        let branches = Branches {
             default: details.default_branch,
             names,
-        })
+        };
+        remember(&LISTED, key, branches.clone());
+        Ok(branches)
     }
 
     /// Deletes the app from oxploy. It stays registered on GitHub until the user
@@ -372,9 +392,10 @@ impl GithubApp {
             .map_err(|error| GithubError::Unexpected(format!("signing a token: {error}")))
     }
 
-    /// Returns a token that acts through the app's installation. GitHub issues them for
-    /// an hour, so each one is reused for most of that.
-    async fn installation_token(&self) -> Result<String, GithubError> {
+    /// Returns a token that acts through the app's installation, such as to fetch its
+    /// repositories with git. GitHub issues them for an hour, so each one is reused for
+    /// most of that.
+    pub async fn installation_token(&self) -> Result<String, GithubError> {
         const REUSE: Duration = Duration::from_secs(50 * 60);
         static TOKENS: LazyLock<Mutex<HashMap<u64, (String, Instant)>>> =
             LazyLock::new(Default::default);
@@ -423,6 +444,27 @@ fn is_login(login: &str) -> bool {
         && login.len() <= 39
         && !login.starts_with('-')
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// How long lists of repositories and branches are reused, so moving around the panel
+/// does not ask GitHub each time. New ones show up after this long.
+const LIST_REUSE: Duration = Duration::from_secs(60);
+
+/// Values read from GitHub, each with when it was read.
+type Kept<K, V> = Mutex<HashMap<K, (Instant, V)>>;
+
+/// Returns the value kept for `key`, if it is younger than [`LIST_REUSE`].
+fn recent<K: Eq + Hash, V: Clone>(kept: &Kept<K, V>, key: &K) -> Option<V> {
+    let kept = kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (at, value) = kept.get(key)?;
+    (at.elapsed() < LIST_REUSE).then(|| value.clone())
+}
+
+/// Keeps `value` for `key`, dropping values that are too old to use.
+fn remember<K: Eq + Hash, V>(kept: &Kept<K, V>, key: K, value: V) {
+    let mut kept = kept.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    kept.retain(|_, (at, _)| at.elapsed() < LIST_REUSE);
+    kept.insert(key, (Instant::now(), value));
 }
 
 /// How many results GitHub returns per page at most.

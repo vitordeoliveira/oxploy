@@ -1,39 +1,53 @@
-//! One service, with a tab for each part of deploying it. Only General has settings
-//! so far; the other tabs say what they will hold.
+//! One service, with a tab for each part of deploying it. The tabs that have nothing
+//! yet say what they will hold.
 
 mod general;
+mod history;
+mod output;
 pub mod tab;
 mod variables;
 
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
+use std::time::Duration;
 
 use topcoat::{
     Result,
     context::Cx,
     icon::{IconData, icon, iconify::iconify_icon},
     router::{
+        Uri,
         content::Form,
         error::{RouterErrorExt, SeeOther, bad_request, see_other},
-        href, module_param, page, path_param, route,
+        header::HOST,
+        href, module_param, page, path_param,
+        request::{headers, uri},
+        route,
     },
-    runtime::{Event, signal},
-    view::{Child, View, attributes, component, view},
+    runtime::{Event, connected, shard, signal},
+    view::{Child, View, attributes, component, emit, live, view},
 };
 
 use super::super::{ProjectId, current_project};
-use crate::app::dashboard::back;
+use crate::app::dashboard::{back, require_organization};
 use crate::app::dashboard::projects::{
     DetailsForm, INVALID_DETAILS, created_at, delete_dialog, deploy_status, details_dialog,
     empty_state,
 };
-use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::components::button::{ButtonSize, ButtonVariant, button, button_variants};
 use crate::components::tabs::{tabs, tabs_content, tabs_list, tabs_trigger};
+use crate::features::deploy::{AppStatus, Deployer};
 use crate::features::project::Project;
 use crate::features::service::Service;
 use general::general_tab;
+use history::deployments_tab;
+use output::logs_tab;
 use tab::Tab;
 use variables::{Draft, environment_tab};
+
+/// How often the service's status refreshes on its page.
+const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
 module_param!(pub service_id: u64, error = not_found);
 
@@ -53,13 +67,13 @@ pub async fn current_service(cx: &Cx) -> Result<(Project, Service)> {
 pub enum ServiceTab {
     General,
     Environment,
+    Storage,
     Domains,
     Deployments,
     Logs,
     Monitoring,
     PreviewDeployments,
     Schedules,
-    VolumeBackups,
     Patches,
     Advanced,
 }
@@ -69,13 +83,13 @@ impl ServiceTab {
     const ALL: [ServiceTab; 11] = [
         Self::General,
         Self::Environment,
+        Self::Storage,
         Self::Domains,
         Self::Deployments,
         Self::Logs,
         Self::Monitoring,
         Self::PreviewDeployments,
         Self::Schedules,
-        Self::VolumeBackups,
         Self::Patches,
         Self::Advanced,
     ];
@@ -85,13 +99,13 @@ impl ServiceTab {
         match self {
             Self::General => "general",
             Self::Environment => "environment",
+            Self::Storage => "storage",
             Self::Domains => "domains",
             Self::Deployments => "deployments",
             Self::Logs => "logs",
             Self::Monitoring => "monitoring",
             Self::PreviewDeployments => "preview-deployments",
             Self::Schedules => "schedules",
-            Self::VolumeBackups => "volume-backups",
             Self::Patches => "patches",
             Self::Advanced => "advanced",
         }
@@ -101,13 +115,13 @@ impl ServiceTab {
         match self {
             Self::General => "General",
             Self::Environment => "Environment",
+            Self::Storage => "Storage",
             Self::Domains => "Domains",
             Self::Deployments => "Deployments",
             Self::Logs => "Logs",
             Self::Monitoring => "Monitoring",
             Self::PreviewDeployments => "Preview deployments",
             Self::Schedules => "Schedules",
-            Self::VolumeBackups => "Volume backups",
             Self::Patches => "Patches",
             Self::Advanced => "Advanced",
         }
@@ -117,13 +131,13 @@ impl ServiceTab {
         match self {
             Self::General => iconify_icon!("lucide:git-branch"),
             Self::Environment => iconify_icon!("lucide:key-round"),
+            Self::Storage => iconify_icon!("lucide:database"),
             Self::Domains => iconify_icon!("lucide:globe"),
             Self::Deployments => iconify_icon!("lucide:rocket"),
             Self::Logs => iconify_icon!("lucide:scroll-text"),
             Self::Monitoring => iconify_icon!("lucide:activity"),
             Self::PreviewDeployments => iconify_icon!("lucide:git-pull-request"),
             Self::Schedules => iconify_icon!("lucide:calendar-clock"),
-            Self::VolumeBackups => iconify_icon!("lucide:hard-drive-download"),
             Self::Patches => iconify_icon!("lucide:file-diff"),
             Self::Advanced => iconify_icon!("lucide:sliders-horizontal"),
         }
@@ -138,6 +152,7 @@ impl ServiceTab {
             Self::Environment => {
                 "Variables passed to cargo while it builds and to the binary when it runs."
             }
+            Self::Storage => "The folder that keeps the app's data, its SQLite databases and their backups.",
             Self::Domains => {
                 "The hostnames Caddy sends to this app, with HTTPS certificates it renews on its own."
             }
@@ -150,7 +165,6 @@ impl ServiceTab {
                 "A temporary copy of the app for each pull request, on its own subdomain."
             }
             Self::Schedules => "Commands that run on a schedule, like cron jobs.",
-            Self::VolumeBackups => "Copies of the service's volumes, made on a schedule.",
             Self::Patches => "Changes applied to the repository before each build.",
             Self::Advanced => {
                 "The port the app listens on, resource limits, volumes and the command that starts it."
@@ -215,6 +229,8 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
     let open_editing = editing.clone();
     let open_deleting = deleting.clone();
     let return_to = tab.url(cx, &project, &service);
+    let local = panel_is_local(cx);
+    let (project_id, service_id) = (project.id, service.id);
     let links: Vec<_> = ServiceTab::ALL
         .into_iter()
         .map(|other| (other, other.url(cx, &project, &service)))
@@ -230,7 +246,7 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                     <div class="flex min-w-0 flex-col gap-1">
                         <div class="flex min-w-0 flex-wrap items-center gap-2">
                             <h1 class="truncate text-2xl font-semibold tracking-tight">(&service.name)</h1>
-                            deploy_status()
+                            service_status(project_id: project_id, service_id: service_id, local: local)
                         </div>
                         <p class="flex flex-wrap items-center gap-x-2 text-sm text-muted-foreground">
                             <span class="font-mono text-xs" title="App name">(&service.app_name)</span>
@@ -292,6 +308,12 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         ServiceTab::Environment => {
                             environment_tab(service: &service, here: &return_to, draft: draft)
                         }
+                        ServiceTab::Deployments => {
+                            deployments_tab(project: &project, service: &service, here: &return_to)
+                        }
+                        ServiceTab::Logs => {
+                            logs_tab(service: &service)
+                        }
                         _ => {
                             empty_state(
                                 symbol: tab.icon(),
@@ -320,9 +342,120 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
             open: &deleting,
             title: "Delete service",
             name: &service.name,
+            consequence: " with the files in its storage".to_owned(),
             action: href!(remove, ProjectId(project.id), ServiceId(service.id)).resolve(cx)
         )
     })
+}
+
+/// The service's status, refreshed every [`STATUS_INTERVAL`].
+///
+/// It is a shard so that the connection that refreshes it is its own: a page connected
+/// as a whole renders again as a plain `GET`, which would drop a form the page shows
+/// back with a problem, such as the Environment tab's. A shard answers requests of its
+/// own, so it checks access itself.
+#[shard]
+async fn service_status(cx: &Cx, project_id: u64, service_id: u64, local: bool) -> Result<impl View> {
+    let organization = require_organization(cx).await?;
+    let project = Project::find_in(cx, organization.id, project_id)
+        .await?
+        .ok_or_not_found()?;
+
+    Ok(view! {
+        (live! {
+            loop {
+                let service = Service::find_in(cx, project.id, service_id)
+                    .await?
+                    .ok_or_not_found()?;
+                let status = Deployer::get(cx).status(&service);
+                // The app listens on 127.0.0.1, which only a browser on the same machine
+                // reaches.
+                let open = service
+                    .port
+                    .filter(|_| local && status == AppStatus::Running)
+                    .map(|port| format!("http://127.0.0.1:{port}"));
+                let token = emit! { status_line(status: status, open: open.as_deref()) }?;
+                if !connected(cx) {
+                    break Ok(token);
+                }
+                tokio::time::sleep(STATUS_INTERVAL).await;
+            }
+        })
+    })
+}
+
+/// The service's status, with a link that opens the app when the browser can reach it.
+#[component]
+async fn status_line(status: AppStatus, open: Option<&str>) -> Result<impl View> {
+    Ok(view! {
+        <span class="inline-flex items-center gap-2">
+            deploy_status(status: status)
+            if let Some(open) = open {
+                <a
+                    href=(open)
+                    target="_blank"
+                    rel="noreferrer"
+                    class=(button_variants(ButtonVariant::Outline, ButtonSize::Sm))
+                >
+                    "Open"
+                    icon(data: iconify_icon!("lucide:external-link"), size: 14)
+                </a>
+            }
+        </span>
+    })
+}
+
+/// Whether the browser reached the panel on the machine it runs on, so it can also
+/// open an app's 127.0.0.1 address.
+fn panel_is_local(cx: &Cx) -> bool {
+    let host = match uri(cx).authority() {
+        Some(authority) => authority.host().to_owned(),
+        None => headers(cx)
+            .get(HOST)
+            .and_then(|host| host.to_str().ok())
+            .and_then(|host| format!("http://{host}").parse::<Uri>().ok())
+            .and_then(|uri| uri.host().map(str::to_owned))
+            .unwrap_or_default(),
+    };
+    let address = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || address.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
+/// The end of a log, which stays scrolled to its newest line as lines arrive. Lines
+/// from oxploy, which start with `==>`, stand out, as do errors and warnings.
+#[component]
+async fn log_lines(log: &str, empty: &str) -> Result<impl View> {
+    Ok(view! {
+        if log.is_empty() {
+            <p class="rounded-lg bg-muted px-4 py-6 text-center text-sm text-muted-foreground">(empty)</p>
+        } else {
+            // Reversed, so the browser keeps the view at the bottom as the log grows.
+            <div class="flex max-h-[36rem] min-h-48 flex-col-reverse overflow-auto rounded-lg bg-muted p-4">
+                <div class="font-mono text-xs leading-relaxed">
+                    #[key(index)]
+                    for (index, line) in log.lines().enumerate() {
+                        <div class=(log_line_class(line))>(line)</div>
+                    }
+                </div>
+            </div>
+        }
+    })
+}
+
+/// How a log line looks, by what it says.
+fn log_line_class(line: &str) -> &'static str {
+    let line = line.trim_start();
+    if line.starts_with("==> ") {
+        "min-h-[1.625em] font-semibold whitespace-pre-wrap break-all text-foreground"
+    } else if line.starts_with("error") {
+        "min-h-[1.625em] whitespace-pre-wrap break-all text-destructive"
+    } else if line.starts_with("warning") {
+        "min-h-[1.625em] whitespace-pre-wrap break-all text-amber-700 dark:text-amber-400"
+    } else {
+        "min-h-[1.625em] whitespace-pre-wrap break-all text-foreground/75"
+    }
 }
 
 /// A card with a heading over one group of settings.
