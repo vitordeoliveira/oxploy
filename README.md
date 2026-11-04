@@ -62,6 +62,10 @@ oxploy builds every route from the database and loads them through Caddy's admin
 `127.0.0.1:2019` unless `OXPLOY_CADDY_ADMIN` says otherwise, and loads them again whenever
 Caddy loses them, as after a restart. Caddy serves ports 80 and 443 (`OXPLOY_HTTP_PORT` and
 `OXPLOY_HTTPS_PORT` change them) and gets each domain's certificate from Let's Encrypt.
+Caddy also sends oxploy the requests an app answered with a server error, at
+`127.0.0.1:2020` unless `OXPLOY_CADDY_LOGS` says otherwise, and oxploy writes them in the
+app's log: an app may answer 500 without printing why, and Caddy answers 502 when the app
+does not answer.
 A service without a domain the first time it goes live gets one at the server's public
 IPv4 address through [sslip.io](https://sslip.io), such as
 `shop-api.203-0-113-7.sslip.io`, over HTTPS, so it opens without a DNS record. oxploy

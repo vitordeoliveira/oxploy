@@ -556,7 +556,7 @@ fn backoff(crashes: u32) -> Duration {
 }
 
 /// Adds a line from oxploy to the app's log, between the app's own lines.
-fn note(files: &AppFiles, text: &str) {
+pub(super) fn note(files: &AppFiles, text: &str) {
     let log = OpenOptions::new().create(true).append(true).open(files.app_log());
     if let Ok(mut log) = log {
         let now = time_zone::now().strftime("%Y-%m-%d %H:%M:%S");

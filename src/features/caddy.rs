@@ -10,6 +10,9 @@
 //! The panel also answers at the server's public address, with a short-lived
 //! certificate for the address, so a fresh install can be set up over HTTPS before it
 //! has a domain.
+//!
+//! Caddy sends oxploy the requests an app answered with a server error, which
+//! [`access_log`](super::access_log) writes in the app's log.
 
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -20,6 +23,7 @@ use tokio::sync::Notify;
 use toasty::Db;
 use topcoat::context::{Cx, app_context};
 
+use super::access_log;
 use super::domain::{self, Domain, PanelDomain};
 use super::service::Service;
 
@@ -28,6 +32,15 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Where Caddy's admin API listens when `OXPLOY_CADDY_ADMIN` does not say.
 const DEFAULT_ADMIN: &str = "127.0.0.1:2019";
+
+/// Where oxploy takes Caddy's log of the apps' server errors when `OXPLOY_CADDY_LOGS`
+/// does not say.
+const DEFAULT_LOGS: &str = "127.0.0.1:2020";
+
+/// The name of the logs Caddy sends oxploy, and of the loggers of the apps' requests
+/// under `http.log.access` and `http.log.error`, such as
+/// `http.log.access.oxploy.shop-api`.
+pub const ACCESS_LOGGER: &str = "oxploy";
 
 /// Talks to Caddy's admin API, which answers right away when it runs.
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
@@ -43,6 +56,9 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
 pub struct Ports {
     /// The admin API's address, such as `127.0.0.1:2019`.
     pub admin: String,
+    /// Where oxploy listens for Caddy's log of the apps' server errors, such as
+    /// `127.0.0.1:2020`.
+    pub logs: String,
     pub http: u16,
     pub https: u16,
     /// Where Caddy reaches the panel, such as `127.0.0.1:3000`.
@@ -53,8 +69,8 @@ pub struct Ports {
 }
 
 impl Ports {
-    /// `OXPLOY_CADDY_ADMIN`, `OXPLOY_HTTP_PORT` and `OXPLOY_HTTPS_PORT`, or 127.0.0.1:2019,
-    /// 80 and 443. The panel listens at `HOST` and `PORT`, as Topcoat reads them. The
+    /// `OXPLOY_CADDY_ADMIN`, `OXPLOY_CADDY_LOGS`, `OXPLOY_HTTP_PORT` and
+    /// `OXPLOY_HTTPS_PORT`, or 127.0.0.1:2019, 127.0.0.1:2020, 80 and 443. The panel listens at `HOST` and `PORT`, as Topcoat reads them. The
     /// public addresses are `OXPLOY_PUBLIC_IP`, separated by commas, for a server
     /// behind NAT, or else the machine's own public IPv4 addresses.
     fn from_env() -> Ports {
@@ -66,6 +82,7 @@ impl Ports {
         };
         Ports {
             admin: std::env::var("OXPLOY_CADDY_ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.to_owned()),
+            logs: std::env::var("OXPLOY_CADDY_LOGS").unwrap_or_else(|_| DEFAULT_LOGS.to_owned()),
             http: port("OXPLOY_HTTP_PORT", 80),
             https: port("OXPLOY_HTTPS_PORT", 443),
             panel: panel_address(
@@ -148,6 +165,7 @@ impl Caddy {
                 changed: Notify::new(),
             }),
         };
+        access_log::listen(caddy.shared.ports.logs.clone());
         let shared = caddy.shared.clone();
         tokio::spawn(async move {
             loop {
@@ -249,6 +267,9 @@ pub struct Site {
     pub https: bool,
     pub redirect_www: bool,
     pub upstream: Upstream,
+    /// The app name of the service the domain belongs to, whose log gets the requests
+    /// it answers with a server error. `None` for the panel.
+    pub app: Option<String>,
 }
 
 /// Every domain on the server, the panel's included, with where its requests go.
@@ -262,6 +283,7 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
         https: true,
         redirect_www: false,
         upstream: Upstream::Panel,
+        app: None,
     });
     Ok(domains
         .into_iter()
@@ -279,6 +301,7 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
                 https: domain.https,
                 redirect_www: domain.redirect_www,
                 upstream,
+                app: Some(service.app_name.clone()),
             })
         })
         .chain(panel)
@@ -291,6 +314,9 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
 /// host with only paths answers the others with 404, which Caddy would otherwise
 /// answer with an empty page or a redirect to HTTPS. The panel answers at the server's
 /// public addresses too.
+///
+/// Both servers log the requests they answer. The log of an app's requests answered
+/// with a server error goes to oxploy, and the rest of the log nowhere.
 pub fn config(ports: &Ports, sites: &[Site]) -> Value {
     let by_address: Vec<Site> = ports
         .public_ips
@@ -302,6 +328,7 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
             https: true,
             redirect_www: false,
             upstream: Upstream::Panel,
+            app: None,
         })
         .collect();
     let mut sites: Vec<&Site> = sites.iter().chain(&by_address).collect();
@@ -329,7 +356,7 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
         if !routes.is_empty() {
             servers.insert(
                 name.to_owned(),
-                json!({ "listen": [format!(":{port}")], "routes": routes }),
+                json!({ "listen": [format!(":{port}")], "routes": routes, "logs": {} }),
             );
         }
     }
@@ -345,7 +372,26 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
             // which Caddy would otherwise add to the system's trusted ones, asking for
             // a password. `caddy trust` does it by hand.
             "pki": { "certificate_authorities": { "local": { "install_trust": false } } },
-        }
+        },
+        "logging": {
+            "logs": {
+                // Caddy would otherwise print every request it answers.
+                "default": { "exclude": ["http.log.access"] },
+            },
+        },
+    });
+    // Caddy logs a request answered with a status of 500 or more as an error, and what
+    // went wrong when it could not pass a request on, such as to an app that is down.
+    // Over UDP, which needs no connection, so the log reaches oxploy again as soon as it
+    // runs again, as after an update.
+    config["logging"]["logs"][ACCESS_LOGGER] = json!({
+        "writer": { "output": "net", "address": format!("udp/{}", ports.logs), "soft_start": true },
+        "encoder": { "format": "json" },
+        "level": "ERROR",
+        "include": [
+            format!("http.log.access.{ACCESS_LOGGER}"),
+            format!("http.log.error.{ACCESS_LOGGER}"),
+        ],
     });
     let policies = address_policies(&ports.public_ips);
     if !policies.is_empty() {
@@ -390,6 +436,13 @@ fn routes(site: &Site, ports: &Ports) -> Vec<Value> {
     let mut handle = Vec::new();
     match site.upstream {
         Upstream::App(port) => {
+            // The request's log goes to the app's own logger, which names the app.
+            if let Some(app) = &site.app {
+                handle.push(json!({
+                    "handler": "vars",
+                    "access_logger_names": [format!("{ACCESS_LOGGER}.{app}")],
+                }));
+            }
             if let (Some(path), true) = (&site.path, site.strip_path) {
                 handle.push(json!({ "handler": "rewrite", "strip_path_prefix": path }));
             }
@@ -443,6 +496,7 @@ mod tests {
     fn ports() -> Ports {
         Ports {
             admin: "127.0.0.1:2019".to_owned(),
+            logs: "127.0.0.1:2020".to_owned(),
             http: 80,
             https: 443,
             panel: "127.0.0.1:3000".to_owned(),
@@ -458,7 +512,33 @@ mod tests {
             https,
             redirect_www: false,
             upstream,
+            app: None,
         }
+    }
+
+    #[test]
+    fn apps_server_errors_go_to_oxploy() {
+        let app = Site {
+            app: Some("shop-api".to_owned()),
+            ..site("shop.com", None, true, Upstream::App(10_001))
+        };
+        let config = config(&ports(), &[app, site("blog.com", None, true, Upstream::Stopped)]);
+        let server = &config["apps"]["http"]["servers"]["https"];
+        assert_eq!(server["logs"], json!({}));
+        assert_eq!(
+            server["routes"][1]["handle"][0],
+            json!({ "handler": "vars", "access_logger_names": ["oxploy.shop-api"] })
+        );
+        // A stopped app's 503 is oxploy's own, and goes to no app's log.
+        assert_eq!(server["routes"][0]["handle"][0]["handler"], "static_response");
+        let logs = &config["logging"]["logs"];
+        assert_eq!(logs["default"]["exclude"], json!(["http.log.access"]));
+        assert_eq!(logs["oxploy"]["writer"]["address"], "udp/127.0.0.1:2020");
+        assert_eq!(logs["oxploy"]["level"], "ERROR");
+        assert_eq!(
+            logs["oxploy"]["include"],
+            json!(["http.log.access.oxploy", "http.log.error.oxploy"])
+        );
     }
 
     #[test]

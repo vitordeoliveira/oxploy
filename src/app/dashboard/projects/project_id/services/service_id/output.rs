@@ -27,7 +27,7 @@ pub async fn logs_tab(cx: &Cx, service: &Service) -> Result<impl View> {
     Ok(view! {
         settings_card(
             title: "Logs",
-            text: "What the app prints, newest at the bottom. The lines oxploy adds are in bold.",
+            text: "What the app prints, newest at the bottom. The lines oxploy adds are in bold, such as the requests the app answered with a server error, which it may not print itself.",
             (live! {
                 loop {
                     let log = tail(&files.app_log(), LOG_LINES);

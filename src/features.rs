@@ -1,6 +1,7 @@
 //! Application features. Each module holds everything one feature owns, such as its
 //! data and business rules, for the pages in `app` to use.
 
+pub mod access_log;
 pub mod app_files;
 pub mod archive;
 pub mod caddy;
