@@ -19,9 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use topcoat::context::{Cx, app_context};
 
+use super::archive::{checksum_in, sha256, unpack};
 use super::deploy::Deployer;
 use super::project::now;
 
@@ -351,7 +351,7 @@ fn prepare(shared: &Shared, work: &Path, version: &str, build: &Build) -> Result
     if actual != expected {
         return Err("the download does not match the release's checksum".to_owned());
     }
-    unpack(&archive, &new)?;
+    unpack(&archive, &new).map_err(|error| error.replace("the archive", "the build"))?;
     if !new.join(ASSETS).join("manifest.toml").is_file() {
         return Err("the build has no assets folder".to_owned());
     }
@@ -463,45 +463,7 @@ fn checksum_at(url: &str) -> Result<String, String> {
         return Err(unreadable());
     }
     let text = response.body_mut().read_to_string().map_err(|_| unreadable())?;
-    text.split_whitespace()
-        .next()
-        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(unreadable)
-}
-
-/// The SHA-256 checksum of the file at `path`, in lowercase hexadecimal.
-fn sha256(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Unpacks the archive at `archive` into `into`, with the system's `tar`.
-fn unpack(archive: &Path, into: &Path) -> Result<(), String> {
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(into)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("tar could not run: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "the build could not be unpacked: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
+    checksum_in(&text).ok_or_else(unreadable)
 }
 
 /// Runs `binary --version`, which also proves that it runs on this machine, and returns

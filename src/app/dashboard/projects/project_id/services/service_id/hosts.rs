@@ -330,9 +330,9 @@ async fn domain_dialog(
     })
 }
 
-/// A setting of the domain form, switched on or off.
+/// A setting of a form, switched on or off.
 #[component]
-async fn option_switch(
+pub(super) async fn option_switch(
     cx: &Cx,
     name: &'static str,
     checked: bool,

@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::archive;
 use super::caddy::Caddy;
 use super::databases::{self, ManagedDatabase};
 use super::deploy::Deployer;
@@ -69,6 +70,18 @@ pub struct Service {
     /// The file the build script leaves in `OXPLOY_OUTPUT_DIR`, which oxploy starts.
     pub script_binary: Option<String>,
 
+    /// The file of the repository's latest GitHub release to deploy, when the service
+    /// deploys releases, such as `api-x86_64-linux.tar.gz`. A `*` stands for any text,
+    /// such as the version.
+    pub github_asset: Option<String>,
+
+    /// The binary in the release's file, when the file is an archive, such as `api` or
+    /// `bin/api`. A file that is not an archive is the binary itself.
+    pub github_asset_binary: Option<String>,
+
+    /// Whether a new GitHub release deploys the service on its own. `None` is no.
+    pub deploys_new_releases: Option<bool>,
+
     /// A shell script that runs after each build, before the new release starts, such
     /// as one that migrates the database.
     pub after_build: Option<String>,
@@ -102,6 +115,9 @@ pub enum BuildKind {
     Cargo,
     /// A shell script the user writes.
     Script,
+    /// A file of the repository's latest GitHub release, built elsewhere: the binary,
+    /// or an archive with it.
+    Release,
 }
 
 /// A build script, as the user wrote it.
@@ -109,6 +125,16 @@ pub struct BuildScript<'a> {
     pub script: &'a str,
     /// The file the script leaves in `OXPLOY_OUTPUT_DIR`.
     pub binary: &'a str,
+}
+
+/// The file of a GitHub release a service deploys, as the user typed it.
+pub struct ReleaseBuild<'a> {
+    /// The file's name, where `*` stands for any text.
+    pub file: &'a str,
+    /// The binary in the file, when it is an archive.
+    pub binary: &'a str,
+    /// Whether new releases deploy on their own.
+    pub automatic: bool,
 }
 
 /// The most bytes a build script may take.
@@ -188,6 +214,9 @@ impl Service {
             build_kind: None,
             build_script: None,
             script_binary: None,
+            github_asset: None,
+            github_asset_binary: None,
+            deploys_new_releases: None,
             after_build: None,
             environment: None,
             port: None,
@@ -291,6 +320,33 @@ impl Service {
             .build_kind(Some(BuildKind::Script))
             .build_script(Some(script.to_owned()))
             .script_binary(Some(binary.to_owned()))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(true)
+    }
+
+    /// Makes the service deploy a file of its repository's latest GitHub release.
+    /// Returns `false`, changing nothing, if the file is not a file name, or the binary
+    /// is not a path inside the archive. The binary is kept only for an archive.
+    pub async fn set_release(&mut self, cx: &Cx, build: &ReleaseBuild<'_>) -> Result<bool> {
+        let file = build.file.trim();
+        let binary = build.binary.trim().trim_start_matches("./");
+        if !is_release_file(file) {
+            return Ok(false);
+        }
+        let binary = if archive::is_archive(file) {
+            if !is_path_inside(binary) {
+                return Ok(false);
+            }
+            Some(binary.to_owned())
+        } else {
+            None
+        };
+        self.update()
+            .build_kind(Some(BuildKind::Release))
+            .github_asset(Some(file.to_owned()))
+            .github_asset_binary(binary)
+            .deploys_new_releases(Some(build.automatic))
             .exec(&mut db(cx))
             .await?;
         Ok(true)
@@ -406,6 +462,85 @@ fn normalize_build_path(path: &str) -> Option<Option<String>> {
                 && !segment.chars().any(|c| c.is_control() || c == '\\')
         });
     valid.then(|| Some(path.to_owned()))
+}
+
+/// Returns whether `name` names a release's file: a file name, where `*` stands for
+/// any text, that is not only stars.
+fn is_release_file(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.chars().any(|c| c != '*')
+        && !name.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+        && name != "."
+        && name != ".."
+}
+
+/// Returns whether `path` is a file path that stays inside the folder it starts from,
+/// such as `api` or `bin/api`.
+fn is_path_inside(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 255
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && !segment.chars().any(|c| c.is_control() || c == '\\')
+        })
+}
+
+/// Returns whether `name` matches a release file's name as the user typed it, where
+/// `*` stands for any text.
+pub fn release_file_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = name.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        // No star: the whole name must match.
+        return rest.is_empty();
+    };
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
+/// The name to save for a file of the release tagged `tag`: the file's name, with the
+/// release's version in it as `*`, so that the files of the next releases match too.
+/// `api-v1.2.0-linux.tar.gz` of `v1.2.0` is `api-*-linux.tar.gz`.
+pub fn release_file_pattern(tag: &str, name: &str) -> String {
+    let version = tag.trim_start_matches('v');
+    // A short version, such as `1`, could be part of anything else in the name.
+    [tag, version]
+        .into_iter()
+        .find(|version| version.len() >= 3 && name.contains(version))
+        .map_or_else(|| name.to_owned(), |version| name.replacen(version, "*", 1))
+}
+
+/// A guess at the binary in a release's archive, from the archive's name without its
+/// extension, version and platform: `api` for `api-v1.2.0-x86_64-unknown-linux-gnu.tar.gz`.
+pub fn guess_binary(file: &str) -> String {
+    const PLATFORM: [&str; 16] = [
+        "x86_64", "amd64", "aarch64", "arm64", "armv7", "i686", "linux", "gnu", "musl",
+        "unknown", "apple", "darwin", "macos", "windows", "msvc", "pc",
+    ];
+    let stem = file.trim_end_matches(".tar.gz").trim_end_matches(".tgz");
+    let kept: Vec<&str> = stem
+        .split('-')
+        .filter(|part| {
+            let version = part.trim_start_matches('v');
+            !part.is_empty()
+                && *part != "*"
+                && !version.starts_with(|c: char| c.is_ascii_digit())
+                && !PLATFORM.contains(part)
+        })
+        .collect();
+    if kept.is_empty() { stem.to_owned() } else { kept.join("-") }
 }
 
 /// Returns whether `name` is a branch name git accepts, following
@@ -573,5 +708,49 @@ mod tests {
     fn app_names_are_slugs() {
         assert_eq!(slug("My API!"), "my-api");
         assert_eq!(slug("  Ação  "), "a-o");
+    }
+
+    #[test]
+    fn release_files_match_with_stars() {
+        assert!(release_file_matches("api-x86_64-linux.tar.gz", "api-x86_64-linux.tar.gz"));
+        assert!(!release_file_matches("api-x86_64-linux.tar.gz", "api-x86_64-linux.tar.gz.sha256"));
+        assert!(release_file_matches("api-*-linux.tar.gz", "api-v1.2.0-x86_64-linux.tar.gz"));
+        assert!(release_file_matches("api-*", "api-"));
+        assert!(release_file_matches("*.tar.gz", "api.tar.gz"));
+        assert!(release_file_matches("api-*-*.tar.gz", "api-1.2-linux.tar.gz"));
+        assert!(!release_file_matches("api-*-linux.tar.gz", "api-linux.tar.gz"));
+        assert!(!release_file_matches("api-*.tar.gz", "web-1.0.tar.gz"));
+        assert!(!release_file_matches("a*a", "a"));
+    }
+
+    #[test]
+    fn release_files_and_binaries_stay_plain() {
+        assert!(is_release_file("api-*-x86_64-linux.tar.gz"));
+        assert!(!is_release_file("*"));
+        assert!(!is_release_file("dist/api"));
+        assert!(!is_release_file(""));
+        assert!(is_path_inside("bin/api"));
+        assert!(!is_path_inside("../api"));
+        assert!(!is_path_inside("/usr/bin/api"));
+        assert!(!is_path_inside("bin//api"));
+    }
+
+    #[test]
+    fn versions_in_release_files_become_stars() {
+        assert_eq!(release_file_pattern("v1.2.0", "api-v1.2.0-linux.tar.gz"), "api-*-linux.tar.gz");
+        assert_eq!(release_file_pattern("v1.2.0", "api-1.2.0-linux.tar.gz"), "api-*-linux.tar.gz");
+        assert_eq!(
+            release_file_pattern("v0.1.0", "oxploy-website-x86_64-linux.tar.gz"),
+            "oxploy-website-x86_64-linux.tar.gz"
+        );
+        assert_eq!(release_file_pattern("v1", "api-v1-x86_64.tar.gz"), "api-v1-x86_64.tar.gz");
+    }
+
+    #[test]
+    fn binaries_are_guessed_from_archive_names() {
+        assert_eq!(guess_binary("oxploy-website-x86_64-linux.tar.gz"), "oxploy-website");
+        assert_eq!(guess_binary("api-v1.2.0-x86_64-unknown-linux-gnu.tar.gz"), "api");
+        assert_eq!(guess_binary("api-*-linux.tar.gz"), "api");
+        assert_eq!(guess_binary("x86_64-linux.tgz"), "x86_64-linux");
     }
 }

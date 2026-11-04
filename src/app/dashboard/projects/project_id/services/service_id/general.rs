@@ -16,6 +16,7 @@ use topcoat::{
 };
 
 use super::super::super::ProjectId;
+use super::hosts::option_switch;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
 use crate::app::dashboard::git;
 use crate::app::dashboard::projects::created_at;
@@ -26,12 +27,15 @@ use crate::components::input::input;
 use crate::components::select::select;
 use crate::components::textarea::textarea;
 use crate::components::tabs::{tabs_list, tabs_trigger};
+use crate::features::archive::{self, Runnable};
 use crate::features::deploy::{AppStatus, Deployer, Refusal};
 use crate::features::deployment::Deployment;
-use crate::features::github::{Branches, GithubApp, Repository};
+use crate::features::github::{Branches, GithubApp, Release, Repository};
 use crate::features::project::Project;
+use crate::features::machine::{Machine, named_for_this_machine};
 use crate::features::service::{
-    BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, Service, Source, cargo_command,
+    BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, ReleaseBuild, Service, Source,
+    cargo_command, guess_binary, release_file_matches, release_file_pattern,
 };
 
 /// The service's source and build settings.
@@ -154,26 +158,32 @@ struct ShownBuild {
     build: Option<String>,
 }
 
-/// How the service is built: with cargo and its options, or with a script of the
-/// user's own. A tab for each, with a dot on the one in use.
+/// How the service is built: with cargo and its options, with a script of the user's
+/// own, or elsewhere, as a file of a GitHub release. A tab for each, with a dot on the
+/// one in use.
 #[component]
 async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -> Result<impl View> {
     let in_use = service.builds_with();
     let in_use_slug = match in_use {
         BuildKind::Cargo => "cargo",
         BuildKind::Script => "script",
+        BuildKind::Release => "release",
     };
     // The tabs switch in the browser. `?build=` picks the first one shown, which the
     // tabs also link to for browsers without the runtime.
     let first = match query_params::<ShownBuild>(cx)?.build.as_deref() {
-        Some(slug @ ("cargo" | "script")) => slug,
+        Some(slug @ ("cargo" | "script" | "release")) => slug,
         _ => in_use_slug,
     };
     let shown = signal(cx, || first.to_owned());
-    let (shows_cargo, shows_script, shows_other) = (shown.clone(), shown.clone(), shown.clone());
+    let (shows_cargo, shows_script, shows_release, shows_other) =
+        (shown.clone(), shown.clone(), shown.clone(), shown.clone());
     let (project_id, service_id) = (project.id, service.id);
     let cargo_url = href!(save_build, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let script_url = href!(save_script, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    let release_url = href!(save_release, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    // The release's file as chosen, which the binaries to choose from come from.
+    let release_file = signal(cx, || service.github_asset.clone().unwrap_or_default());
     let rust_version_id = element_id(cx);
     let binary_id = element_id(cx);
     let features_id = element_id(cx);
@@ -193,12 +203,13 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
     let tabs = [
         (BuildKind::Cargo, "cargo", "Cargo", iconify_icon!("lucide:package")),
         (BuildKind::Script, "script", "Script", iconify_icon!("lucide:square-terminal")),
+        (BuildKind::Release, "release", "GitHub release", iconify_icon!("lucide:tag")),
     ];
 
     Ok(view! {
         settings_card(
             title: "Build",
-            text: "How oxploy turns the code into a binary.",
+            text: "How oxploy turns the code into a binary, or where it gets one built elsewhere.",
             tabs_list(
                 #[key(slug)]
                 for (kind, slug, label, symbol) in tabs {
@@ -228,8 +239,9 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
             >
                 icon(data: iconify_icon!("lucide:info"), size: 16, attrs: attributes! { class="shrink-0" })
                 match in_use {
-                    BuildKind::Cargo => "The service builds with cargo. Saving a script here switches it to the script.",
-                    BuildKind::Script => "The service builds with its script. Saving here switches it to cargo.",
+                    BuildKind::Cargo => "The service builds with cargo. Saving this tab switches it.",
+                    BuildKind::Script => "The service builds with its script. Saving this tab switches it.",
+                    BuildKind::Release => "The service deploys its GitHub releases. Saving this tab switches it.",
                 }
             </p>
             <div :hidden=$(shows_cargo.get() != "cargo")>
@@ -355,6 +367,28 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                     </div>
                 </form>
             </div>
+            <div :hidden=$(shows_release.get() != "release")>
+                <form method="post" action=(&release_url) class="flex flex-col gap-5">
+                    <p class="text-sm text-muted-foreground">
+                        "Deploying downloads a file of the repository's latest release, built elsewhere, such as in GitHub Actions, for this server: "
+                        (Machine::this().to_string())
+                        ". The branch and build path above do not apply."
+                    </p>
+                    <div class="grid grid-cols-1 gap-5 md:grid-cols-2">
+                        release_file_field(project_id: project_id, service_id: service_id, file: release_file.clone())
+                        release_binary_field(project_id: project_id, service_id: service_id, file: $(release_file.get()))
+                    </div>
+                    option_switch(
+                        name: "automatic",
+                        checked: service.deploys_new_releases == Some(true),
+                        label: "Deploy new releases",
+                        text: "oxploy looks at the repository every minute and deploys a new release once its file is there. A release that fails to deploy is not tried again on its own."
+                    )
+                    <div class="flex justify-end">
+                        button(attrs: attributes! { type="submit" }, "Save release")
+                    </div>
+                </form>
+            </div>
         )
     })
 }
@@ -372,12 +406,16 @@ async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<im
     let deploy_url = href!(deploy, project_id, service_id).resolve(cx);
     let restart_url = href!(restart, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
     let stop_url = href!(stop, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
-    let text = match status {
-        AppStatus::NotDeployed => "Fetch the branch, build it and start it.",
-        AppStatus::Deploying => "A deployment is in progress. Its log is in the Deployments tab.",
-        AppStatus::Running => "Deploying again builds the branch's latest commit and swaps it in.",
-        AppStatus::Restarting => "The app exited, and oxploy is starting it again. Its output is in the Logs tab.",
-        AppStatus::Stopped => "The app is stopped. Start it again, or deploy the latest commit.",
+    let releases = service.builds_with() == BuildKind::Release;
+    let text = match (status, releases) {
+        (AppStatus::NotDeployed, false) => "Fetch the branch, build it and start it.",
+        (AppStatus::NotDeployed, true) => "Download the repository's latest release and start it.",
+        (AppStatus::Deploying, _) => "A deployment is in progress. Its log is in the Deployments tab.",
+        (AppStatus::Running, false) => "Deploying again builds the branch's latest commit and swaps it in.",
+        (AppStatus::Running, true) => "Deploying again downloads the latest release and swaps it in.",
+        (AppStatus::Restarting, _) => "The app exited, and oxploy is starting it again. Its output is in the Logs tab.",
+        (AppStatus::Stopped, false) => "The app is stopped. Start it again, or deploy the latest commit.",
+        (AppStatus::Stopped, true) => "The app is stopped. Start it again, or deploy the latest release.",
     };
 
     Ok(view! {
@@ -427,7 +465,9 @@ async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<im
             if let Some(release) = &release {
                 <p class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
                     <span class="font-medium text-foreground">"Release #" (release.id.to_string())</span>
-                    if let Some(commit) = &release.commit {
+                    if let Some(tag) = &release.tag {
+                        <span class="font-mono text-xs">(tag)</span>
+                    } else if let Some(commit) = &release.commit {
                         <span class="font-mono text-xs">(commit.get(..7).unwrap_or(commit))</span>
                     }
                     if let Some(message) = &release.commit_message {
@@ -440,6 +480,299 @@ async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<im
                         <span class="font-mono text-xs">"127.0.0.1:" (port.to_string())</span>
                     }
                 </p>
+            }
+        )
+    })
+}
+
+/// What the GitHub release tab's fields offer to choose from.
+enum ReleaseChoices {
+    /// Asked for once the browser connects, so the page does not wait for GitHub.
+    Loading,
+    /// The service has no source saved yet.
+    NoSource,
+    /// The repository has no release yet.
+    NoRelease(String),
+    Failed(String),
+    Found {
+        app: Box<GithubApp>,
+        repository: String,
+        release: Release,
+    },
+}
+
+/// The service, and the latest release of its saved repository, for the GitHub release
+/// tab's fields.
+///
+/// Shards answer requests of their own, without the page's guards, so this checks
+/// access.
+async fn release_choices(cx: &Cx, project_id: u64, service_id: u64) -> Result<(Service, ReleaseChoices)> {
+    let organization = require_organization(cx).await?;
+    let project = Project::find_in(cx, organization.id, project_id)
+        .await?
+        .ok_or_not_found()?;
+    let service = Service::find_in(cx, project.id, service_id)
+        .await?
+        .ok_or_not_found()?;
+    let (Some(app_id), Some(repository)) = (service.github_app_id, service.repository.clone())
+    else {
+        return Ok((service, ReleaseChoices::NoSource));
+    };
+    let app = GithubApp::find_in(cx, organization.id, app_id).await?;
+    let Some(app) = app.filter(|app| app.installation_id.is_some()) else {
+        return Ok((service, ReleaseChoices::NoSource));
+    };
+    if !connected(cx) {
+        return Ok((service, ReleaseChoices::Loading));
+    }
+    let choices = match app.latest_release(&repository).await {
+        Ok(Some(release)) => ReleaseChoices::Found {
+            app: Box::new(app),
+            repository,
+            release,
+        },
+        Ok(None) => ReleaseChoices::NoRelease(repository),
+        Err(error) => ReleaseChoices::Failed(error.to_string()),
+    };
+    Ok((service, choices))
+}
+
+/// The files of the latest release of the service's repository, to choose the one to
+/// deploy, as it is saved: with the release's version as `*`. Choosing one updates
+/// `file`, which lists the binaries in it. Without a release to choose from, the name is
+/// typed.
+#[shard]
+async fn release_file_field(
+    cx: &Cx,
+    project_id: u64,
+    service_id: u64,
+    file: Signal<String>,
+) -> Result<impl View> {
+    let (_, choices) = release_choices(cx, project_id, service_id).await?;
+    let saved = file.get_untracked();
+    let id = element_id(cx);
+    let (choose, type_in) = (file.clone(), file.clone());
+    let reason = match &choices {
+        ReleaseChoices::NoSource => "Save a source above to choose from its releases. Meanwhile, type the file's name.".to_owned(),
+        ReleaseChoices::NoRelease(repository) => format!("{repository} has no release yet. Type the file's name, or publish a release and come back to choose it."),
+        ReleaseChoices::Failed(error) => format!("{error}. Type the file's name meanwhile."),
+        ReleaseChoices::Loading | ReleaseChoices::Found { .. } => String::new(),
+    };
+
+    Ok(view! {
+        field(
+            field_label(attrs: attributes! { for=(&id) }, "File")
+            match &choices {
+                ReleaseChoices::Found { release, .. } => {
+                    let options = release_file_options(release, &saved);
+                    select(
+                        attrs: attributes! {
+                            id=(&id)
+                            name="file"
+                            required=""
+                            @change=$(|e: Event| choose.set(e.target.value))
+                        },
+                        // With `required`, this empty first option is the placeholder.
+                        <option value="" selected=(saved.is_empty().then_some(""))>"Choose a file"</option>
+                        #[key(value.clone())]
+                        for (value, label) in &options {
+                            <option value=(value) selected=((*value == saved).then_some(""))>(label)</option>
+                        }
+                    )
+                    field_description(
+                        "From release " <span class="font-mono">(&release.tag_name)</span>
+                        ". A version in a name is saved as *, so the next releases match too. When the release also has the file's .sha256, oxploy checks the download against it."
+                    )
+                }
+                ReleaseChoices::Loading => {
+                    select(
+                        attrs: attributes! { id=(&id) name="file" required="" },
+                        <option value=(&saved) selected="">
+                            (if saved.is_empty() { "Loading the release from GitHub…" } else { saved.as_str() })
+                        </option>
+                    )
+                    field_description("Loading the latest release from GitHub…")
+                }
+                _ => {
+                    input(
+                        attrs: attributes! {
+                            id=(&id)
+                            name="file"
+                            value=(&saved)
+                            placeholder="api-x86_64-linux.tar.gz"
+                            maxlength="255"
+                            autocomplete="off"
+                            spellcheck="false"
+                            required=""
+                            @change=$(|e: Event| type_in.set(e.target.value))
+                        }
+                    )
+                    field_description((reason) " A * stands for any text, such as the version in api-*-linux.tar.gz.")
+                }
+            }
+        )
+    })
+}
+
+/// The files of `release` to deploy, as the value to save and a label with the file's
+/// name and size, the saved one kept when the release no longer has it.
+fn release_file_options(release: &Release, saved: &str) -> Vec<(String, String)> {
+    let mut options: Vec<(String, String)> = release
+        .assets
+        .iter()
+        .filter(|file| file.state == "uploaded" && !file.name.ends_with(".sha256"))
+        .map(|file| {
+            let mut label = format!("{} · {:.1} MB", file.name, file.size as f64 / 1_000_000.0);
+            if named_for_this_machine(&file.name) {
+                label.push_str(" · this server");
+            }
+            (release_file_pattern(&release.tag_name, &file.name), label)
+        })
+        .collect();
+    if !saved.is_empty() && !options.iter().any(|(value, _)| value == saved) {
+        options.insert(0, (saved.to_owned(), format!("{saved} · saved")));
+    }
+    options
+}
+
+/// What the binary field offers, for the file chosen.
+enum BinaryChoices {
+    NoFile,
+    /// The file is not an archive, so it is the binary.
+    TheFile,
+    Loading,
+    Found(Vec<Runnable>),
+    /// Typed, for this reason.
+    Typed(String),
+}
+
+/// The binaries in the chosen file, when it is an archive, to choose the one to start.
+/// oxploy downloads the archive to look into it. When it cannot, the path is typed,
+/// starting from a guess.
+#[shard]
+async fn release_binary_field(cx: &Cx, project_id: u64, service_id: u64, file: String) -> Result<impl View> {
+    let (service, choices) = release_choices(cx, project_id, service_id).await?;
+    let id = element_id(cx);
+    let file = file.trim().to_owned();
+    let saved = service.github_asset_binary.clone().unwrap_or_default();
+    let binaries = if file.is_empty() {
+        BinaryChoices::NoFile
+    } else if !archive::is_archive(&file) {
+        BinaryChoices::TheFile
+    } else {
+        match &choices {
+            ReleaseChoices::Loading => BinaryChoices::Loading,
+            ReleaseChoices::Found { app, repository, release } => {
+                let found = release.assets.iter().find(|asset| {
+                    asset.state == "uploaded" && release_file_matches(&file, &asset.name)
+                });
+                match found {
+                    Some(asset) => match app.runnables_in_release_file(repository, asset).await {
+                        Ok(runnables) if !runnables.is_empty() => BinaryChoices::Found(runnables),
+                        Ok(_) => BinaryChoices::Typed(format!("{} has no file it can run.", asset.name)),
+                        Err(error) => BinaryChoices::Typed(format!("The archive could not be looked into: {error}.")),
+                    },
+                    None => BinaryChoices::Typed(format!("Release {} has no file named {file}.", release.tag_name)),
+                }
+            }
+            _ => BinaryChoices::Typed(String::new()),
+        }
+    };
+    let guess = guess_binary(&file);
+    let this = Machine::this();
+    let runs_here = |runnable: &&Runnable| runnable.machine.is_none_or(|machine| machine.runs_on(this));
+    let named = |runnable: &&Runnable| runnable.path.rsplit('/').next() == Some(guess.as_str());
+    let chosen = match &binaries {
+        BinaryChoices::Found(runnables) if runnables.iter().any(|runnable| runnable.path == saved) => saved.clone(),
+        // The guess if it runs here, or else any that runs here, the guess, or the first.
+        BinaryChoices::Found(runnables) => runnables
+            .iter()
+            .find(|runnable| runs_here(runnable) && named(runnable))
+            .or_else(|| runnables.iter().find(runs_here))
+            .or_else(|| runnables.iter().find(named))
+            .or(runnables.first())
+            .map(|runnable| runnable.path.clone())
+            .unwrap_or_default(),
+        _ if saved.is_empty() => guess.clone(),
+        _ => saved.clone(),
+    };
+    // The chosen binary's machine, when it is not this one.
+    let elsewhere = match &binaries {
+        BinaryChoices::Found(runnables) => runnables
+            .iter()
+            .find(|runnable| runnable.path == chosen)
+            .and_then(|runnable| runnable.machine)
+            .filter(|machine| !machine.runs_on(this)),
+        _ => None,
+    };
+
+    Ok(view! {
+        field(
+            field_label(attrs: attributes! { for=(&id) }, "Binary")
+            match &binaries {
+                BinaryChoices::NoFile => {
+                    select(
+                        attrs: attributes! { id=(&id) name="binary" disabled="" },
+                        <option>"Choose a file first"</option>
+                    )
+                }
+                BinaryChoices::TheFile => {
+                    <input type="hidden" name="binary" value="">
+                    <p id=(&id) class="flex min-h-10 items-center text-sm text-muted-foreground">
+                        "The file is the binary itself."
+                    </p>
+                }
+                BinaryChoices::Loading => {
+                    select(
+                        attrs: attributes! { id=(&id) name="binary" required="" },
+                        <option value=(&saved) selected="">
+                            (if saved.is_empty() { "Looking in the archive…" } else { saved.as_str() })
+                        </option>
+                    )
+                    field_description("Looking in the archive…")
+                }
+                BinaryChoices::Found(runnables) => {
+                    select(
+                        attrs: attributes! { id=(&id) name="binary" required="" },
+                        #[key(runnable.path.clone())]
+                        for runnable in runnables {
+                            <option value=(&runnable.path) selected=((runnable.path == chosen).then_some(""))>
+                                (&runnable.path)
+                                if let Some(machine) = runnable.machine {
+                                    " · " (machine.to_string())
+                                    if !machine.runs_on(this) {
+                                        ", not this server"
+                                    }
+                                }
+                            </option>
+                        }
+                    )
+                    if let Some(machine) = elsewhere {
+                        <p class="flex items-start gap-2 text-sm text-destructive">
+                            icon(data: iconify_icon!("lucide:triangle-alert"), size: 16, attrs: attributes! { class="mt-0.5 shrink-0" })
+                            <span>
+                                (format!("{chosen} is built for {machine}, and this server is {this}, so it would not start here. Choose the release's file built for this server, or publish one."))
+                            </span>
+                        </p>
+                    } else {
+                        field_description("The files in the archive that can run. The binary runs with the files beside it, such as a Topcoat app's assets.")
+                    }
+                }
+                BinaryChoices::Typed(reason) => {
+                    input(
+                        attrs: attributes! {
+                            id=(&id)
+                            name="binary"
+                            value=(&chosen)
+                            placeholder="api"
+                            maxlength="255"
+                            autocomplete="off"
+                            spellcheck="false"
+                            required=""
+                        }
+                    )
+                    field_description((reason) " The binary in the .tar.gz, such as api or bin/api.")
+                }
             }
         )
     })
@@ -678,6 +1011,34 @@ async fn save_script(cx: &Cx, Form(form): Form<ScriptForm>) -> Result<SeeOther> 
     if !service.set_build_script(cx, &build).await? {
         return Err(bad_request(
             "Write a script, and name the binary it leaves as a plain file name",
+        )
+        .into());
+    }
+    Ok(see_other(general_url(cx, &project, &service)))
+}
+
+/// A form with the file of a GitHub release to deploy.
+#[derive(Deserialize)]
+struct ReleaseForm {
+    file: String,
+    #[serde(default)]
+    binary: String,
+    /// `on` when new releases deploy on their own.
+    automatic: Option<String>,
+}
+
+/// Makes the service deploy a file of its repository's GitHub releases.
+#[route(POST "./release")]
+async fn save_release(cx: &Cx, Form(form): Form<ReleaseForm>) -> Result<SeeOther> {
+    let (project, mut service) = current_service(cx).await?;
+    let build = ReleaseBuild {
+        file: &form.file,
+        binary: &form.binary,
+        automatic: form.automatic.is_some(),
+    };
+    if !service.set_release(cx, &build).await? {
+        return Err(bad_request(
+            "Name the release's file without slashes, and for a .tar.gz the binary in it, as a path inside the archive",
         )
         .into());
     }

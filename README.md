@@ -37,7 +37,13 @@ back to the address the panel was opened at, so connect from the address you wil
 using.
 
 Deploying runs `git` and `cargo` from the panel's `PATH`, on the machine itself, or a
-build script of your own that leaves the binary in `OXPLOY_OUTPUT_DIR`. Each app
+build script of your own that leaves the binary in `OXPLOY_OUTPUT_DIR`. A service can
+instead deploy a file of its repository's latest GitHub release, built elsewhere, such as
+in GitHub Actions: the binary itself, or a `.tar.gz` with it and the files it needs,
+checked against the release's `.sha256` of the file when there is one. Such a service can
+also deploy each new release on its own: oxploy looks at the repository every minute, and
+does not try again a release that failed. A binary built for another machine, such as a
+Linux one on a Mac, fails its deployment before the running release stops. Each app
 runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`. Apps keep
 running when the panel stops or restarts, and the panel takes them back when it starts.
 Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them

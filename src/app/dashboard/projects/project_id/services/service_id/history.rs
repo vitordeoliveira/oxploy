@@ -130,7 +130,13 @@ async fn deployments_view(
                                             <span class="font-medium">"#" (deployment.id.to_string())</span>
                                             <span class="text-muted-foreground">(status_label(deployment.status, live))</span>
                                         </span>
-                                        if let Some(commit) = &deployment.commit {
+                                        if let Some(tag) = &deployment.tag {
+                                            <span class="truncate text-xs text-muted-foreground">
+                                                <span class="font-mono">(tag)</span>
+                                                " "
+                                                (deployment.commit_message.as_deref().unwrap_or(""))
+                                            </span>
+                                        } else if let Some(commit) = &deployment.commit {
                                             <span class="truncate text-xs text-muted-foreground">
                                                 <span class="font-mono">(commit.get(..7).unwrap_or(commit))</span>
                                                 " "

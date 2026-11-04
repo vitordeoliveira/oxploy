@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
 use std::hash::Hash;
+use std::io;
+use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +18,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use topcoat::{Result, context::Cx};
 
+use super::archive;
 use super::project::now;
 use crate::db::db;
 
@@ -61,6 +65,27 @@ pub struct Repository {
     /// The owner and name, such as `rust-lang/cargo`.
     pub full_name: String,
     pub private: bool,
+}
+
+/// A release of a repository, with the files attached to it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Release {
+    /// Its tag, such as `v1.2.0`.
+    pub tag_name: String,
+    /// Its title, which may be empty or the tag again.
+    pub name: Option<String>,
+    pub assets: Vec<ReleaseFile>,
+}
+
+/// A file attached to a release.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReleaseFile {
+    pub id: u64,
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// `uploaded` once the file is whole; one still being uploaded is not.
+    pub state: String,
 }
 
 /// The branches of a repository.
@@ -352,6 +377,109 @@ impl GithubApp {
         Ok(branches)
     }
 
+    /// Returns a repository's latest release: the newest one that is neither a draft
+    /// nor a prerelease. `None` if it has none.
+    pub async fn latest_release(&self, repository: &str) -> Result<Option<Release>, GithubError> {
+        if !is_repository_name(repository) {
+            return Err(GithubError::Rejected {
+                status: 404,
+                message: "Not Found".to_owned(),
+            });
+        }
+        let token = self.installation_token().await?;
+        let path = format!("/repos/{repository}/releases/latest");
+        match api(Method::Get, path, Some(token)).await {
+            Ok(release) => Ok(Some(release)),
+            Err(GithubError::Rejected { status: 404, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Downloads a file of one of a repository's releases into the file at `to`, which
+    /// also works for private repositories.
+    pub async fn download_release_file(
+        &self,
+        repository: &str,
+        file: &ReleaseFile,
+        to: &Path,
+    ) -> Result<(), GithubError> {
+        let token = self.installation_token().await?;
+        let url = format!("{API_ROOT}/repos/{repository}/releases/assets/{}", file.id);
+        let to = to.to_owned();
+        // GitHub sends the browser on to where the file is stored, and `ureq` leaves
+        // the token behind when it follows.
+        let call = move || {
+            let mut response = DOWNLOADS
+                .get(&url)
+                .header("Accept", "application/octet-stream")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Authorization", format!("Bearer {token}"))
+                .call()
+                .map_err(|error| GithubError::Unreachable(error.to_string()))?;
+            if !response.status().is_success() {
+                return Err(GithubError::Rejected {
+                    status: response.status().as_u16(),
+                    message: "the file could not be downloaded".to_owned(),
+                });
+            }
+            let mut written = File::create(&to)
+                .map_err(|error| GithubError::Unexpected(format!("{}: {error}", to.display())))?;
+            let mut body = response.body_mut().with_config().limit(MAX_DOWNLOAD).reader();
+            io::copy(&mut body, &mut written)
+                .map_err(|error| GithubError::Unreachable(error.to_string()))?;
+            Ok(())
+        };
+        tokio::task::spawn_blocking(call)
+            .await
+            .unwrap_or_else(|error| Err(GithubError::Unexpected(error.to_string())))
+    }
+
+    /// The files a release's archive can run, by their path in it, the ones nearest its
+    /// top first, to choose the binary from. It downloads the archive to look, once:
+    /// a file of a release does not change.
+    pub async fn runnables_in_release_file(
+        &self,
+        repository: &str,
+        file: &ReleaseFile,
+    ) -> Result<Vec<archive::Runnable>, String> {
+        /// The largest archive downloaded only to look into it.
+        const MAX_LOOKED_INTO: u64 = 256 * 1024 * 1024;
+        static LOOKED_INTO: LazyLock<Mutex<HashMap<u64, Vec<archive::Runnable>>>> =
+            LazyLock::new(Default::default);
+
+        let cached = LOOKED_INTO
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&file.id)
+            .cloned();
+        if let Some(runnables) = cached {
+            return Ok(runnables);
+        }
+        if file.size > MAX_LOOKED_INTO {
+            return Err(format!("{} is too large to look into", file.name));
+        }
+        let scratch = std::env::temp_dir().join(format!("oxploy-release-file-{}", file.id));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+        let downloaded = scratch.join("file");
+        let listed = match self.download_release_file(repository, file, &downloaded).await {
+            Ok(()) => {
+                let contents = scratch.join("contents");
+                tokio::task::spawn_blocking(move || archive::runnables_in(&downloaded, &contents))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        let runnables = listed?;
+        LOOKED_INTO
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(file.id, runnables.clone());
+        Ok(runnables)
+    }
+
     /// Deletes the app from oxploy. It stays registered on GitHub until the user
     /// deletes it there.
     pub async fn remove(self, cx: &Cx) -> Result<()> {
@@ -473,11 +601,27 @@ const PER_PAGE: usize = 100;
 /// How many pages of repositories or branches are read at most.
 const MAX_PAGES: usize = 10;
 
+/// Where GitHub's API answers.
+const API_ROOT: &str = "https://api.github.com";
+
+/// The largest release file a deployment downloads.
+const MAX_DOWNLOAD: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Sends requests to GitHub. Statuses other than success are handled by [`api`].
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(15)))
+        .user_agent("oxploy")
+        .build()
+        .into()
+});
+
+/// Downloads release files, which takes longer than other requests.
+static DOWNLOADS: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30 * 60)))
         .user_agent("oxploy")
         .build()
         .into()
@@ -500,7 +644,7 @@ where
 
     // `ureq` blocks, so the request runs off the async threads.
     let call = move || {
-        let url = format!("https://api.github.com{path}");
+        let url = format!("{API_ROOT}{path}");
         let response = match method {
             Method::Get => headers(AGENT.get(&url), bearer.as_deref()).call(),
             Method::Post => headers(AGENT.post(&url), bearer.as_deref()).send_empty(),

@@ -27,10 +27,12 @@ use super::databases::{self, ManagedDatabase};
 use super::deployment::{Deployment, DeploymentStatus};
 use super::domain::{self, Domain};
 use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
-use super::github::GithubApp;
+use super::archive;
+use super::github::{GithubApp, Release, ReleaseFile};
+use super::machine::Machine;
 use super::project::{Project, now};
 use super::runtime::{Exits, Launch, Readiness, Runtime, app_variables, system_env};
-use super::service::{BuildKind, Service};
+use super::service::{BuildKind, Service, release_file_matches};
 use super::storage;
 use super::usage::Usage;
 
@@ -39,6 +41,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The ports oxploy gives apps, on 127.0.0.1.
 const PORTS: std::ops::RangeInclusive<u64> = 10_000..=19_999;
+
+/// How often oxploy looks for new GitHub releases of the services that deploy them on
+/// their own.
+const RELEASE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How many releases before the live one are kept, to go back to.
 const KEPT_RELEASES: usize = 2;
@@ -110,13 +116,15 @@ impl Deployer {
         }
         let runtime = Arc::new(Runtime::new(db.clone()));
         runtime.clone().watch();
-        Ok(Deployer {
+        let deployer = Deployer {
             db,
             caddy,
             runtime,
             builds: Arc::new(Semaphore::new(1)),
             deploying: Arc::default(),
-        })
+        };
+        tokio::spawn(deployer.clone().deploy_new_releases());
+        Ok(deployer)
     }
 
     /// Returns the deployer registered on the router.
@@ -175,6 +183,7 @@ impl Deployer {
             status: DeploymentStatus::Queued,
             commit: None,
             commit_message: None,
+            tag: None,
             binary: None,
             build_path: None,
             created_at: now(),
@@ -385,15 +394,22 @@ impl Deployer {
         let mut db = self.db.clone();
         let saved = |error: toasty::Error| format!("the database could not be updated: {error}");
 
-        let _build = match self.builds.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                log.step("Waiting for another build to finish");
-                self.builds
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|error| error.to_string())?
+        let kind = service.builds_with();
+        // A GitHub release was built elsewhere, so only builds wait for each other.
+        let _build = match kind {
+            BuildKind::Release => None,
+            BuildKind::Cargo | BuildKind::Script => {
+                Some(match self.builds.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        log.step("Waiting for another build to finish");
+                        self.builds
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|error| error.to_string())?
+                    }
+                })
             }
         };
         deployment
@@ -412,50 +428,52 @@ impl Deployer {
         let app = self.github_app(service, app_id).await.map_err(saved)?.ok_or(
             "the GitHub account was removed; choose another one in the General tab",
         )?;
-        log.step(&format!("Fetching {repository} at {branch}"));
-        let token = app
-            .installation_token()
-            .await
-            .map_err(|error| error.to_string())?;
         let source = files.source(deployment.id);
         let _ = fs::remove_dir_all(&source);
         fs::create_dir_all(files.release(deployment.id)).map_err(|error| error.to_string())?;
-        let mut clone = tokio::process::Command::new("git");
-        clone
-            .args(["clone", "--depth", "1", "--single-branch", "--no-tags", "--branch"])
-            .arg(branch)
-            .arg("--")
-            .arg(format!("https://github.com/{repository}.git"))
-            .arg(&source)
-            .env_clear()
-            .envs(system_env())
-            .envs(git_auth(&token))
-            .env("GIT_TERMINAL_PROMPT", "0");
-        let status = run_logged(clone, log, |line| Some(line.to_owned()))
-            .await
-            .map_err(|error| format!("git could not run: {error}"))?;
-        if !status.success() {
-            return Err("git could not fetch the code".to_owned());
-        }
-        let commit = git_output(&source, &["rev-parse", "HEAD"]).await;
-        let message = git_output(&source, &["log", "-1", "--format=%s"]).await;
-        if let Some(commit) = &commit {
-            let short = commit.get(..7).unwrap_or(commit);
-            log.line(&format!("Commit {short} {}", message.as_deref().unwrap_or("")));
-        }
-        deployment
-            .update()
-            .commit(commit)
-            .commit_message(message)
-            .build_path(service.build_path.clone())
-            .exec(&mut db)
-            .await
-            .map_err(saved)?;
+        // The binary of a release, which needs no build.
+        let released = match kind {
+            BuildKind::Release => {
+                let (release, file) = find_release(&app, repository, service, log).await?;
+                // Kept before the download, so a release whose download fails counts as
+                // tried, and new releases do not try it again.
+                let title = release
+                    .name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty() && *name != release.tag_name);
+                deployment
+                    .update()
+                    .tag(Some(release.tag_name.clone()))
+                    .commit_message(title)
+                    .exec(&mut db)
+                    .await
+                    .map_err(saved)?;
+                let download = ReleaseDownload {
+                    app: &app,
+                    repository,
+                    release: &release,
+                    file: &file,
+                };
+                Some(fetch_release(&download, service, files, deployment.id, log).await?)
+            }
+            BuildKind::Cargo | BuildKind::Script => {
+                let (commit, message) = fetch_branch(&app, repository, branch, &source, log).await?;
+                deployment
+                    .update()
+                    .commit(commit)
+                    .commit_message(message)
+                    .build_path(service.build_path.clone())
+                    .exec(&mut db)
+                    .await
+                    .map_err(saved)?;
+                None
+            }
+        };
 
         // Build.
-        let work_dir = match &service.build_path {
-            Some(path) => source.join(path),
-            None => source.clone(),
+        let work_dir = match (&released, &service.build_path) {
+            (None, Some(path)) => source.join(path),
+            _ => source.clone(),
         };
         if !work_dir.is_dir() {
             let path = service.build_path.as_deref().unwrap_or("");
@@ -478,11 +496,23 @@ impl Deployer {
             work_dir: &work_dir,
             variables: &variables,
         };
-        let name = match service.builds_with() {
-            BuildKind::Cargo => build_with_cargo(&build, log).await?,
-            BuildKind::Script => build_with_script(&build, log).await?,
+        let name = match (released, kind) {
+            (Some(binary), _) => binary,
+            (None, BuildKind::Cargo) => build_with_cargo(&build, log).await?,
+            (None, BuildKind::Script | BuildKind::Release) => build_with_script(&build, log).await?,
         };
         let binary = files.binary(deployment.id, &name);
+        // One built for another machine would only fail to start, as an app that exits.
+        let this = Machine::this();
+        if let Ok(Some(machine)) = Machine::of_binary(&binary)
+            && !machine.runs_on(this)
+        {
+            let advice = match kind {
+                BuildKind::Release => "choose the release's file for this server under Build in the General tab",
+                BuildKind::Cargo | BuildKind::Script => "build it for this server",
+            };
+            return Err(format!("{name} is built for {machine}, and this server is {this}; {advice}"));
+        }
         deployment
             .update()
             .binary(Some(name))
@@ -605,6 +635,62 @@ impl Deployer {
     }
 
     /// The service's GitHub App, if it still exists in the service's organization.
+    /// Deploys, every [`RELEASE_CHECK_INTERVAL`], the services that deploy new GitHub
+    /// releases on their own, once their repository has a release they have not tried.
+    async fn deploy_new_releases(self) {
+        loop {
+            tokio::time::sleep(RELEASE_CHECK_INTERVAL).await;
+            let services = match Service::all().exec(&mut self.db.clone()).await {
+                Ok(services) => services,
+                Err(error) => {
+                    eprintln!("oxploy: the services could not be read: {error}");
+                    continue;
+                }
+            };
+            for service in services {
+                let watched = service.builds_with() == BuildKind::Release
+                    && service.deploys_new_releases == Some(true)
+                    && service.stopped_at.is_none();
+                if !watched || self.is_deploying(service.id) {
+                    continue;
+                }
+                if let Err(error) = self.deploy_if_released(&service).await {
+                    eprintln!("oxploy: could not look for a release of {}: {error}", service.app_name);
+                }
+            }
+        }
+    }
+
+    /// Deploys the service if its repository's latest release is not the one it last
+    /// tried, and has the service's file. A release that failed is not tried again on
+    /// its own.
+    async fn deploy_if_released(&self, service: &Service) -> toasty::Result<()> {
+        let (Some(app_id), Some(repository), Some(pattern)) =
+            (service.github_app_id, &service.repository, &service.github_asset)
+        else {
+            return Ok(());
+        };
+        let Some(app) = self.github_app(service, app_id).await? else {
+            return Ok(());
+        };
+        // When GitHub cannot be reached, the next look tries again.
+        let Ok(Some(release)) = app.latest_release(repository).await else {
+            return Ok(());
+        };
+        let last = Deployment::filter_by_service_id(service.id)
+            .order_by(Deployment::fields().id().desc())
+            .first()
+            .exec(&mut self.db.clone())
+            .await?;
+        let tried = last.is_some_and(|last| last.tag.as_deref() == Some(release.tag_name.as_str()));
+        // A release still getting its files waits for the next look.
+        if tried || release_file(&release, pattern).is_err() {
+            return Ok(());
+        }
+        let _ = self.deploy(service).await?;
+        Ok(())
+    }
+
     async fn github_app(&self, service: &Service, app_id: u64) -> toasty::Result<Option<GithubApp>> {
         let mut db = self.db.clone();
         let Some(project) = Project::filter_by_id(service.project_id).first().exec(&mut db).await?
@@ -671,6 +757,208 @@ impl Build<'_> {
             .env("CARGO_TERM_COLOR", "never");
         command
     }
+}
+
+/// Fetches the branch's latest commit into `source`, and returns the commit and the first
+/// line of its message.
+async fn fetch_branch(
+    app: &GithubApp,
+    repository: &str,
+    branch: &str,
+    source: &Path,
+    log: &mut DeployLog,
+) -> Result<(Option<String>, Option<String>), String> {
+    log.step(&format!("Fetching {repository} at {branch}"));
+    let token = app
+        .installation_token()
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut clone = tokio::process::Command::new("git");
+    clone
+        .args(["clone", "--depth", "1", "--single-branch", "--no-tags", "--branch"])
+        .arg(branch)
+        .arg("--")
+        .arg(format!("https://github.com/{repository}.git"))
+        .arg(source)
+        .env_clear()
+        .envs(system_env())
+        .envs(git_auth(&token))
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let status = run_logged(clone, log, |line| Some(line.to_owned()))
+        .await
+        .map_err(|error| format!("git could not run: {error}"))?;
+    if !status.success() {
+        return Err("git could not fetch the code".to_owned());
+    }
+    let commit = git_output(source, &["rev-parse", "HEAD"]).await;
+    let message = git_output(source, &["log", "-1", "--format=%s"]).await;
+    if let Some(commit) = &commit {
+        let short = commit.get(..7).unwrap_or(commit);
+        log.line(&format!("Commit {short} {}", message.as_deref().unwrap_or("")));
+    }
+    Ok((commit, message))
+}
+
+/// Finds the repository's latest GitHub release, and the service's file of it.
+async fn find_release(
+    app: &GithubApp,
+    repository: &str,
+    service: &Service,
+    log: &mut DeployLog,
+) -> Result<(Release, ReleaseFile), String> {
+    let pattern = service
+        .github_asset
+        .as_deref()
+        .ok_or("choose the release's file under Build in the General tab")?;
+    log.step(&format!("Fetching the latest release of {repository}"));
+    let release = app
+        .latest_release(repository)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("{repository} has no release yet"))?;
+    match release.name.as_deref().map(str::trim) {
+        Some(title) if !title.is_empty() && title != release.tag_name => {
+            log.line(&format!("Release {}, {title}", release.tag_name));
+        }
+        _ => log.line(&format!("Release {}", release.tag_name)),
+    }
+    let file = release_file(&release, pattern)?.clone();
+    Ok((release, file))
+}
+
+/// A file of a GitHub release, to download for a deployment.
+#[derive(Clone, Copy)]
+struct ReleaseDownload<'a> {
+    app: &'a GithubApp,
+    repository: &'a str,
+    release: &'a Release,
+    file: &'a ReleaseFile,
+}
+
+/// Downloads the file, checks it against the release's checksum of it when there is
+/// one, and puts it in the release's `source`, unpacked when it is an archive. The
+/// release's `bin` folder is a link to `source`, so the binary runs with the files that
+/// came beside it, as a built one runs beside its assets. Returns the binary to start,
+/// from `bin`.
+async fn fetch_release(
+    download_of: &ReleaseDownload<'_>,
+    service: &Service,
+    files: &AppFiles,
+    deployment_id: u64,
+    log: &mut DeployLog,
+) -> Result<String, String> {
+    let ReleaseDownload {
+        app,
+        repository,
+        release,
+        file,
+    } = *download_of;
+    let folder = files.release(deployment_id);
+    let download = folder.join("download");
+    log.step(&format!("Downloading {} ({})", file.name, megabytes(file.size)));
+    app.download_release_file(repository, file, &download)
+        .await
+        .map_err(|error| format!("the download failed: {error}"))?;
+
+    let checksum_name = format!("{}.sha256", file.name);
+    let checksum_file = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == checksum_name && asset.state == "uploaded");
+    match checksum_file {
+        Some(checksum_file) => {
+            let checksum = folder.join("download.sha256");
+            app.download_release_file(repository, checksum_file, &checksum)
+                .await
+                .map_err(|error| format!("the download of {checksum_name} failed: {error}"))?;
+            let expected = fs::read_to_string(&checksum)
+                .ok()
+                .as_deref()
+                .and_then(archive::checksum_in)
+                .ok_or_else(|| format!("{checksum_name} has no checksum in it"))?;
+            let _ = fs::remove_file(&checksum);
+            let path = download.clone();
+            let actual = tokio::task::spawn_blocking(move || archive::sha256(&path))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("the download could not be read: {error}"))?;
+            if actual != expected {
+                return Err(format!("the download does not match {checksum_name}"));
+            }
+            log.line(&format!("Checked it against {checksum_name}"));
+        }
+        None => log.line(&format!(
+            "The release has no {checksum_name} to check the download against"
+        )),
+    }
+
+    let source = files.source(deployment_id);
+    fs::create_dir_all(&source).map_err(|error| error.to_string())?;
+    let binary = if archive::is_archive(&file.name) {
+        let inside = service
+            .github_asset_binary
+            .clone()
+            .ok_or("name the binary in the archive under Build in the General tab")?;
+        let (archive_path, into) = (download.clone(), source.clone());
+        tokio::task::spawn_blocking(move || archive::unpack(&archive_path, &into))
+            .await
+            .map_err(|error| error.to_string())??;
+        log.line(&format!("Unpacked {}", file.name));
+        let _ = fs::remove_file(&download);
+        inside
+    } else {
+        // GitHub keeps release files' names free of slashes.
+        fs::rename(&download, source.join(&file.name)).map_err(|error| error.to_string())?;
+        file.name.clone()
+    };
+    let path = source.join(&binary);
+    if !path.is_file() {
+        return Err(format!("{} has no file {binary}", file.name));
+    }
+    // Runnable, whatever the release kept of its mode.
+    let mut permissions = fs::metadata(&path)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o755);
+    fs::set_permissions(&path, permissions).map_err(|error| error.to_string())?;
+    std::os::unix::fs::symlink("source", folder.join("bin")).map_err(|error| error.to_string())?;
+    Ok(binary)
+}
+
+/// The file of `release` that `pattern` names, among those uploaded whole. Checksum
+/// files only match a pattern for one.
+fn release_file<'a>(release: &'a Release, pattern: &str) -> Result<&'a ReleaseFile, String> {
+    let matching: Vec<&ReleaseFile> = release
+        .assets
+        .iter()
+        .filter(|file| file.state == "uploaded")
+        .filter(|file| !file.name.ends_with(".sha256") || pattern.ends_with(".sha256"))
+        .filter(|file| release_file_matches(pattern, &file.name))
+        .collect();
+    let tag = &release.tag_name;
+    match matching.as_slice() {
+        [file] => Ok(file),
+        [] if release.assets.is_empty() => Err(format!("release {tag} has no files")),
+        [] => {
+            let names: Vec<&str> = release.assets.iter().map(|file| file.name.as_str()).collect();
+            Err(format!(
+                "release {tag} has no file named {pattern}; its files are {}",
+                names.join(", ")
+            ))
+        }
+        several => {
+            let names: Vec<&str> = several.iter().map(|file| file.name.as_str()).collect();
+            Err(format!(
+                "several files of release {tag} match {pattern}: {}; name one of them",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// A size in bytes as megabytes, such as `12.3 MB`.
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
 /// Builds with `cargo build --release`, keeps the binary in the release, and bundles

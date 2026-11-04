@@ -20,8 +20,13 @@ pub struct Deployment {
     /// The commit that was built, once fetched.
     pub commit: Option<String>,
 
-    /// The first line of the commit's message.
+    /// The first line of the commit's message, or the title of the GitHub release
+    /// that was deployed.
     pub commit_message: Option<String>,
+
+    /// The tag of the GitHub release that was deployed, such as `v1.2.0`, for a
+    /// service that deploys releases.
+    pub tag: Option<String>,
 
     /// The file name of the built binary, once built.
     pub binary: Option<String>,
