@@ -1090,6 +1090,17 @@ async fn run_after_build(
         .await
         .map_err(|error| format!("the script after the build could not run: {error}"))?;
     if !status.success() {
+        // `./api`, as one runs a binary next to it, finds nothing where the app runs
+        // when the binary was built there.
+        let name = binary.file_name().map(|name| name.to_string_lossy().into_owned());
+        if let Some(name) = name
+            && script.contains(&format!("./{name}"))
+            && !build.work_dir.join(&name).exists()
+        {
+            log.line(&format!(
+                "The script runs where the app runs, and the new binary is on its PATH: call it as {name}, without ./"
+            ));
+        }
         return Err(format!("the script after the build failed ({status})"));
     }
     Ok(())
