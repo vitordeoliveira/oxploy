@@ -34,6 +34,7 @@ use crate::components::textarea::textarea;
 use crate::features::deploy::AppStatus;
 use crate::features::project::{Details, MAX_DESCRIPTION_LEN, MAX_NAME_LEN, Project};
 use crate::features::service::Service;
+use crate::features::time_zone;
 use project_id::ProjectId;
 use project_id::services::service_id::{self, ServiceId};
 
@@ -300,7 +301,7 @@ pub(super) async fn created_at(seconds: i64) -> Result<impl View> {
     Ok(view! {
         <time
             datetime=(moment.to_string())
-            title=(moment.strftime("%Y-%m-%d %H:%M UTC").to_string())
+            title=(time_zone::at(moment).strftime("%Y-%m-%d %H:%M UTC%:z").to_string())
         >
             (ago)
         </time>

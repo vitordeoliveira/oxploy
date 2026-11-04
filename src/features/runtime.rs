@@ -27,6 +27,7 @@ use super::databases::{self, ManagedDatabase};
 use super::deployment::Deployment;
 use super::environment::{self, PORT_VARIABLE, STORAGE_VARIABLE};
 use super::service::Service;
+use super::time_zone;
 use super::usage::Usage;
 
 /// How often the panel checks that the apps that should run are running.
@@ -272,7 +273,7 @@ impl Runtime {
         writeln!(
             log,
             "==> {} Starting release #{} on 127.0.0.1:{}",
-            jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S"),
+            time_zone::now().strftime("%Y-%m-%d %H:%M:%S"),
             launch.release_id,
             launch.port,
         )?;
@@ -558,7 +559,7 @@ fn backoff(crashes: u32) -> Duration {
 fn note(files: &AppFiles, text: &str) {
     let log = OpenOptions::new().create(true).append(true).open(files.app_log());
     if let Ok(mut log) = log {
-        let now = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S");
+        let now = time_zone::now().strftime("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(log, "==> {now} {text}");
     }
 }

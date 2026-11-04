@@ -23,6 +23,7 @@ use topcoat::{
 use super::require_server_owner;
 use crate::components::tabs::{tabs_list, tabs_trigger};
 use crate::features::monitoring::{HISTORY, Host, INTERVAL, Monitor, Rates, Sample};
+use crate::features::time_zone;
 
 #[page]
 pub async fn page(cx: &Cx) -> Result<impl View> {
@@ -571,15 +572,10 @@ fn tooltip_data(samples: &[Sample], rates: &[Rates]) -> String {
     serde_json::Value::Array(rows).to_string()
 }
 
-/// The time of day on the server's clock, such as `18:24:32`.
+/// The time of day on the server's clock, in the panel's time zone, such as `18:24:32`.
 pub(super) fn server_clock(at: SystemTime) -> String {
     jiff::Timestamp::try_from(at)
-        .map(|timestamp| {
-            timestamp
-                .to_zoned(jiff::tz::TimeZone::system())
-                .strftime("%H:%M:%S")
-                .to_string()
-        })
+        .map(|timestamp| time_zone::at(timestamp).strftime("%H:%M:%S").to_string())
         .unwrap_or_default()
 }
 

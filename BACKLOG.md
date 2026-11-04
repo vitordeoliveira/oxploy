@@ -89,3 +89,22 @@ igual no Mac.
   systemd, ele volta em segundos;
 - como o Caddy ganha as portas 80 e 443 sem rodar como root, por exemplo com
   `AmbientCapabilities` no serviço do systemd do oxploy.
+
+## Fuso horário
+
+### Passar o fuso das Settings aos apps
+
+**Problema.** O fuso que o super admin escolhe em Settings vale só para o painel: o relógio,
+os gráficos, as datas e as marcas que o oxploy escreve nos logs. Os apps continuam no fuso
+do sistema, que numa VPS costuma ser UTC.
+
+**Quando.** Junto com as rotinas, as tarefas agendadas dos apps, que precisam de um fuso
+para dizer a que horas rodam.
+
+**Caminho.** O oxploy passa `TZ` com o fuso escolhido aos apps, aos builds e aos scripts,
+como já passa `PORT`.
+
+**A decidir:**
+
+- se um app que define `TZ` nas variáveis dele ganha do fuso do painel;
+- se mudar o fuso reinicia os apps, ou se vale só a partir do próximo start.

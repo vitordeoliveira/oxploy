@@ -17,6 +17,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use rusqlite::{Connection, OpenFlags};
 
 use super::app_files::{AppFiles, size_of};
+use super::time_zone;
 
 /// The first bytes of every SQLite database file.
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -148,7 +149,7 @@ pub fn back_up(files: &AppFiles, database: &str, note: &str) -> Result<Backup, S
         .ok_or_else(|| StorageError(format!("there is no database {database} in the storage")))?;
     let folder = files.backups().join(database);
     fs::create_dir_all(&folder)?;
-    let stamp = jiff::Zoned::now().strftime("%Y-%m-%d-%H%M%S").to_string();
+    let stamp = time_zone::now().strftime("%Y-%m-%d-%H%M%S").to_string();
     let mut name = format!("{stamp}{note}.db");
     for attempt in 2.. {
         if !folder.join(&name).exists() {

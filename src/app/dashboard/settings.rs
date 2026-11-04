@@ -1,5 +1,6 @@
 //! Settings of the whole server, which only its super admin sees: the panel's own
-//! domain, the Caddy that serves it and the apps, and the version of oxploy.
+//! domain, the time zone it shows times in, the Caddy that serves it and the apps, and
+//! the version of oxploy.
 
 use serde::Deserialize;
 use topcoat::{
@@ -24,9 +25,11 @@ use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::dialog::{dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title};
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
+use crate::components::select::select;
 use crate::db::db;
 use crate::features::caddy::{Caddy, CaddyStatus};
 use crate::features::domain::{self, PanelDomain};
+use crate::features::time_zone::{self, PanelTimeZone};
 
 #[page]
 pub async fn page(cx: &Cx) -> Result<impl View> {
@@ -43,6 +46,12 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
     let open_removing = removing.clone();
     let updating = signal(cx, || false);
     let here = href!(page).resolve(cx);
+    let time_zone_url = href!(set_time_zone).resolve(cx);
+    let time_zone_id = element_id(cx);
+    let picked_zone = PanelTimeZone::picked(cx).await?;
+    let zones = time_zone::names();
+    let server_zone = time_zone::server_zone();
+    let local_now = time_zone::now();
     let host_id = element_id(cx);
     let set_url = href!(set_domain).resolve(cx);
     let remove_url = href!(remove_domain).resolve(cx);
@@ -124,6 +133,33 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
                         ": " <span class="font-mono break-all text-foreground">(addresses.join(", "))</span> "."
                     }
                     " Caddy gets its certificate from Let's Encrypt, or its own for names under localhost. Signing in to the panel needs HTTPS away from localhost, so it has no plain HTTP."
+                )
+            )
+            settings_card(
+                title: "Time zone",
+                text: "The time zone the panel shows times in: its clock, its charts and dates, and the times oxploy writes in the apps' logs and backups. The apps keep the server's own.",
+                <form method="post" action=(&time_zone_url) class="flex flex-col gap-4 sm:flex-row sm:items-end">
+                    field(
+                        attrs: attributes! { class="flex-1" },
+                        field_label(attrs: attributes! { for=(&time_zone_id) }, "Time zone")
+                        select(
+                            attrs: attributes! { id=(&time_zone_id) name="time_zone" },
+                            <option value="" selected=(picked_zone.is_none().then_some(""))>
+                                "The server's, " (&server_zone)
+                            </option>
+                            #[key(zone.clone())]
+                            for zone in &zones {
+                                <option value=(zone) selected=((picked_zone.as_deref() == Some(zone.as_str())).then_some(""))>
+                                    (zone)
+                                </option>
+                            }
+                        )
+                    )
+                    button(attrs: attributes! { type="submit" }, "Save time zone")
+                </form>
+                field_description(
+                    "It is " (local_now.strftime("%H:%M").to_string()) " there now, "
+                    (local_now.strftime("%Y-%m-%d").to_string()) ", UTC" (local_now.strftime("%:z").to_string()) "."
                 )
             )
             settings_card(
@@ -210,6 +246,22 @@ async fn remove_dialog(
             )
         )
     })
+}
+
+/// The time zone, as the form sends it: empty for the server's own.
+#[derive(Deserialize)]
+struct TimeZoneForm {
+    time_zone: String,
+}
+
+/// Picks the time zone the panel shows times in.
+#[route(POST "./time-zone")]
+async fn set_time_zone(cx: &Cx, Form(form): Form<TimeZoneForm>) -> Result<SeeOther> {
+    require_server_owner(cx).await?;
+    if !PanelTimeZone::pick(cx, &form.time_zone).await? {
+        return Err(bad_request("Choose a time zone from the list").into());
+    }
+    Ok(see_other(href!(page).resolve(cx)))
 }
 
 /// The panel's domain, as the form sends it.

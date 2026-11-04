@@ -32,6 +32,7 @@ use crate::components::sidebar::{
 };
 use crate::features::organization::Organization;
 use crate::features::session::{SignedIn, UserSession};
+use crate::features::time_zone;
 use crate::features::update::{Updater, VERSION};
 use crate::features::user::{Role, User};
 use organizations::{OrganizationMenu, organization_dialogs, organization_switcher};
@@ -322,11 +323,11 @@ async fn account(user: &User, version_url: &str) -> Result<impl View> {
     })
 }
 
-/// The server's clock and time zone. The server renders the time once, and
+/// The server's clock, in the panel's time zone. The server renders the time once, and
 /// `server-time.js` keeps it ticking in the browser.
 #[component]
 async fn server_time() -> Result<impl View> {
-    let now = jiff::Zoned::now();
+    let now = time_zone::now();
     let zone = now.time_zone().iana_name().unwrap_or("UTC").to_owned();
     let offset = now.offset().seconds();
 

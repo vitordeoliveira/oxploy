@@ -25,6 +25,8 @@ async fn main() {
         return;
     }
 
+    // The time zone the super admin picked, which the panel shows times in.
+    features::time_zone::PanelTimeZone::load(&db).await.unwrap();
     let monitor = features::monitoring::Monitor::start().unwrap();
     // Keeps Caddy's routes to the apps in step with their domains.
     let caddy = features::caddy::Caddy::start(db.clone());

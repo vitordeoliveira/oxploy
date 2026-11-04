@@ -120,6 +120,10 @@ deployments in progress finish. The apps keep running. It needs the panel's user
 folder it is installed in. To go back, stop oxploy, move `previous/oxploy` and
 `previous/assets` back in place, and start it.
 
+**Settings** also picks the time zone the panel shows times in: its clock, its charts and
+dates, and the times oxploy writes in the apps' logs and backups. Until one is picked, it
+is the server's own, and the apps keep the server's own either way.
+
 ## Project structure
 
 | Path | Contents |
