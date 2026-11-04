@@ -392,7 +392,7 @@ async fn service_status(cx: &Cx, project_id: u64, service_id: u64, local: bool) 
                 let domains = Domain::of_service(cx, service.id).await?;
                 // A domain reaches the app from anywhere. Without one, the app listens
                 // on 127.0.0.1, which only a browser on the same machine reaches.
-                let open = match domains.first() {
+                let open = match Domain::default_of(&domains, service.default_domain_id) {
                     Some(domain) if status == AppStatus::Running => Some(domain.url()),
                     _ => service
                         .port

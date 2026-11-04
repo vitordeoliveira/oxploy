@@ -200,6 +200,21 @@ impl Domain {
     pub fn www(&self) -> Option<String> {
         self.redirect_www.then(|| format!("www.{}", self.host))
     }
+
+    /// Whether oxploy made the domain up, at the server's address through sslip.io.
+    pub fn is_generated(&self) -> bool {
+        self.host.ends_with(&format!(".{GENERATED_DOMAIN}"))
+    }
+
+    /// Of a service's `domains`, oldest first, the one its Open button opens: the one
+    /// with the ID the user chose, or else the first of the user's own, or else the
+    /// first.
+    pub fn default_of(domains: &[Domain], chosen: Option<u64>) -> Option<&Domain> {
+        chosen
+            .and_then(|id| domains.iter().find(|domain| domain.id == id))
+            .or_else(|| domains.iter().find(|domain| !domain.is_generated()))
+            .or_else(|| domains.first())
+    }
 }
 
 impl PanelDomain {
@@ -465,6 +480,35 @@ fn is_public(address: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored(id: u64, host: &str) -> Domain {
+        Domain {
+            id,
+            service_id: 1,
+            host: host.to_owned(),
+            path: None,
+            strip_path: false,
+            https: true,
+            redirect_www: false,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn open_prefers_the_chosen_domain_then_the_users_own() {
+        let domains = [
+            stored(1, "shop-api.203-0-113-7.sslip.io"),
+            stored(2, "shop.example.com"),
+            stored(3, "api.example.com"),
+        ];
+        assert_eq!(Domain::default_of(&domains, None).map(|domain| domain.id), Some(2));
+        assert_eq!(Domain::default_of(&domains, Some(3)).map(|domain| domain.id), Some(3));
+        assert_eq!(Domain::default_of(&domains, Some(1)).map(|domain| domain.id), Some(1));
+        // A chosen domain since deleted falls back.
+        assert_eq!(Domain::default_of(&domains, Some(9)).map(|domain| domain.id), Some(2));
+        assert_eq!(Domain::default_of(&domains[..1], None).map(|domain| domain.id), Some(1));
+        assert!(Domain::default_of(&[], Some(1)).is_none());
+    }
 
     fn new<'a>(host: &'a str, path: &'a str) -> NewDomain<'a> {
         NewDomain {

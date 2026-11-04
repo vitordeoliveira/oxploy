@@ -69,3 +69,8 @@ snapshot_name = "0012_snapshot.toml"
 id = 1080417055680541685
 name = "0013_add_panel_time_zone.sql"
 snapshot_name = "0013_snapshot.toml"
+
+[[migrations]]
+id = 1533788045676834090
+name = "0014_add_default_domains.sql"
+snapshot_name = "0014_snapshot.toml"

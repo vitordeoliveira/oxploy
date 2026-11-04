@@ -60,12 +60,14 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
     let add_url = href!(add_domain, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let edit_url = href!(edit_domain, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let delete_url = href!(delete_domain, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    let default_url = href!(default_domain, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    let default_id = Domain::default_of(&domains, service.default_domain_id).map(|domain| domain.id);
 
     Ok(view! {
         <div class="flex flex-col gap-6">
             settings_card(
                 title: "Domains",
-                text: "The addresses that reach the app. Caddy takes their requests and passes them to it, over HTTPS with certificates it gets and renews.",
+                text: "The addresses that reach the app. Caddy takes their requests and passes them to it, over HTTPS with certificates it gets and renews. Open, beside the service's name, opens the default one.",
                 caddy_notice(status: &status, admin: &admin)
                 <div class="flex flex-wrap items-start justify-between gap-3">
                     <p class="flex max-w-2xl items-start gap-2 text-sm text-muted-foreground">
@@ -104,6 +106,9 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
                                 project_id: project_id,
                                 service_id: service_id,
                                 domain: domain,
+                                // With one domain, there is nothing to choose.
+                                default: (domains.len() > 1).then_some(default_id == Some(domain.id)),
+                                default_url: &default_url,
                                 editing: &dialogs[index].0,
                                 deleting: &dialogs[index].1
                             )
@@ -122,11 +127,14 @@ pub async fn domains_tab(cx: &Cx, project: &Project, service: &Service) -> Resul
 }
 
 /// One domain: its address, how it is served, where its DNS points, and its buttons.
+/// `default` says whether it is the one Open opens, when there are others to choose from.
 #[component]
 async fn domain_row(
     project_id: u64,
     service_id: u64,
     domain: &Domain,
+    default: Option<bool>,
+    default_url: &str,
     editing: &Signal<bool>,
     deleting: &Signal<bool>,
 ) -> Result<impl View> {
@@ -151,6 +159,12 @@ async fn domain_row(
                     icon(data: iconify_icon!("lucide:external-link"), size: 14, attrs: attributes! { class="shrink-0 text-muted-foreground" })
                 </a>
                 <div class="flex flex-wrap items-center gap-2 text-xs">
+                    if default == Some(true) {
+                        <span class="inline-flex items-center gap-1 rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 font-medium text-primary">
+                            icon(data: iconify_icon!("lucide:star"), size: 12)
+                            "Default"
+                        </span>
+                    }
                     <span class="rounded-full border border-border px-2 py-0.5 text-muted-foreground">
                         (if domain.https { "HTTPS" } else { "Plain HTTP" })
                     </span>
@@ -171,6 +185,20 @@ async fn domain_row(
                 </div>
             </div>
             <div class="flex items-center gap-1 self-end sm:self-auto">
+                if default == Some(false) {
+                    <form method="post" action=(default_url)>
+                        <input type="hidden" name="id" value=(domain.id.to_string())>
+                        button(
+                            variant: ButtonVariant::Ghost,
+                            size: ButtonSize::Sm,
+                            attrs: attributes! {
+                                type="submit"
+                                title="Open this one from the service's Open button"
+                            },
+                            "Make default"
+                        )
+                    </form>
+                }
                 button(
                     variant: ButtonVariant::Ghost,
                     size: ButtonSize::Icon,
@@ -444,6 +472,15 @@ async fn edit_domain(cx: &Cx, Form(form): Form<DomainForm>) -> Result<SeeOther> 
 #[derive(Deserialize)]
 struct ChosenDomain {
     id: u64,
+}
+
+/// Makes one of the service's domains the one its Open button opens.
+#[route(POST "./default-domain")]
+async fn default_domain(cx: &Cx, Form(form): Form<ChosenDomain>) -> Result<SeeOther> {
+    let (project, mut service) = current_service(cx).await?;
+    let domain = Domain::find_of(cx, service.id, form.id).await?.ok_or_not_found()?;
+    service.set_default_domain(cx, domain.id).await?;
+    Ok(see_other(ServiceTab::Domains.url(cx, &project, &service)))
 }
 
 /// Deletes one of the service's domains.

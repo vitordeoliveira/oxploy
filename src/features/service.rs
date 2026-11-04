@@ -106,6 +106,10 @@ pub struct Service {
     /// a public address. It gives one only if the service had no domain then, and only
     /// that once, so a domain the user removes stays removed.
     pub domain_offered_at: Option<i64>,
+
+    /// The domain the service's Open button opens. Without one, or once it is deleted, it
+    /// opens the first domain of the user's own, or else the one oxploy gave the app.
+    pub default_domain_id: Option<u64>,
 }
 
 /// How a service is built.
@@ -223,6 +227,7 @@ impl Service {
             release_id: None,
             stopped_at: None,
             domain_offered_at: None,
+            default_domain_id: None,
         })
         .exec(&mut db(cx))
         .await?;
@@ -350,6 +355,16 @@ impl Service {
             .exec(&mut db(cx))
             .await?;
         Ok(true)
+    }
+
+    /// Makes the domain with this ID the one the service's Open button opens. The
+    /// caller checks that it is one of the service's.
+    pub async fn set_default_domain(&mut self, cx: &Cx, domain_id: u64) -> Result<()> {
+        self.update()
+            .default_domain_id(Some(domain_id))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(())
     }
 
     /// Sets the script that runs after each build. An empty one means none. Returns
