@@ -65,6 +65,11 @@ pub(super) async fn resolution_label(host: &str, resolution: Option<&Resolution>
                 addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
             ),
         ),
+        Some(Resolution::Cloudflare) => (
+            iconify_icon!("lucide:cloud"),
+            "text-sky-700 dark:text-sky-400",
+            "goes through Cloudflare's proxy".to_owned(),
+        ),
         Some(Resolution::Nowhere) => (
             iconify_icon!("lucide:triangle-alert"),
             "text-amber-700 dark:text-amber-400",
@@ -72,8 +77,13 @@ pub(super) async fn resolution_label(host: &str, resolution: Option<&Resolution>
         ),
     };
 
+    // Cloudflare's addresses say nothing of where it sends the requests.
+    let hint = matches!(resolution, Some(Resolution::Cloudflare)).then_some(
+        "Cloudflare answers for the name with addresses of its own and passes the requests to the address set there, which oxploy cannot check. Set its SSL/TLS mode to Full (strict).",
+    );
+
     Ok(view! {
-        <span class=(class!("inline-flex items-center gap-1", color))>
+        <span class=(class!("inline-flex items-center gap-1", color)) title=(hint)>
             icon(data: symbol, size: 12, attrs: attributes! { class="shrink-0" })
             <span class="break-all">(host) " " (text)</span>
         </span>

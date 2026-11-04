@@ -359,6 +359,9 @@ fn normalize_path(path: &str) -> Option<Option<String>> {
 pub enum Resolution {
     /// To this machine.
     Here,
+    /// To Cloudflare's proxy, which answers for the name with addresses of its own and
+    /// passes the requests on to the address set at Cloudflare, which oxploy cannot see.
+    Cloudflare,
     /// To other addresses.
     Elsewhere(Vec<IpAddr>),
     /// Nowhere: the name has no address, or the lookup failed.
@@ -383,8 +386,63 @@ pub async fn resolve(host: &str) -> Resolution {
         Resolution::Nowhere
     } else if found.iter().any(|address| here.contains(address)) {
         Resolution::Here
+    } else if found.iter().all(is_cloudflare) {
+        Resolution::Cloudflare
     } else {
         Resolution::Elsewhere(found)
+    }
+}
+
+/// The addresses of Cloudflare's proxy, as Cloudflare publishes them at
+/// <https://www.cloudflare.com/ips-v4> and <https://www.cloudflare.com/ips-v6>.
+const CLOUDFLARE: [&str; 22] = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+];
+
+/// Whether `address` is one of Cloudflare's proxy.
+fn is_cloudflare(address: &IpAddr) -> bool {
+    CLOUDFLARE.iter().any(|range| in_range(address, range))
+}
+
+/// Whether `address` is in `range`, such as `104.16.0.0/13`.
+fn in_range(address: &IpAddr, range: &str) -> bool {
+    let Some((network, bits)) = range.split_once('/') else {
+        return false;
+    };
+    let Ok(bits) = bits.parse::<u32>() else {
+        return false;
+    };
+    match (address, network.parse::<IpAddr>()) {
+        (IpAddr::V4(address), Ok(IpAddr::V4(network))) => {
+            let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+            u32::from(*address) & mask == u32::from(network) & mask
+        }
+        (IpAddr::V6(address), Ok(IpAddr::V6(network))) => {
+            let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+            u128::from(*address) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
 }
 
@@ -480,6 +538,17 @@ fn is_public(address: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloudflares_proxy_is_known_by_its_addresses() {
+        let cloudflare = ["104.21.66.153", "172.67.161.125", "2606:4700:3032::ac43:a17d", "104.27.255.255"];
+        for address in cloudflare {
+            assert!(is_cloudflare(&address.parse().unwrap()), "{address}");
+        }
+        for address in ["203.0.113.7", "104.28.0.1", "172.72.0.1", "2606:4701::1"] {
+            assert!(!is_cloudflare(&address.parse().unwrap()), "{address}");
+        }
+    }
 
     fn stored(id: u64, host: &str) -> Domain {
         Domain {
