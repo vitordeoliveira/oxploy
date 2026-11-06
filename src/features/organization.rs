@@ -3,6 +3,7 @@
 use topcoat::{Result, context::Cx};
 
 use super::github::GithubApp;
+use super::mcp::McpToken;
 use super::project::Project;
 use super::user::User;
 use crate::db::db;
@@ -150,6 +151,7 @@ impl Organization {
         }
         Project::remove_all_in(cx, self.id).await?;
         GithubApp::remove_all_in(cx, self.id).await?;
+        McpToken::remove_all_in(cx, self.id).await?;
         Organization::filter_by_id(self.id)
             .delete()
             .exec(&mut db(cx))

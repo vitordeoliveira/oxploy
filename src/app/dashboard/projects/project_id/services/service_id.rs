@@ -190,7 +190,7 @@ impl ServiceTab {
     }
 
     /// The URL of the tab on a service's page.
-    fn url(self, cx: &Cx, project: &Project, service: &Service) -> String {
+    pub(crate) fn url(self, cx: &Cx, project: &Project, service: &Service) -> String {
         let (project, service) = (ProjectId(project.id), ServiceId(service.id));
         match self {
             Self::General => href!(page, project, service).resolve(cx),

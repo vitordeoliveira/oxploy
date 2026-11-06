@@ -84,3 +84,8 @@ snapshot_name = "0015_snapshot.toml"
 id = 3655558434444535784
 name = "0016_add_app_mcp_servers.sql"
 snapshot_name = "0016_snapshot.toml"
+
+[[migrations]]
+id = 7864625882920893610
+name = "0017_add_organization_mcp_tokens.sql"
+snapshot_name = "0017_snapshot.toml"

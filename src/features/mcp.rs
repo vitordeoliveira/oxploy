@@ -1,10 +1,11 @@
 //! Access to the panel's MCP server: the tokens AI agents, such as a bot or Claude Code,
 //! send to read the server over the Model Context Protocol.
 //!
-//! The super admin makes each token in the panel, which shows it once. Only its hash is
-//! stored, as with the sign-in sessions, so a leaked database cannot be used to read the
-//! server. So far every token is a server token: it reads the machine, oxploy itself and
-//! every app it runs.
+//! Each token is made in the panel, which shows it once. Only its hash is stored, as
+//! with the sign-in sessions, so a leaked database cannot be used. A token reaches one
+//! of two things: the server, for the super admin, with the machine, oxploy itself and
+//! every app it runs; or one organization, with the tools of its apps that were turned
+//! on.
 
 use sha2::{Digest, Sha256};
 use topcoat::{
@@ -25,6 +26,10 @@ pub struct McpToken {
 
     /// What the user calls it, such as the client that uses it.
     pub name: String,
+
+    /// The organization whose apps' tools it reaches, or `None` for a server token.
+    #[index]
+    pub organization_id: Option<u64>,
 
     /// The SHA-256 hash of the token.
     #[unique]
@@ -52,19 +57,31 @@ pub const MAX_NAME_LEN: usize = 64;
 const LAST_USED_PRECISION: i64 = 60;
 
 impl McpToken {
-    /// The tokens, newest first.
-    pub async fn all_newest_first(cx: &Cx) -> Result<Vec<McpToken>> {
-        let tokens = McpToken::all()
+    /// The tokens of the organization, or the server's with `None`, newest first.
+    pub async fn of(cx: &Cx, organization_id: Option<u64>) -> Result<Vec<McpToken>> {
+        let mut tokens = McpToken::all()
             .order_by(McpToken::fields().id().desc())
             .exec(&mut db(cx))
             .await?;
+        tokens.retain(|token| token.organization_id == organization_id);
         Ok(tokens)
     }
 
-    /// Makes a token named `name`, and returns it with the token itself, which is never
-    /// stored and so cannot be shown again. Returns `None` if the name is empty or too
-    /// long.
-    pub async fn issue(cx: &Cx, name: &str) -> Result<Option<(McpToken, String)>> {
+    /// The token with this ID, if it is one of the organization's, or the server's with
+    /// `None`.
+    pub async fn find_of(cx: &Cx, organization_id: Option<u64>, id: u64) -> Result<Option<McpToken>> {
+        let token = McpToken::filter_by_id(id).first().exec(&mut db(cx)).await?;
+        Ok(token.filter(|token| token.organization_id == organization_id))
+    }
+
+    /// Makes a token named `name` for the organization, or for the server with `None`,
+    /// and returns it with the token itself, which is never stored and so cannot be
+    /// shown again. Returns `None` if the name is empty or too long.
+    pub async fn issue(
+        cx: &Cx,
+        organization_id: Option<u64>,
+        name: &str,
+    ) -> Result<Option<(McpToken, String)>> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > MAX_NAME_LEN {
             return Ok(None);
@@ -72,6 +89,7 @@ impl McpToken {
         let secret = new_secret();
         let token = toasty::create!(McpToken {
             name: name.to_owned(),
+            organization_id,
             token_hash: hash(&secret),
             created_at: now(),
             last_used_at: None,
@@ -81,10 +99,18 @@ impl McpToken {
         Ok(Some((token, secret)))
     }
 
-    /// Deletes the token with this ID, if there is one. Clients that send it are turned
-    /// away from then on.
-    pub async fn revoke(cx: &Cx, id: u64) -> Result<()> {
-        McpToken::filter_by_id(id).delete().exec(&mut db(cx)).await?;
+    /// Deletes the token. Clients that send it are turned away from then on.
+    pub async fn revoke(self, cx: &Cx) -> Result<()> {
+        McpToken::filter_by_id(self.id).delete().exec(&mut db(cx)).await?;
+        Ok(())
+    }
+
+    /// Deletes the organization's tokens, as when it is deleted.
+    pub async fn remove_all_in(cx: &Cx, organization_id: u64) -> Result<()> {
+        McpToken::filter_by_organization_id(Some(organization_id))
+            .delete()
+            .exec(&mut db(cx))
+            .await?;
         Ok(())
     }
 }

@@ -130,14 +130,20 @@ is the server's own, and the apps keep the server's own either way.
 
 ## MCP
 
-`/mcp` lets AI agents, such as a bot or Claude Code, read the server through the
-[Model Context Protocol](https://modelcontextprotocol.io). The super admin makes a token
-for each client on the **MCP** page, which shows it once: oxploy keeps only its hash.
-Clients send it as `Authorization: Bearer <token>`, and a missing or wrong one gets a 401
-after a second. Revoking a token on the same page turns its client away.
+`/mcp` lets AI agents, such as a bot or Claude Code, reach the server and its apps through
+the [Model Context Protocol](https://modelcontextprotocol.io). Each client gets a token of
+its own on the **MCP** page, which shows it once: oxploy keeps only its hash. Clients send
+it as `Authorization: Bearer <token>`, and a missing or wrong one gets a 401 after a
+second. Revoking a token on the same page turns its client away. A client that needs
+both kinds below holds one token of each.
 
-A server token reads the machine, oxploy itself and every app it runs, across
-organizations. The tools only read:
+An organization's token reaches the tools of its apps that serve MCP, the ones turned on
+in each app's **MCP** tab, as described below. Each is named after its app, such as
+`porta-global__list_requests`, and a call goes to the app's own server. An app that is
+not running lists none. Other organizations' tokens see none of them.
+
+A server token, which only the super admin makes, reads the machine, oxploy itself and
+every app it runs, across organizations. Its tools only read:
 
 | Tool | What it returns |
 | --- | --- |
@@ -156,8 +162,9 @@ claude mcp add --transport http oxploy https://<panel>/mcp \
 ```
 
 `src/app/mcp.rs` answers each JSON-RPC message, sent by POST, with plain JSON, with no
-session and no event stream. Each tool is a file of its own in `src/app/mcp/`, with a line
-each in `definitions` and `call_tool`.
+session and no event stream. Each server tool is a file of its own in `src/app/mcp/`, with
+a line each in `definitions` and `call_tool`, and `src/app/mcp/apps.rs` passes on the
+apps' tools.
 
 An app can serve an MCP server of its own, over Streamable HTTP on its port. Its **MCP**
 tab turns that on at a path, `/mcp` unless set otherwise. oxploy then gives the app
@@ -165,9 +172,9 @@ tab turns that on at a path, `/mcp` unless set otherwise. oxploy then gives the 
 `Authorization: Bearer <token>`, and has Caddy answer 404 at the path on the app's
 domains, so only oxploy reaches it. An app that reads another variable takes the token
 with a line such as `MCP_TOKEN=${OXPLOY_MCP_TOKEN}` in its Environment tab. The tab lists
-the app's tools, each off until it is turned on: the ones turned on will reach each
-organization's own MCP. `src/features/app_mcp.rs` is the client, which takes answers in
-plain JSON or as an event stream, with or without a session.
+the app's tools, each off until it is turned on, and the organization's tokens reach the
+ones turned on. `src/features/app_mcp.rs` is the client, which takes answers in plain JSON
+or as an event stream, with or without a session.
 
 ## Project structure
 

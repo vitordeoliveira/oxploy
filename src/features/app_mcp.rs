@@ -6,9 +6,9 @@
 //! `OXPLOY_MCP_TOKEN` as `Authorization: Bearer <token>`. Caddy answers 404 at that path
 //! on the app's domains, so only oxploy reaches it.
 //!
-//! oxploy speaks the protocol as a client: it opens a session and lists the tools. A
-//! server may answer each request with plain JSON or with an event stream, and may give
-//! the session an ID to send back; oxploy handles both.
+//! oxploy speaks the protocol as a client: it opens a session, then lists the tools or
+//! calls one. A server may answer each request with plain JSON or with an event stream,
+//! and may give the session an ID to send back; oxploy handles both.
 
 use std::fmt;
 use std::io::{BufRead, BufReader};
@@ -35,8 +35,11 @@ const MAX_TOOL_NAME_LEN: usize = 128;
 /// The protocol version oxploy asks for. The server answers with the one it speaks.
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
-/// How long a call to an app's MCP server may take, from connecting to the last byte.
+/// How long listing an app's tools may take, from connecting to the last byte.
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long calling one of an app's tools may take, since a tool may have work to do.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most pages of tools oxploy reads, so a server that keeps sending more cannot
 /// keep it busy.
@@ -149,6 +152,8 @@ pub struct Tool {
     pub title: Option<String>,
     pub description: Option<String>,
     pub effect: Effect,
+    /// The tool as the server listed it, with its arguments' schema, to pass on.
+    pub definition: Value,
 }
 
 /// What a tool does to the app's data, as the app declares it. The protocol takes a
@@ -172,8 +177,12 @@ pub enum ConnectError {
     NotFound,
     /// The app answered something other than MCP, with what was wrong.
     NotMcp(String),
-    /// The app's server answered a request with an error, with its message.
-    Failed(String),
+    /// The app's server answered a request with a JSON-RPC error.
+    Rpc {
+        method: String,
+        code: i64,
+        message: String,
+    },
 }
 
 impl fmt::Display for ConnectError {
@@ -183,7 +192,9 @@ impl fmt::Display for ConnectError {
             Self::Refused(status) => write!(f, "the app turned oxploy away with {status}"),
             Self::NotFound => f.write_str("the app serves no MCP at this path"),
             Self::NotMcp(problem) => write!(f, "the app's answer is not MCP: {problem}"),
-            Self::Failed(message) => write!(f, "the app's MCP server answered with an error: {message}"),
+            Self::Rpc { method, message, .. } => {
+                write!(f, "the app's MCP server answered {method} with an error: {message}")
+            }
         }
     }
 }
@@ -199,18 +210,40 @@ pub async fn list_tools(port: u64, path: &str, token: &str) -> Result<Listing, C
         .unwrap_or_else(|error| Err(ConnectError::Unreachable(error.to_string())))
 }
 
+/// Calls the tool `name` of the MCP server an app serves at `path` on `port` with
+/// `arguments`, and returns the result as the server gave it: its content, and whether
+/// the tool failed. The server's own JSON-RPC errors come back as
+/// [`ConnectError::Rpc`].
+pub async fn call_tool(
+    port: u64,
+    path: &str,
+    token: &str,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, ConnectError> {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    let (token, name) = (token.to_owned(), name.to_owned());
+    tokio::task::spawn_blocking(move || fetch_call(&url, &token, &name, arguments))
+        .await
+        .unwrap_or_else(|error| Err(ConnectError::Unreachable(error.to_string())))
+}
+
 /// Opens a session with the server at `url`, lists its tools and closes the session.
 fn fetch_tools(url: &str, token: &str) -> Result<Listing, ConnectError> {
-    let mut session = Session {
-        url,
-        token,
-        id: None,
-        version: None,
-        next_request: 1,
-    };
+    let mut session = Session::new(&AGENT, url, token);
     let listing = session.list();
     session.close();
     listing
+}
+
+/// Opens a session with the server at `url`, calls one tool and closes the session.
+fn fetch_call(url: &str, token: &str, name: &str, arguments: Value) -> Result<Value, ConnectError> {
+    let mut session = Session::new(&CALLS, url, token);
+    let result = session
+        .initialize()
+        .and_then(|_| session.request("tools/call", json!({ "name": name, "arguments": arguments })));
+    session.close();
+    result
 }
 
 /// Calls an app's MCP server.
@@ -223,8 +256,19 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// Calls a tool of an app's MCP server, which may take longer than listing.
+static CALLS: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(CALL_TIMEOUT))
+        .user_agent("oxploy")
+        .build()
+        .into()
+});
+
 /// A session with an app's MCP server.
 struct Session<'a> {
+    agent: &'static ureq::Agent,
     url: &'a str,
     token: &'a str,
     /// The ID the server gave the session, sent back with every later request.
@@ -234,31 +278,21 @@ struct Session<'a> {
     next_request: u64,
 }
 
-impl Session<'_> {
+impl<'a> Session<'a> {
+    fn new(agent: &'static ureq::Agent, url: &'a str, token: &'a str) -> Self {
+        Session {
+            agent,
+            url,
+            token,
+            id: None,
+            version: None,
+            next_request: 1,
+        }
+    }
+
     /// Initializes the session and lists the tools, page by page.
     fn list(&mut self) -> Result<Listing, ConnectError> {
-        let initialized = self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "oxploy", "title": "oxploy", "version": VERSION },
-            }),
-        )?;
-        let version = initialized
-            .get("protocolVersion")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ConnectError::NotMcp("its answer to initialize has no protocol version".to_owned()))?
-            .to_owned();
-        let info = initialized.get("serverInfo");
-        let text = |field: &str| info.and_then(|info| info.get(field)).and_then(Value::as_str).map(str::to_owned);
-        let server = Server {
-            name: text("name").unwrap_or_default(),
-            title: text("title"),
-            version: text("version"),
-        };
-        self.version = Some(version.clone());
-        self.notify("notifications/initialized")?;
+        let (server, version) = self.initialize()?;
 
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
@@ -283,6 +317,33 @@ impl Session<'_> {
             protocol_version: version,
             tools,
         })
+    }
+
+    /// Opens the session, and returns the server and the protocol version it speaks.
+    fn initialize(&mut self) -> Result<(Server, String), ConnectError> {
+        let initialized = self.request(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "oxploy", "title": "oxploy", "version": VERSION },
+            }),
+        )?;
+        let version = initialized
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ConnectError::NotMcp("its answer to initialize has no protocol version".to_owned()))?
+            .to_owned();
+        let info = initialized.get("serverInfo");
+        let text = |field: &str| info.and_then(|info| info.get(field)).and_then(Value::as_str).map(str::to_owned);
+        let server = Server {
+            name: text("name").unwrap_or_default(),
+            title: text("title"),
+            version: text("version"),
+        };
+        self.version = Some(version.clone());
+        self.notify("notifications/initialized")?;
+        Ok((server, version))
     }
 
     /// Sends a request and returns its result.
@@ -311,8 +372,15 @@ impl Session<'_> {
                 .map_err(|error| ConnectError::NotMcp(format!("its answer to {method} is not JSON: {error}")))?
         };
         if let Some(error) = message.get("error") {
-            let text = error.get("message").and_then(Value::as_str).unwrap_or("no details");
-            return Err(ConnectError::Failed(format!("{method}: {text}")));
+            return Err(ConnectError::Rpc {
+                method: method.to_owned(),
+                code: error.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no details")
+                    .to_owned(),
+            });
         }
         message
             .get("result")
@@ -327,7 +395,8 @@ impl Session<'_> {
 
     /// Posts one message, and turns away an answer whose status says it failed.
     fn post(&self, message: &Value) -> Result<ureq::http::Response<ureq::Body>, ConnectError> {
-        let mut request = AGENT
+        let mut request = self
+            .agent
             .post(self.url)
             .header("Accept", "application/json, text/event-stream")
             .header("Authorization", format!("Bearer {}", self.token));
@@ -352,7 +421,8 @@ impl Session<'_> {
     /// matter: it ends the session on its own after a while anyway.
     fn close(&self) {
         if let Some(id) = &self.id {
-            let mut request = AGENT
+            let mut request = self
+                .agent
                 .delete(self.url)
                 .header("Authorization", format!("Bearer {}", self.token))
                 .header("Mcp-Session-Id", id);
@@ -411,6 +481,7 @@ fn tool(value: &Value) -> Option<Tool> {
         }),
         description: text("description"),
         effect,
+        definition: value.clone(),
     })
 }
 
@@ -526,19 +597,20 @@ mod tests {
         assert_eq!(listing.server.name, "portaglobal");
         assert_eq!(listing.server.title.as_deref(), Some("Porta Global"));
         assert_eq!(listing.protocol_version, "2025-06-18");
+        let tools: Vec<_> = listing
+            .tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.title.as_deref(), tool.description.as_deref(), tool.effect))
+            .collect();
         assert_eq!(
-            listing.tools,
+            tools,
             [
-                Tool {
-                    name: "list_requests".to_owned(),
-                    title: Some("List quote requests".to_owned()),
-                    description: Some("Lists them.".to_owned()),
-                    effect: Effect::ReadOnly,
-                },
-                Tool { name: "archive".to_owned(), title: None, description: None, effect: Effect::Writes },
-                Tool { name: "purge".to_owned(), title: None, description: None, effect: Effect::Destructive },
+                ("list_requests", Some("List quote requests"), Some("Lists them."), Effect::ReadOnly),
+                ("archive", None, None, Effect::Writes),
+                ("purge", None, None, Effect::Destructive),
             ]
         );
+        assert_eq!(listing.tools[1].definition, json!({ "name": "archive", "annotations": { "destructiveHint": false } }));
 
         let got = got.lock().unwrap();
         let methods: Vec<_> = got.iter().map(Got::rpc).collect();
@@ -598,7 +670,7 @@ mod tests {
         });
         assert_eq!(
             fetch_tools(&failing, "secret").unwrap_err(),
-            ConnectError::Failed("initialize: boom".to_owned())
+            ConnectError::Rpc { method: "initialize".to_owned(), code: -32603, message: "boom".to_owned() }
         );
 
         // A port nothing listens on: bound, then let go.
@@ -607,6 +679,33 @@ mod tests {
             fetch_tools(&format!("http://{free}/mcp"), "secret"),
             Err(ConnectError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn calls_a_tool_and_returns_its_result_as_it_came() {
+        let (url, got) = serve(|got| match got.rpc() {
+            "initialize" => json_answer(got, initialized()),
+            "tools/call" if got.body["params"]["name"] == "list_requests" => json_answer(
+                got,
+                json!({ "content": [{ "type": "text", "text": "{\"count\":0}" }], "isError": false }),
+            ),
+            "tools/call" => {
+                let body = json!({ "jsonrpc": "2.0", "id": got.body["id"], "error": { "code": -32602, "message": "Unknown tool" } });
+                (200, vec![("Content-Type", "application/json".to_owned())], body.to_string())
+            }
+            _ => (202, Vec::new(), String::new()),
+        });
+
+        let result = fetch_call(&url, "secret", "list_requests", json!({ "stage": "new" })).unwrap();
+        assert_eq!(result["content"][0]["text"], "{\"count\":0}");
+        let sent = got.lock().unwrap().iter().find(|got| got.rpc() == "tools/call").cloned().unwrap();
+        assert_eq!(sent.body["params"], json!({ "name": "list_requests", "arguments": { "stage": "new" } }));
+        assert_eq!(sent.header("authorization"), Some("Bearer secret"));
+
+        assert_eq!(
+            fetch_call(&url, "secret", "delete_all", json!({})).unwrap_err(),
+            ConnectError::Rpc { method: "tools/call".to_owned(), code: -32602, message: "Unknown tool".to_owned() }
+        );
     }
 
     #[test]

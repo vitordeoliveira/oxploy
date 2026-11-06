@@ -1,26 +1,27 @@
-//! The MCP page: where AI clients, such as a bot or Claude Code, read this server and its
-//! apps over the Model Context Protocol, at `/mcp`.
+//! The MCP page: where AI clients, such as a bot or Claude Code, reach this server and
+//! its apps over the Model Context Protocol, at `/mcp`.
 //!
 //! The super admin makes server tokens here, which read the machine, oxploy itself and
-//! every app it runs. Each organization will get tokens of its own, for the tools of its
-//! apps.
+//! every app it runs. Each organization makes tokens of its own, which reach the tools
+//! of its apps that were turned on in each app's MCP tab.
 
 use serde::Deserialize;
 use topcoat::{
     Result,
     context::Cx,
-    icon::{icon, iconify::iconify_icon},
+    icon::{IconData, icon, iconify::iconify_icon},
     router::{
         content::Form,
-        error::{SeeOther, bad_request, see_other},
+        error::{RouterErrorExt, SeeOther, bad_request, see_other},
         href, page, route,
     },
     runtime::{Event, Signal, signal},
-    view::{View, attributes, component, element_id, view},
+    view::{Child, View, attributes, component, element_id, view},
 };
 
 use super::projects::created_at;
-use super::{panel_url, require_server_owner, require_sign_in};
+use super::projects::project_id::services::service_id::ServiceTab;
+use super::{panel_url, require_organization, require_server_owner, require_sign_in};
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::dialog::{
@@ -28,11 +29,52 @@ use crate::components::dialog::{
 };
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
+use crate::features::app_mcp::McpTool;
 use crate::features::mcp::{MAX_NAME_LEN, McpToken};
+use crate::features::project::Project;
+use crate::features::service::Service;
 use crate::features::user::Role;
+
+/// Whose tokens a part of the page holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The server's, which only the super admin sees.
+    Server,
+    /// The organization the browser is working in.
+    Organization,
+}
+
+impl Kind {
+    /// How the forms name it.
+    fn code(self) -> &'static str {
+        match self {
+            Kind::Server => "server",
+            Kind::Organization => "organization",
+        }
+    }
+
+    fn parse(code: &str) -> Option<Kind> {
+        [Kind::Server, Kind::Organization]
+            .into_iter()
+            .find(|kind| kind.code() == code)
+    }
+
+    /// The organization the kind's tokens belong to, `None` for the server's, once the
+    /// browser is checked to manage them.
+    async fn owner(self, cx: &Cx) -> Result<Option<u64>> {
+        Ok(match self {
+            Kind::Server => {
+                require_server_owner(cx).await?;
+                None
+            }
+            Kind::Organization => Some(require_organization(cx).await?.id),
+        })
+    }
+}
 
 /// A token just made, which the page shows this once.
 struct Issued {
+    kind: Kind,
     name: String,
     secret: String,
 }
@@ -46,18 +88,21 @@ pub async fn page() -> Result<impl View> {
 /// The form that makes a token.
 #[derive(Deserialize)]
 struct IssueForm {
+    kind: String,
     name: String,
 }
 
-/// Makes a server token, and shows the page with it: the only time it is shown, since
-/// only its hash is kept.
+/// Makes a token, and shows the page with it: the only time it is shown, since only its
+/// hash is kept.
 #[page(POST)]
 async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<impl View> {
-    require_server_owner(cx).await?;
-    let Some((token, secret)) = McpToken::issue(cx, &form.name).await? else {
+    let kind = Kind::parse(&form.kind).ok_or_bad_request("No such kind of token")?;
+    let owner = kind.owner(cx).await?;
+    let Some((token, secret)) = McpToken::issue(cx, owner, &form.name).await? else {
         return Err(bad_request(format!("A token needs a name of 1 to {MAX_NAME_LEN} characters")).into());
     };
     let issued = Issued {
+        kind,
         name: token.name,
         secret,
     };
@@ -68,14 +113,20 @@ async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<impl View> {
 /// The form that revokes a token.
 #[derive(Deserialize)]
 struct RevokeForm {
+    kind: String,
     id: u64,
 }
 
-/// Revokes a server token: clients that send it are turned away from then on.
+/// Revokes a token: clients that send it are turned away from then on.
 #[route(POST "./revoke")]
 async fn revoke(cx: &Cx, Form(form): Form<RevokeForm>) -> Result<SeeOther> {
-    require_server_owner(cx).await?;
-    McpToken::revoke(cx, form.id).await?;
+    let kind = Kind::parse(&form.kind).ok_or_bad_request("No such kind of token")?;
+    let owner = kind.owner(cx).await?;
+    McpToken::find_of(cx, owner, form.id)
+        .await?
+        .ok_or_not_found()?
+        .revoke(cx)
+        .await?;
     Ok(see_other(href!(page).resolve(cx)))
 }
 
@@ -84,41 +135,70 @@ async fn revoke(cx: &Cx, Form(form): Form<RevokeForm>) -> Result<SeeOther> {
 async fn mcp_view(cx: &Cx, #[default] issued: Option<&Issued>) -> Result<impl View> {
     let signed_in = require_sign_in(cx).await?;
     let owns_server = signed_in.user.role == Role::SuperAdmin;
+    let organization = require_organization(cx).await?;
+    let endpoint = format!("{}/mcp", panel_url(cx).unwrap_or_default());
+    let issued_server = issued.filter(|issued| issued.kind == Kind::Server);
+    let issued_organization = issued.filter(|issued| issued.kind == Kind::Organization);
 
     Ok(view! {
         <div class="flex flex-1 flex-col gap-6">
             <div class="flex flex-col gap-1">
                 <h1 class="text-2xl font-semibold tracking-tight">"MCP"</h1>
                 <p class="text-sm text-muted-foreground">
-                    "Where AI clients, such as a bot or Claude Code, read this server and its apps."
+                    "Where AI clients, such as a bot or Claude Code, reach this server and its apps."
                 </p>
             </div>
-            if owns_server {
-                server_section(issued: issued)
-            }
-            <section class="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card p-5">
-                <span class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-foreground/5">
-                    icon(data: iconify_icon!("lucide:boxes"), size: 18)
-                </span>
-                <div class="flex min-w-56 flex-1 flex-col">
-                    <h2 class="font-semibold">"This organization"</h2>
-                    <p class="text-sm text-muted-foreground">
-                        "Tokens of its own, which reach the tools of this organization's apps that you allow. Other organizations have their own."
-                    </p>
-                </div>
-                <span class="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
-                    "Coming soon"
-                </span>
+            <section class="flex flex-col gap-2 rounded-xl border border-border bg-card p-5">
+                <h2 class="font-semibold">"Endpoint"</h2>
+                <code class="w-fit max-w-full rounded-md bg-muted px-2 py-1 font-mono text-sm break-all select-all">
+                    (&endpoint)
+                </code>
+                <p class="text-sm text-muted-foreground">
+                    "Clients send a token as "
+                    <code class="font-mono text-foreground">"Authorization: Bearer <token>"</code>
+                    ". What they reach depends on the token: the server, or one organization's apps."
+                </p>
             </section>
+            if owns_server {
+                tokens_section(
+                    kind: Kind::Server,
+                    title: "Server",
+                    text: "Reads the machine, oxploy itself, and the usage, logs and deployments of every app on it. Only you see this, as the server's owner, and it is the same in every organization. Its tools only read.",
+                    symbol: iconify_icon!("lucide:server"),
+                    endpoint: &endpoint,
+                    issued: issued_server
+                )
+            }
+            tokens_section(
+                kind: Kind::Organization,
+                title: &organization.name,
+                text: "Reaches the tools of this organization's apps that are turned on in each app's MCP tab. Other organizations have tokens of their own.",
+                symbol: iconify_icon!("lucide:boxes"),
+                endpoint: &endpoint,
+                issued: issued_organization,
+                apps_list(organization_id: organization.id)
+            )
         </div>
     })
 }
 
-/// The server's MCP: its address, the token just made, and the tokens to revoke.
+/// One kind of tokens: the token just made, what `child` adds, and the tokens to revoke.
 #[component]
-async fn server_section(cx: &Cx, issued: Option<&Issued>) -> Result<impl View> {
-    let tokens = McpToken::all_newest_first(cx).await?;
-    let endpoint = format!("{}/mcp", panel_url(cx).unwrap_or_default());
+async fn tokens_section(
+    cx: &Cx,
+    kind: Kind,
+    title: &str,
+    text: &str,
+    symbol: IconData,
+    endpoint: &str,
+    issued: Option<&Issued>,
+    #[default] child: Child<'_>,
+) -> Result<impl View> {
+    let owner = match kind {
+        Kind::Server => None,
+        Kind::Organization => Some(require_organization(cx).await?.id),
+    };
+    let tokens = McpToken::of(cx, owner).await?;
     let issuing = signal(cx, || false);
     let open_issuing = issuing.clone();
     let revoking: Vec<_> = tokens
@@ -130,13 +210,11 @@ async fn server_section(cx: &Cx, issued: Option<&Issued>) -> Result<impl View> {
         <section class="flex flex-col rounded-xl border border-border bg-card">
             <header class="flex flex-wrap items-center gap-3 border-b border-border p-5">
                 <span class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-foreground/5">
-                    icon(data: iconify_icon!("lucide:server"), size: 18)
+                    icon(data: symbol, size: 18)
                 </span>
                 <div class="flex min-w-56 flex-1 flex-col">
-                    <h2 class="font-semibold">"Server"</h2>
-                    <p class="text-sm text-muted-foreground">
-                        "Reads the machine, oxploy itself, and the usage, logs and deployments of every app on it. Only you see this, as the server's owner, and it is the same in every organization."
-                    </p>
+                    <h2 class="font-semibold">(title)</h2>
+                    <p class="text-sm text-muted-foreground">(text)</p>
                 </div>
                 button(
                     attrs: attributes! { type="button" @click=$(|_e: Event| open_issuing.set(true)) },
@@ -145,19 +223,9 @@ async fn server_section(cx: &Cx, issued: Option<&Issued>) -> Result<impl View> {
                 )
             </header>
             if let Some(issued) = issued {
-                issued_token(issued: issued, endpoint: &endpoint)
+                issued_token(issued: issued, endpoint: endpoint)
             }
-            <div class="flex flex-col gap-2 border-b border-border p-5">
-                <span class="text-sm font-medium">"Endpoint"</span>
-                <code class="w-fit max-w-full rounded-md bg-muted px-2 py-1 font-mono text-sm break-all select-all">
-                    (&endpoint)
-                </code>
-                <p class="text-sm text-muted-foreground">
-                    "Clients send a token as "
-                    <code class="font-mono text-foreground">"Authorization: Bearer <token>"</code>
-                    ". The tools only read: changes are made here, in the panel."
-                </p>
-            </div>
+            (child)
             if tokens.is_empty() {
                 <p class="p-5 text-sm text-muted-foreground">
                     "No tokens yet. Make one for each client, so you can revoke one without the others."
@@ -171,11 +239,59 @@ async fn server_section(cx: &Cx, issued: Option<&Issued>) -> Result<impl View> {
                 </ul>
             }
         </section>
-        issue_dialog(open: &issuing)
+        issue_dialog(open: &issuing, kind: kind, title: title)
         #[key(token.id)]
         for (index, token) in tokens.iter().enumerate() {
-            revoke_dialog(open: &revoking[index], token: token)
+            revoke_dialog(open: &revoking[index], kind: kind, token: token)
         }
+    })
+}
+
+/// The organization's apps that serve MCP, with how many of their tools are on, each
+/// linked to its MCP tab.
+#[component]
+async fn apps_list(cx: &Cx, organization_id: u64) -> Result<impl View> {
+    let mut apps = Vec::new();
+    for project in Project::in_organization(cx, organization_id).await? {
+        for service in Service::in_project(cx, project.id).await? {
+            if service.mcp_path.is_none() {
+                continue;
+            }
+            let on = McpTool::enabled_of(cx, service.id).await?.len();
+            let url = ServiceTab::Mcp.url(cx, &project, &service);
+            apps.push((project.name.clone(), service, on, url));
+        }
+    }
+
+    Ok(view! {
+        <div class="flex flex-col gap-2 border-b border-border p-5">
+            <h3 class="text-sm font-medium">"Apps"</h3>
+            if apps.is_empty() {
+                <p class="text-sm text-muted-foreground">
+                    "No app of this organization serves MCP yet. Turn it on in an app's MCP tab, then turn on the tools it passes on."
+                </p>
+            } else {
+                <ul class="flex flex-col gap-1.5">
+                    #[key(service.id)]
+                    for (project, service, on, url) in &apps {
+                        <li class="flex flex-wrap items-baseline gap-x-2 text-sm">
+                            <a href=(url) class="font-medium underline-offset-4 hover:underline">
+                                (project) " / " (&service.name)
+                            </a>
+                            <span class="font-mono text-xs text-muted-foreground">(&service.app_name)</span>
+                            <span class="text-muted-foreground">
+                                "· "
+                                (match on {
+                                    0 => "no tools on".to_owned(),
+                                    1 => "1 tool on".to_owned(),
+                                    on => format!("{on} tools on"),
+                                })
+                            </span>
+                        </li>
+                    }
+                </ul>
+            }
+        </div>
     })
 }
 
@@ -242,12 +358,23 @@ async fn token_row(token: &McpToken, revoking: &Signal<bool>) -> Result<impl Vie
     })
 }
 
-/// A dialog that names a new server token.
+/// A dialog that names a new token of `kind`, for `title`: the server, or the
+/// organization's name.
 #[component]
-async fn issue_dialog(cx: &Cx, open: &Signal<bool>) -> Result<impl View> {
+async fn issue_dialog(cx: &Cx, open: &Signal<bool>, kind: Kind, title: &str) -> Result<impl View> {
     let open = open.clone();
     let title_id = element_id(cx);
     let name_id = element_id(cx);
+    let (heading, about) = match kind {
+        Kind::Server => (
+            "New server token".to_owned(),
+            "A token for one client, such as a bot. It reads the server and every app on it, and is shown only once.",
+        ),
+        Kind::Organization => (
+            format!("New token for {title}"),
+            "A token for one client, such as a bot. It reaches the tools of this organization's apps that are turned on, and is shown only once.",
+        ),
+    };
 
     Ok(view! {
         dialog(
@@ -255,12 +382,11 @@ async fn issue_dialog(cx: &Cx, open: &Signal<bool>) -> Result<impl View> {
             attrs: attributes! { aria-labelledby=(&title_id) },
             dialog_content(
                 dialog_header(
-                    dialog_title(attrs: attributes! { id=(&title_id) }, "New server token")
-                    dialog_description(
-                        "A token for one client, such as a bot. It reads the server and every app on it, and is shown only once."
-                    )
+                    dialog_title(attrs: attributes! { id=(&title_id) }, (heading))
+                    dialog_description((about))
                 )
                 <form method="post" action=(href!(page)) class="flex flex-col gap-4">
+                    <input type="hidden" name="kind" value=(kind.code())>
                     field(
                         field_label(attrs: attributes! { for=(&name_id) }, "Name")
                         input(
@@ -291,10 +417,14 @@ async fn issue_dialog(cx: &Cx, open: &Signal<bool>) -> Result<impl View> {
 
 /// A dialog that confirms revoking `token`.
 #[component]
-async fn revoke_dialog(cx: &Cx, open: &Signal<bool>, token: &McpToken) -> Result<impl View> {
+async fn revoke_dialog(cx: &Cx, open: &Signal<bool>, kind: Kind, token: &McpToken) -> Result<impl View> {
     let open = open.clone();
     let title_id = element_id(cx);
     let description_id = element_id(cx);
+    let reach = match kind {
+        Kind::Server => " will no longer reach the server.",
+        Kind::Organization => " will no longer reach this organization's apps.",
+    };
 
     Ok(view! {
         alert_dialog(
@@ -310,7 +440,8 @@ async fn revoke_dialog(cx: &Cx, open: &Signal<bool>, token: &McpToken) -> Result
                         attrs: attributes! { id=(&description_id) },
                         "Clients that use "
                         <strong class="font-medium text-foreground">(&token.name)</strong>
-                        " will no longer reach the server. A revoked token cannot be brought back."
+                        (reach)
+                        " A revoked token cannot be brought back."
                     )
                 )
                 dialog_footer(
@@ -320,6 +451,7 @@ async fn revoke_dialog(cx: &Cx, open: &Signal<bool>, token: &McpToken) -> Result
                         "Cancel"
                     )
                     <form method="post" action=(href!(revoke))>
+                        <input type="hidden" name="kind" value=(kind.code())>
                         <input type="hidden" name="id" value=(token.id.to_string())>
                         button(
                             variant: ButtonVariant::Destructive,

@@ -1,6 +1,7 @@
-//! The MCP server at `/mcp`, through which AI agents, such as a bot or Claude Code, read
-//! the server: the machine, oxploy itself, and the usage, logs and deployments of every
-//! app it runs.
+//! The MCP server at `/mcp`, through which AI agents, such as a bot or Claude Code, reach
+//! what their token opens: with a server token, the machine, oxploy itself, and the
+//! usage, logs and deployments of every app it runs; with an organization's, the tools
+//! of its apps that were turned on, which [`apps`] passes on to each app's own server.
 //!
 //! It speaks the Model Context Protocol over Streamable HTTP in its simplest form: each
 //! POST carries one JSON-RPC message and gets plain JSON back, with no session and no
@@ -9,10 +10,11 @@
 //! router already turns away requests sent from other sites' pages, as the protocol asks
 //! of a server.
 //!
-//! Each tool has a file of its own beside this one, and a line each in [`definitions`]
-//! and [`call_tool`].
+//! Each server tool has a file of its own beside this one, and a line each in
+//! [`definitions`] and [`call_tool`].
 
 mod app_logs;
+mod apps;
 mod deployment_log;
 mod list_deployments;
 mod list_services;
@@ -40,7 +42,8 @@ use topcoat::{
 use crate::db::db;
 use crate::features::app_files::tail;
 use crate::features::deploy::{AppStatus, Deployer};
-use crate::features::mcp;
+use crate::features::mcp::{self, McpToken};
+use crate::features::organization::Organization;
 use crate::features::runtime::Exits;
 use crate::features::service::Service;
 use crate::features::time_zone;
@@ -61,7 +64,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-/// What the server tells an agent about itself when it connects.
+/// What the server tells an agent with a server token about itself when it connects.
 const INSTRUCTIONS: &str = "oxploy deploys Rust apps on this server and runs each as a \
     process of its own. This MCP server reads the machine, oxploy itself, and the usage, \
     logs and deployments of every app, across all organizations. It only reads: changes \
@@ -69,10 +72,36 @@ const INSTRUCTIONS: &str = "oxploy deploys Rust apps on this server and runs eac
     as list_services returns it. Usage history covers only the last 10 minutes, kept in \
     memory since oxploy started. Times are in the panel's time zone.";
 
+/// What a token reaches.
+enum Scope {
+    /// The machine, oxploy itself, and every app it runs.
+    Server,
+    /// The tools of one organization's apps that were turned on.
+    Organization { id: u64, name: String },
+}
+
+impl Scope {
+    /// What `token` reaches, or `None` if its organization is gone.
+    async fn of(cx: &Cx, token: &McpToken) -> Result<Option<Scope>> {
+        let Some(id) = token.organization_id else {
+            return Ok(Some(Scope::Server));
+        };
+        let organization = Organization::filter_by_id(id).first().exec(&mut db(cx)).await?;
+        Ok(organization.map(|organization| Scope::Organization {
+            id,
+            name: organization.name,
+        }))
+    }
+}
+
 /// Receives one MCP message and answers it.
 #[route(POST)]
 pub async fn receive(cx: &Cx, body: Bytes) -> Result<Response> {
-    if mcp::authorized(cx).await?.is_none() {
+    let scope = match mcp::authorized(cx).await? {
+        Some(token) => Scope::of(cx, &token).await?,
+        None => None,
+    };
+    let Some(scope) = scope else {
         tokio::time::sleep(FAILED_TOKEN_DELAY).await;
         return (
             StatusCode::UNAUTHORIZED,
@@ -80,9 +109,9 @@ pub async fn receive(cx: &Cx, body: Bytes) -> Result<Response> {
             "Unauthorized",
         )
             .into_response(cx);
-    }
+    };
     let answer = match serde_json::from_slice(&body) {
-        Ok(message) => answer(cx, &message).await,
+        Ok(message) => answer(cx, &scope, &message).await,
         Err(_) => Some(failure(Value::Null, PARSE_ERROR, "The body is not JSON.")),
     };
     match answer {
@@ -110,7 +139,7 @@ impl Failure {
 
 /// The answer to one JSON-RPC message, or `None` for a notification, such as
 /// `notifications/initialized`, which gets none.
-async fn answer(cx: &Cx, message: &Value) -> Option<Value> {
+async fn answer(cx: &Cx, scope: &Scope, message: &Value) -> Option<Value> {
     let id = message.get("id").cloned();
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         let id = id.unwrap_or(Value::Null);
@@ -118,11 +147,19 @@ async fn answer(cx: &Cx, message: &Value) -> Option<Value> {
     };
     let id = id?;
     let params = message.get("params").unwrap_or(&Value::Null);
-    let outcome = match method {
-        "initialize" => Ok(initialize(params)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": definitions() })),
-        "tools/call" => call_tool(cx, params).await,
+    let outcome = match (method, scope) {
+        ("initialize", scope) => Ok(initialize(params, scope)),
+        ("ping", _) => Ok(json!({})),
+        ("tools/list", Scope::Server) => Ok(json!({ "tools": definitions() })),
+        ("tools/list", Scope::Organization { id, .. }) => match apps::definitions(cx, *id).await {
+            Ok(tools) => Ok(json!({ "tools": tools })),
+            Err(error) => Err(failed("tools/list", &error)),
+        },
+        ("tools/call", Scope::Server) => call_tool(cx, params).await,
+        ("tools/call", Scope::Organization { id, .. }) => match apps::call(cx, *id, params).await {
+            Ok(outcome) => outcome,
+            Err(error) => Err(failed("tools/call", &error)),
+        },
         _ => Err(Failure::new(METHOD_NOT_FOUND, format!("Unknown method: {method}."))),
     };
     Some(match outcome {
@@ -132,12 +169,22 @@ async fn answer(cx: &Cx, message: &Value) -> Option<Value> {
 }
 
 /// The answer to `initialize`: the protocol version, the client's when the server
-/// speaks it or else the newest, and what the server offers.
-fn initialize(params: &Value) -> Value {
+/// speaks it or else the newest, and what the server offers to `scope`.
+fn initialize(params: &Value, scope: &Scope) -> Value {
     let requested = params.get("protocolVersion").and_then(Value::as_str);
     let version = requested
         .filter(|version| PROTOCOL_VERSIONS.contains(version))
         .unwrap_or(PROTOCOL_VERSIONS[0]);
+    let instructions = match scope {
+        Scope::Server => INSTRUCTIONS.to_owned(),
+        Scope::Organization { name, .. } => format!(
+            "oxploy deploys Rust apps on this server. This MCP server passes on the tools of \
+             the apps of the organization {name}, which each app's own MCP server offers. \
+             Only the tools turned on in oxploy are listed. Each is named after its app, as \
+             <app>__<tool>, and its description starts with the app it comes from. A tool \
+             of an app that is not running is not listed."
+        ),
+    };
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": {} },
@@ -146,8 +193,14 @@ fn initialize(params: &Value) -> Value {
             "title": "oxploy",
             "version": VERSION,
         },
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
     })
+}
+
+/// A database failure while answering `method`, logged, as the client sees it.
+fn failed(method: &str, error: &topcoat::Error) -> Failure {
+    eprintln!("oxploy: the MCP request {method} failed: {error}");
+    Failure::new(INTERNAL_ERROR, "The request failed. Try again later.")
 }
 
 /// Every tool's name, description and arguments, for `tools/list`.
@@ -316,7 +369,7 @@ mod tests {
     use super::*;
 
     async fn send(message: Value) -> Option<Value> {
-        answer(&CxTestBuilder::new().build(), &message).await
+        answer(&CxTestBuilder::new().build(), &Scope::Server, &message).await
     }
 
     #[tokio::test]
@@ -341,6 +394,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(answer["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);
+    }
+
+    #[tokio::test]
+    async fn an_organization_token_reaches_its_apps_and_not_the_server() {
+        let cx = CxTestBuilder::new().build();
+        let scope = Scope::Organization { id: 7, name: "Porta Global".to_owned() };
+
+        let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+        let initialized = answer(&cx, &scope, &message).await.unwrap();
+        let instructions = initialized["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("the organization Porta Global"), "{instructions}");
+
+        // The server's tools are not the organization's, and a name without an app is no
+        // app's tool.
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": server_status::NAME },
+        });
+        let call = answer(&cx, &scope, &message).await.unwrap();
+        assert_eq!(call["error"]["code"], INVALID_PARAMS);
     }
 
     #[tokio::test]

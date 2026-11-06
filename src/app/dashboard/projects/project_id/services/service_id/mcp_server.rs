@@ -110,7 +110,7 @@ async fn tools_card(cx: &Cx, project: &Project, service: &Service) -> Result<imp
     Ok(view! {
         settings_card(
             title: "Tools",
-            text: "The tools the app's MCP server offers now. The ones you turn on will reach this organization's MCP once it has tokens of its own. A tool the app starts offering stays off until you turn it on.",
+            text: "The tools the app's MCP server offers now. The ones you turn on reach this organization's MCP, through its tokens, and a tool the app starts offering stays off until you turn it on. Clients already connected see a change once they reconnect.",
             match &listing {
                 None => {
                     <p class="text-sm text-muted-foreground">"The app is not running. Start it to see its tools."</p>
