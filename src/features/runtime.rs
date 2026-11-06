@@ -455,6 +455,17 @@ pub fn app_variables(
     port: u64,
     managed: &[ManagedDatabase],
 ) -> Vec<(String, String)> {
+    variables_with_port(service, files, &port.to_string(), managed)
+}
+
+/// The variables of [`app_variables`], with `port` as text, so a service that has no
+/// port yet can show `${PORT}` in its place.
+pub fn variables_with_port(
+    service: &Service,
+    files: &AppFiles,
+    port: &str,
+    managed: &[ManagedDatabase],
+) -> Vec<(String, String)> {
     // Saved variables always parse: a problem is refused when saving.
     let own = environment::parse(
         service.environment.as_deref().unwrap_or(""),
@@ -464,7 +475,7 @@ pub fn app_variables(
     let set_by_databases = databases::variables(managed, files);
     let mcp_token = service.mcp_token_in_use();
     let mut provided = vec![
-        (PORT_VARIABLE, port.to_string()),
+        (PORT_VARIABLE, port.to_owned()),
         (STORAGE_VARIABLE, files.storage().display().to_string()),
         (MCP_TOKEN_VARIABLE, mcp_token.unwrap_or_default().to_owned()),
     ];
