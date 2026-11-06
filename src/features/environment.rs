@@ -18,8 +18,12 @@ pub const PORT_VARIABLE: &str = "PORT";
 /// The variable with the service's storage folder, which survives deploys.
 pub const STORAGE_VARIABLE: &str = "OXPLOY_STORAGE_DIR";
 
+/// The variable with the token oxploy calls the app's MCP server with, set while the
+/// app serves one. Values can use it either way: it is empty while the app serves none.
+pub const MCP_TOKEN_VARIABLE: &str = "OXPLOY_MCP_TOKEN";
+
 /// The variables oxploy sets for every app, which values can use.
-const PROVIDED: [&str; 2] = [PORT_VARIABLE, STORAGE_VARIABLE];
+const PROVIDED: [&str; 3] = [PORT_VARIABLE, STORAGE_VARIABLE, MCP_TOKEN_VARIABLE];
 
 /// One variable.
 #[derive(Debug, PartialEq, Eq)]
@@ -276,6 +280,20 @@ mod tests {
                 ("LITERAL".to_owned(), "${HOST}".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn passes_the_mcp_token_under_the_name_an_app_reads() {
+        let variables = parse("MCP_TOKEN=${OXPLOY_MCP_TOKEN}", &[]).unwrap();
+        let on = resolve(variables, &[(MCP_TOKEN_VARIABLE, "3f9a".to_owned())]);
+        assert_eq!(on, [("MCP_TOKEN".to_owned(), "3f9a".to_owned())]);
+
+        // Turned off, the app gets an empty token, which serves no one.
+        let variables = parse("MCP_TOKEN=${OXPLOY_MCP_TOKEN}", &[]).unwrap();
+        let off = resolve(variables, &[(MCP_TOKEN_VARIABLE, String::new())]);
+        assert_eq!(off, [("MCP_TOKEN".to_owned(), String::new())]);
+
+        assert!(parse("OXPLOY_MCP_TOKEN=mine", &[]).is_err());
     }
 
     #[test]

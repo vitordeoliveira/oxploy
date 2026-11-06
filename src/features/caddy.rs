@@ -270,6 +270,9 @@ pub struct Site {
     /// The app name of the service the domain belongs to, whose log gets the requests
     /// it answers with a server error. `None` for the panel.
     pub app: Option<String>,
+    /// A path of the app that this domain answers with 404 instead, as it would reach
+    /// it, such as the app's MCP server, which only oxploy may call.
+    pub hidden_path: Option<String>,
 }
 
 /// Every domain on the server, the panel's included, with where its requests go.
@@ -284,6 +287,7 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
         redirect_www: false,
         upstream: Upstream::Panel,
         app: None,
+        hidden_path: None,
     });
     Ok(domains
         .into_iter()
@@ -294,6 +298,10 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
                 (Some(port), Some(_), None) => Upstream::App(port),
                 _ => Upstream::NotDeployed,
             };
+            let hidden_path = service
+                .mcp_path
+                .as_deref()
+                .and_then(|mcp| public_path(domain.path.as_deref(), domain.strip_path, mcp));
             Some(Site {
                 host: domain.host,
                 path: domain.path,
@@ -302,10 +310,22 @@ async fn sites(db: &Db) -> toasty::Result<Vec<Site>> {
                 redirect_www: domain.redirect_www,
                 upstream,
                 app: Some(service.app_name.clone()),
+                hidden_path,
             })
         })
         .chain(panel)
         .collect())
+}
+
+/// Where a domain reaches the app's `path`: under the domain's own path when it is
+/// taken off before the request reaches the app, or as it is when the domain's path
+/// leaves it in. `None` when the domain never reaches it.
+fn public_path(domain_path: Option<&str>, strip: bool, path: &str) -> Option<String> {
+    match domain_path {
+        None => Some(path.to_owned()),
+        Some(prefix) if strip => Some(format!("{prefix}{path}")),
+        Some(prefix) => (path == prefix || path.starts_with(&format!("{prefix}/"))).then(|| path.to_owned()),
+    }
 }
 
 /// The configuration Caddy runs for `sites`: a server on the HTTPS port for the domains
@@ -329,6 +349,7 @@ pub fn config(ports: &Ports, sites: &[Site]) -> Value {
             redirect_www: false,
             upstream: Upstream::Panel,
             app: None,
+            hidden_path: None,
         })
         .collect();
     let mut sites: Vec<&Site> = sites.iter().chain(&by_address).collect();
@@ -458,7 +479,15 @@ fn routes(site: &Site, ports: &Ports) -> Vec<Value> {
         Upstream::NotDeployed => handle.push(unavailable("This app has not been deployed yet.")),
         Upstream::Stopped => handle.push(unavailable("This app is stopped.")),
     }
-    let mut routes = vec![json!({ "match": [matcher], "handle": handle, "terminal": true })];
+    let mut routes = Vec::new();
+    if let (Upstream::App(_), Some(hidden)) = (&site.upstream, &site.hidden_path) {
+        routes.push(json!({
+            "match": [{ "host": [site.host], "path": [hidden, format!("{hidden}/*")] }],
+            "handle": [{ "handler": "static_response", "status_code": 404 }],
+            "terminal": true,
+        }));
+    }
+    routes.push(json!({ "match": [matcher], "handle": handle, "terminal": true }));
     if site.redirect_www && site.path.is_none() {
         let (scheme, port, usual) = if site.https {
             ("https", ports.https, 443)
@@ -513,7 +542,37 @@ mod tests {
             redirect_www: false,
             upstream,
             app: None,
+            hidden_path: None,
         }
+    }
+
+    #[test]
+    fn hides_an_apps_mcp_server_from_its_domain() {
+        let app = Site {
+            hidden_path: Some("/mcp".to_owned()),
+            ..site("shop.com", None, true, Upstream::App(10_001))
+        };
+        let stopped = Site {
+            hidden_path: Some("/mcp".to_owned()),
+            ..site("blog.com", None, true, Upstream::Stopped)
+        };
+        let config = config(&ports(), &[app, stopped]);
+        let routes = config["apps"]["http"]["servers"]["https"]["routes"].as_array().unwrap();
+        // blog.com sorts first, and its 503 needs no 404 in front.
+        assert_eq!(routes[0]["match"][0]["host"], json!(["blog.com"]));
+        assert_eq!(routes[1]["match"][0], json!({ "host": ["shop.com"], "path": ["/mcp", "/mcp/*"] }));
+        assert_eq!(routes[1]["handle"][0], json!({ "handler": "static_response", "status_code": 404 }));
+        assert_eq!(routes[1]["terminal"], true);
+        assert_eq!(routes[2]["handle"].as_array().unwrap().last().unwrap()["handler"], "reverse_proxy");
+    }
+
+    #[test]
+    fn finds_where_a_domain_reaches_an_app_path() {
+        assert_eq!(public_path(None, false, "/mcp").as_deref(), Some("/mcp"));
+        assert_eq!(public_path(Some("/api"), true, "/mcp").as_deref(), Some("/api/mcp"));
+        assert_eq!(public_path(Some("/api"), false, "/api/mcp").as_deref(), Some("/api/mcp"));
+        assert_eq!(public_path(Some("/api"), false, "/mcp"), None);
+        assert_eq!(public_path(Some("/api"), false, "/apimcp"), None);
     }
 
     #[test]

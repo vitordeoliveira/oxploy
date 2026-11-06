@@ -3,6 +3,7 @@
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
+use super::app_mcp::{self, McpTool};
 use super::archive;
 use super::caddy::Caddy;
 use super::databases::{self, ManagedDatabase};
@@ -110,6 +111,15 @@ pub struct Service {
     /// The domain the service's Open button opens. Without one, or once it is deleted, it
     /// opens the first domain of the user's own, or else the one oxploy gave the app.
     pub default_domain_id: Option<u64>,
+
+    /// The path the app serves MCP at on its port, such as `/mcp`, or `None` when it
+    /// serves none. See [`app_mcp`].
+    pub mcp_path: Option<String>,
+
+    /// The token oxploy gives the app in `OXPLOY_MCP_TOKEN` and calls its MCP server
+    /// with. Made the first time MCP is turned on, and kept when it is turned off, so
+    /// turning it on again needs no restart.
+    pub mcp_token: Option<String>,
 }
 
 /// How a service is built.
@@ -380,6 +390,32 @@ impl Service {
         Ok(true)
     }
 
+    /// Turns the app's MCP server on at `path`, or off with `None`, and has Caddy hide
+    /// the path from the app's domains. Returns `false`, changing nothing, if the path
+    /// cannot be one; see [`app_mcp::is_path`].
+    pub async fn set_mcp(&mut self, cx: &Cx, path: Option<&str>) -> Result<bool> {
+        let path = path.map(str::trim);
+        if path.is_some_and(|path| !app_mcp::is_path(path)) {
+            return Ok(false);
+        }
+        let token = match (&self.mcp_token, path) {
+            (None, Some(_)) => Some(app_mcp::new_token()),
+            (token, _) => token.clone(),
+        };
+        self.update()
+            .mcp_path(path.map(str::to_owned))
+            .mcp_token(token)
+            .exec(&mut db(cx))
+            .await?;
+        Caddy::get(cx).changed();
+        Ok(true)
+    }
+
+    /// The token the app's MCP server takes, while it serves one.
+    pub fn mcp_token_in_use(&self) -> Option<&str> {
+        self.mcp_path.as_ref().and(self.mcp_token.as_deref())
+    }
+
     /// How the service is built.
     pub fn builds_with(&self) -> BuildKind {
         self.build_kind.unwrap_or(BuildKind::Cargo)
@@ -398,6 +434,7 @@ impl Service {
     pub async fn remove(self, cx: &Cx) -> Result<()> {
         Deployer::get(cx).forget(&self).await?;
         Domain::remove_all(&db(cx), self.id).await?;
+        McpTool::remove_all(&db(cx), self.id).await?;
         Caddy::get(cx).changed();
         Service::filter_by_id(self.id)
             .delete()

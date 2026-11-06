@@ -4,6 +4,7 @@
 mod general;
 mod history;
 mod hosts;
+mod mcp_server;
 mod output;
 mod process;
 mod stored;
@@ -48,6 +49,7 @@ use crate::features::service::Service;
 use general::general_tab;
 use history::deployments_tab;
 use hosts::domains_tab;
+use mcp_server::mcp_tab;
 use output::logs_tab;
 use process::advanced_tab;
 use stored::storage_tab;
@@ -81,6 +83,7 @@ pub enum ServiceTab {
     Deployments,
     Logs,
     Monitoring,
+    Mcp,
     PreviewDeployments,
     Schedules,
     Patches,
@@ -89,7 +92,7 @@ pub enum ServiceTab {
 
 impl ServiceTab {
     /// Every tab, in the order they are shown.
-    const ALL: [ServiceTab; 11] = [
+    const ALL: [ServiceTab; 12] = [
         Self::General,
         Self::Environment,
         Self::Storage,
@@ -97,6 +100,7 @@ impl ServiceTab {
         Self::Deployments,
         Self::Logs,
         Self::Monitoring,
+        Self::Mcp,
         Self::PreviewDeployments,
         Self::Schedules,
         Self::Patches,
@@ -113,6 +117,7 @@ impl ServiceTab {
             Self::Deployments => "deployments",
             Self::Logs => "logs",
             Self::Monitoring => "monitoring",
+            Self::Mcp => "mcp",
             Self::PreviewDeployments => "preview-deployments",
             Self::Schedules => "schedules",
             Self::Patches => "patches",
@@ -129,6 +134,7 @@ impl ServiceTab {
             Self::Deployments => "Deployments",
             Self::Logs => "Logs",
             Self::Monitoring => "Monitoring",
+            Self::Mcp => "MCP",
             Self::PreviewDeployments => "Preview deployments",
             Self::Schedules => "Schedules",
             Self::Patches => "Patches",
@@ -145,6 +151,7 @@ impl ServiceTab {
             Self::Deployments => iconify_icon!("lucide:rocket"),
             Self::Logs => iconify_icon!("lucide:scroll-text"),
             Self::Monitoring => iconify_icon!("lucide:activity"),
+            Self::Mcp => iconify_icon!("lucide:plug"),
             Self::PreviewDeployments => iconify_icon!("lucide:git-pull-request"),
             Self::Schedules => iconify_icon!("lucide:calendar-clock"),
             Self::Patches => iconify_icon!("lucide:file-diff"),
@@ -170,6 +177,7 @@ impl ServiceTab {
             }
             Self::Logs => "What the running binary prints, as it prints it.",
             Self::Monitoring => "The CPU, memory and disk the app takes while it runs.",
+            Self::Mcp => "The MCP server the app serves, and which of its tools reach this organization's MCP.",
             Self::PreviewDeployments => {
                 "A temporary copy of the app for each pull request, on its own subdomain."
             }
@@ -331,6 +339,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                         }
                         ServiceTab::Monitoring => {
                             monitoring_tab(service: &service)
+                        }
+                        ServiceTab::Mcp => {
+                            mcp_tab(project: &project, service: &service)
                         }
                         ServiceTab::Advanced => {
                             advanced_tab(project: &project, service: &service, here: &return_to)

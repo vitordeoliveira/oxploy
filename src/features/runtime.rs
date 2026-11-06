@@ -25,7 +25,7 @@ use toasty::Db;
 use super::app_files::AppFiles;
 use super::databases::{self, ManagedDatabase};
 use super::deployment::Deployment;
-use super::environment::{self, PORT_VARIABLE, STORAGE_VARIABLE};
+use super::environment::{self, MCP_TOKEN_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE};
 use super::service::Service;
 use super::time_zone;
 use super::usage::Usage;
@@ -448,7 +448,7 @@ impl Runtime {
 
 /// The service's variables as its app and builds get them: those its databases set,
 /// then its own, with each `${NAME}` filled in from what oxploy sets for the app or
-/// from an earlier line.
+/// from an earlier line, then the token of its MCP server while it serves one.
 pub fn app_variables(
     service: &Service,
     files: &AppFiles,
@@ -462,13 +462,18 @@ pub fn app_variables(
     )
     .unwrap_or_default();
     let set_by_databases = databases::variables(managed, files);
+    let mcp_token = service.mcp_token_in_use();
     let mut provided = vec![
         (PORT_VARIABLE, port.to_string()),
         (STORAGE_VARIABLE, files.storage().display().to_string()),
+        (MCP_TOKEN_VARIABLE, mcp_token.unwrap_or_default().to_owned()),
     ];
     provided.extend(set_by_databases.iter().map(|(name, value)| (name.as_str(), value.clone())));
     let mut variables = set_by_databases.clone();
     variables.extend(environment::resolve(own, &provided));
+    if let Some(token) = mcp_token {
+        variables.push((MCP_TOKEN_VARIABLE.to_owned(), token.to_owned()));
+    }
     variables
 }
 

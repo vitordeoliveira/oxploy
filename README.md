@@ -159,6 +159,16 @@ claude mcp add --transport http oxploy https://<panel>/mcp \
 session and no event stream. Each tool is a file of its own in `src/app/mcp/`, with a line
 each in `definitions` and `call_tool`.
 
+An app can serve an MCP server of its own, over Streamable HTTP on its port. Its **MCP**
+tab turns that on at a path, `/mcp` unless set otherwise. oxploy then gives the app
+`OXPLOY_MCP_TOKEN` when it starts, calls its server at 127.0.0.1 with that token as
+`Authorization: Bearer <token>`, and has Caddy answer 404 at the path on the app's
+domains, so only oxploy reaches it. An app that reads another variable takes the token
+with a line such as `MCP_TOKEN=${OXPLOY_MCP_TOKEN}` in its Environment tab. The tab lists
+the app's tools, each off until it is turned on: the ones turned on will reach each
+organization's own MCP. `src/features/app_mcp.rs` is the client, which takes answers in
+plain JSON or as an event stream, with or without a session.
+
 ## Project structure
 
 | Path | Contents |

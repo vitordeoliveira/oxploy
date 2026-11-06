@@ -3,6 +3,7 @@
 
 pub mod access_log;
 pub mod app_files;
+pub mod app_mcp;
 pub mod archive;
 pub mod caddy;
 pub mod databases;
