@@ -4,6 +4,13 @@
 //! The super admin makes server tokens here, which read the machine, oxploy itself and
 //! every app it runs. Each organization makes tokens of its own, which reach the tools
 //! of its apps that were turned on in each app's MCP tab.
+//!
+//! Making a token sends the browser on to this page with an ID, which shows the token
+//! once. Reloading the page sends the form no more, so it makes no second token.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use topcoat::{
@@ -12,8 +19,8 @@ use topcoat::{
     icon::{IconData, icon, iconify::iconify_icon},
     router::{
         content::Form,
-        error::{RouterErrorExt, SeeOther, bad_request, see_other},
-        href, page, route,
+        error::{RouterErrorExt, SeeOther, see_other},
+        href, page, query_params, route,
     },
     runtime::{Event, Signal, signal},
     view::{Child, View, attributes, component, element_id, view},
@@ -27,10 +34,10 @@ use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::dialog::{
     dialog, dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title,
 };
-use crate::components::field::{field, field_description, field_label};
+use crate::components::field::{field, field_description, field_error, field_label};
 use crate::components::input::input;
 use crate::features::app_mcp::McpTool;
-use crate::features::mcp::{MAX_NAME_LEN, McpToken};
+use crate::features::mcp::{IssueError, MAX_NAME_LEN, McpToken, client_name};
 use crate::features::project::Project;
 use crate::features::service::Service;
 use crate::features::user::Role;
@@ -77,12 +84,81 @@ struct Issued {
     kind: Kind,
     name: String,
     secret: String,
+    /// The name the client knows the token's server by, for the command that adds it.
+    client: String,
 }
 
-/// The MCP page.
+/// A name the form turned down, shown again in its dialog with why.
+struct Refused {
+    kind: Kind,
+    name: String,
+    problem: IssueError,
+}
+
+/// What a form left for the page to show once, after it sent the browser back.
+enum Shown {
+    Issued(Issued),
+    Refused(Refused),
+}
+
+/// How long what a form left waits for the page, which the browser opens right away.
+const SHOWN_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// What a form left for one user's next view of the page.
+struct Waiting {
+    user_id: u64,
+    shown: Shown,
+    at: Instant,
+}
+
+/// What the forms left for the page, by the ID they sent the browser back with. Kept in
+/// memory only, as a token is shown once and never stored.
+static WAITING: LazyLock<Mutex<HashMap<String, Waiting>>> = LazyLock::new(Mutex::default);
+
+/// Leaves `shown` for `user_id`'s next view of the page, and returns its ID.
+fn leave(user_id: u64, shown: Shown) -> String {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).expect("the system provides random bytes");
+    let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut waiting = WAITING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    waiting.retain(|_, left| left.at.elapsed() < SHOWN_FOR);
+    waiting.insert(
+        id.clone(),
+        Waiting {
+            user_id,
+            shown,
+            at: Instant::now(),
+        },
+    );
+    id
+}
+
+/// Takes what was left with `id` for `user_id`, if it is still there.
+fn take(user_id: u64, id: &str) -> Option<Shown> {
+    let mut waiting = WAITING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let left = waiting.get(id)?;
+    if left.user_id != user_id || left.at.elapsed() >= SHOWN_FOR {
+        return None;
+    }
+    waiting.remove(id).map(|left| left.shown)
+}
+
+/// The page's address, with what a form left in `shown`.
+#[query_params]
+struct PageQuery {
+    shown: Option<String>,
+}
+
+/// The MCP page, with the token a form just made or the name it turned down.
 #[page]
-pub async fn page() -> Result<impl View> {
-    Ok(view! { mcp_view() })
+pub async fn page(cx: &Cx) -> Result<impl View> {
+    let signed_in = require_sign_in(cx).await?;
+    let shown = query_params::<PageQuery>(cx)
+        .ok()
+        .and_then(|query| query.shown.clone())
+        .and_then(|id| take(signed_in.user.id, &id));
+
+    Ok(view! { mcp_view(shown: shown.as_ref()) })
 }
 
 /// The form that makes a token.
@@ -92,22 +168,32 @@ struct IssueForm {
     name: String,
 }
 
-/// Makes a token, and shows the page with it: the only time it is shown, since only its
-/// hash is kept.
-#[page(POST)]
-async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<impl View> {
+/// Makes a token, and sends the browser on to the page, which shows it once: only its
+/// hash is kept. A name it turns down goes back to the dialog with why.
+#[route(POST "./issue")]
+async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<SeeOther> {
     let kind = Kind::parse(&form.kind).ok_or_bad_request("No such kind of token")?;
+    let signed_in = require_sign_in(cx).await?;
     let owner = kind.owner(cx).await?;
-    let Some((token, secret)) = McpToken::issue(cx, owner, &form.name).await? else {
-        return Err(bad_request(format!("A token needs a name of 1 to {MAX_NAME_LEN} characters")).into());
+    let organization = match kind {
+        Kind::Server => None,
+        Kind::Organization => Some(require_organization(cx).await?.name),
     };
-    let issued = Issued {
-        kind,
-        name: token.name,
-        secret,
+    let shown = match McpToken::issue(cx, owner, &form.name).await? {
+        Ok((token, secret)) => Shown::Issued(Issued {
+            kind,
+            client: client_name(organization.as_deref(), &token.name),
+            name: token.name,
+            secret,
+        }),
+        Err(problem) => Shown::Refused(Refused {
+            kind,
+            name: form.name,
+            problem,
+        }),
     };
-
-    Ok(view! { mcp_view(issued: Some(&issued)) })
+    let id = leave(signed_in.user.id, shown);
+    Ok(see_other(format!("{}?shown={id}", href!(page).resolve(cx))))
 }
 
 /// The form that revokes a token.
@@ -130,15 +216,22 @@ async fn revoke(cx: &Cx, Form(form): Form<RevokeForm>) -> Result<SeeOther> {
     Ok(see_other(href!(page).resolve(cx)))
 }
 
-/// The page, with the token just made in `issued`.
+/// The page, with the token a form just made, or the name it just turned down.
 #[component]
-async fn mcp_view(cx: &Cx, #[default] issued: Option<&Issued>) -> Result<impl View> {
+async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
+    let (issued, refused) = match shown {
+        Some(Shown::Issued(issued)) => (Some(issued), None),
+        Some(Shown::Refused(refused)) => (None, Some(refused)),
+        None => (None, None),
+    };
     let signed_in = require_sign_in(cx).await?;
     let owns_server = signed_in.user.role == Role::SuperAdmin;
     let organization = require_organization(cx).await?;
     let endpoint = format!("{}/mcp", panel_url(cx).unwrap_or_default());
     let issued_server = issued.filter(|issued| issued.kind == Kind::Server);
     let issued_organization = issued.filter(|issued| issued.kind == Kind::Organization);
+    let refused_server = refused.filter(|refused| refused.kind == Kind::Server);
+    let refused_organization = refused.filter(|refused| refused.kind == Kind::Organization);
 
     Ok(view! {
         <div class="flex flex-1 flex-col gap-6">
@@ -166,7 +259,8 @@ async fn mcp_view(cx: &Cx, #[default] issued: Option<&Issued>) -> Result<impl Vi
                     text: "Reads the machine, oxploy itself, and the usage, logs and deployments of every app on it. Only you see this, as the server's owner, and it is the same in every organization. Its tools only read.",
                     symbol: iconify_icon!("lucide:server"),
                     endpoint: &endpoint,
-                    issued: issued_server
+                    issued: issued_server,
+                    refused: refused_server
                 )
             }
             tokens_section(
@@ -176,6 +270,7 @@ async fn mcp_view(cx: &Cx, #[default] issued: Option<&Issued>) -> Result<impl Vi
                 symbol: iconify_icon!("lucide:boxes"),
                 endpoint: &endpoint,
                 issued: issued_organization,
+                refused: refused_organization,
                 apps_list(organization_id: organization.id)
             )
         </div>
@@ -192,6 +287,7 @@ async fn tokens_section(
     symbol: IconData,
     endpoint: &str,
     issued: Option<&Issued>,
+    refused: Option<&Refused>,
     #[default] child: Child<'_>,
 ) -> Result<impl View> {
     let owner = match kind {
@@ -199,7 +295,8 @@ async fn tokens_section(
         Kind::Organization => Some(require_organization(cx).await?.id),
     };
     let tokens = McpToken::of(cx, owner).await?;
-    let issuing = signal(cx, || false);
+    // A name turned down opens the dialog again, to be changed.
+    let issuing = signal(cx, || refused.is_some());
     let open_issuing = issuing.clone();
     let revoking: Vec<_> = tokens
         .iter()
@@ -239,7 +336,7 @@ async fn tokens_section(
                 </ul>
             }
         </section>
-        issue_dialog(open: &issuing, kind: kind, title: title)
+        issue_dialog(open: &issuing, kind: kind, title: title, refused: refused)
         #[key(token.id)]
         for (index, token) in tokens.iter().enumerate() {
             revoke_dialog(open: &revoking[index], kind: kind, token: token)
@@ -299,8 +396,8 @@ async fn apps_list(cx: &Cx, organization_id: u64) -> Result<impl View> {
 #[component]
 async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
     let command = format!(
-        "claude mcp add --transport http oxploy {endpoint} --header \"Authorization: Bearer {}\"",
-        issued.secret
+        "claude mcp add --transport http {} {endpoint} --header \"Authorization: Bearer {}\"",
+        issued.client, issued.secret
     );
 
     Ok(view! {
@@ -359,12 +456,32 @@ async fn token_row(token: &McpToken, revoking: &Signal<bool>) -> Result<impl Vie
 }
 
 /// A dialog that names a new token of `kind`, for `title`: the server, or the
-/// organization's name.
+/// organization's name. A name just turned down comes back in it, with why.
 #[component]
-async fn issue_dialog(cx: &Cx, open: &Signal<bool>, kind: Kind, title: &str) -> Result<impl View> {
+async fn issue_dialog(
+    cx: &Cx,
+    open: &Signal<bool>,
+    kind: Kind,
+    title: &str,
+    refused: Option<&Refused>,
+) -> Result<impl View> {
     let open = open.clone();
     let title_id = element_id(cx);
     let name_id = element_id(cx);
+    let hint_id = element_id(cx);
+    let problem = refused.map(|refused| match refused.problem {
+        IssueError::BadName => format!(
+            "Give it a name with letters or digits, of up to {MAX_NAME_LEN} characters."
+        ),
+        IssueError::Taken => format!(
+            "{} already has a token named like {}. Pick another name, so each one's client gets a name of its own.",
+            match kind {
+                Kind::Server => "The server",
+                Kind::Organization => title,
+            },
+            refused.name.trim(),
+        ),
+    });
     let (heading, about) = match kind {
         Kind::Server => (
             "New server token".to_owned(),
@@ -385,7 +502,7 @@ async fn issue_dialog(cx: &Cx, open: &Signal<bool>, kind: Kind, title: &str) -> 
                     dialog_title(attrs: attributes! { id=(&title_id) }, (heading))
                     dialog_description((about))
                 )
-                <form method="post" action=(href!(page)) class="flex flex-col gap-4">
+                <form method="post" action=(href!(issue)) class="flex flex-col gap-4">
                     <input type="hidden" name="kind" value=(kind.code())>
                     field(
                         field_label(attrs: attributes! { for=(&name_id) }, "Name")
@@ -393,13 +510,23 @@ async fn issue_dialog(cx: &Cx, open: &Signal<bool>, kind: Kind, title: &str) -> 
                             attrs: attributes! {
                                 id=(&name_id)
                                 name="name"
+                                value=(refused.map_or("", |refused| refused.name.as_str()))
                                 placeholder="Telegram bot"
                                 maxlength=(MAX_NAME_LEN.to_string())
                                 required=""
                                 autocomplete="off"
+                                aria-describedby=(&hint_id)
+                                aria-invalid=(problem.is_some().then_some("true"))
                             }
                         )
-                        field_description("What uses it, so you know which one to revoke.")
+                        if let Some(problem) = &problem {
+                            field_error(attrs: attributes! { id=(&hint_id) }, (problem))
+                        } else {
+                            field_description(
+                                attrs: attributes! { id=(&hint_id) },
+                                "What uses it, so you know which one to revoke. Its client gets a name made from it."
+                            )
+                        }
                     )
                     dialog_footer(
                         button(

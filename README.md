@@ -154,12 +154,19 @@ every app it runs, across organizations. Its tools only read:
 | `list_deployments` | An app's latest deployments |
 | `deployment_log` | The end of a deployment's log |
 
-To connect Claude Code:
+With a new token, the page gives the command that connects Claude Code to it, under a
+name made from the token's: `oxploy-server-<token>` for a server token, or
+`oxploy-<organization>-<token>` for an organization's, so a client that holds several
+tells them apart. For a server token named Claude Local:
 
 ```sh
-claude mcp add --transport http oxploy https://<panel>/mcp \
+claude mcp add --transport http oxploy-server-claude-local https://<panel>/mcp \
   --header "Authorization: Bearer <token>"
 ```
+
+Two tokens of the server, or of one organization, cannot have names that read the same,
+such as `Claude Local` and `claude-local`. Making a token sends the browser on to the page,
+which shows it once, so reloading the page makes no second token.
 
 `src/app/mcp.rs` answers each JSON-RPC message, sent by POST, with plain JSON, with no
 session and no event stream. Each server tool is a file of its own in `src/app/mcp/`, with

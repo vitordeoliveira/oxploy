@@ -487,7 +487,7 @@ async fn unused_app_name(cx: &Cx, project: &str, service: &str) -> Result<String
 
 /// Lowercases ASCII letters and digits and joins the runs between them with dashes,
 /// so `My API!` becomes `my-api`.
-fn slug(text: &str) -> String {
+pub fn slug(text: &str) -> String {
     let mut slug = String::new();
     for character in text.chars() {
         if character.is_ascii_alphanumeric() {

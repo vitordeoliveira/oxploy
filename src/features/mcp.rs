@@ -15,6 +15,7 @@ use topcoat::{
 };
 
 use super::project::now;
+use super::service::slug;
 use crate::db::db;
 
 /// A token an MCP client sends as `Authorization: Bearer <token>`.
@@ -76,15 +77,24 @@ impl McpToken {
 
     /// Makes a token named `name` for the organization, or for the server with `None`,
     /// and returns it with the token itself, which is never stored and so cannot be
-    /// shown again. Returns `None` if the name is empty or too long.
+    /// shown again. Returns why not instead if the name has no letters or digits, is too
+    /// long, or reads like the name of another of the same tokens: as clients know each
+    /// token by a name made from it, two such would clash.
     pub async fn issue(
         cx: &Cx,
         organization_id: Option<u64>,
         name: &str,
-    ) -> Result<Option<(McpToken, String)>> {
+    ) -> Result<Result<(McpToken, String), IssueError>> {
         let name = name.trim();
-        if name.is_empty() || name.chars().count() > MAX_NAME_LEN {
-            return Ok(None);
+        if slug(name).is_empty() || name.chars().count() > MAX_NAME_LEN {
+            return Ok(Err(IssueError::BadName));
+        }
+        let taken = McpToken::of(cx, organization_id)
+            .await?
+            .iter()
+            .any(|token| slug(&token.name) == slug(name));
+        if taken {
+            return Ok(Err(IssueError::Taken));
         }
         let secret = new_secret();
         let token = toasty::create!(McpToken {
@@ -96,7 +106,7 @@ impl McpToken {
         })
         .exec(&mut db(cx))
         .await?;
-        Ok(Some((token, secret)))
+        Ok(Ok((token, secret)))
     }
 
     /// Deletes the token. Clients that send it are turned away from then on.
@@ -113,6 +123,32 @@ impl McpToken {
             .await?;
         Ok(())
     }
+}
+
+/// Why a token could not be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueError {
+    /// The name has no letters or digits, or is longer than [`MAX_NAME_LEN`].
+    BadName,
+    /// Another of the same tokens has a name that reads the same.
+    Taken,
+}
+
+/// The name an MCP client knows a token's server by, such as
+/// `oxploy-server-claude-local` for a server token named Claude Local, or
+/// `oxploy-shop-telegram-bot` for the organization Shop's token named Telegram bot, so a
+/// client that holds several tokens tells them apart.
+pub fn client_name(organization: Option<&str>, token: &str) -> String {
+    let owner = match organization.map(slug) {
+        None => "server".to_owned(),
+        Some(organization) if organization.is_empty() => "organization".to_owned(),
+        Some(organization) => organization,
+    };
+    ["oxploy".to_owned(), owner, slug(token)]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The token the current request carries, if it is one of the tokens, and notes that it
@@ -178,6 +214,17 @@ mod tests {
         assert_eq!(hash("oxp_3f9a1c"), hash("oxp_3f9a1c"));
         assert_ne!(hash("oxp_3f9a1c"), hash("oxp_3f9a1c "));
         assert_ne!(hash("oxp_3f9a1c"), hash("OXP_3F9A1C"));
+    }
+
+    #[test]
+    fn names_each_token_for_its_client() {
+        assert_eq!(client_name(None, "Claude Local"), "oxploy-server-claude-local");
+        assert_eq!(
+            client_name(Some("My Organization"), "telegram_bot"),
+            "oxploy-my-organization-telegram-bot"
+        );
+        assert_eq!(client_name(Some("Ação!"), "Bot"), "oxploy-a-o-bot");
+        assert_eq!(client_name(Some("🚀"), "Bot"), "oxploy-organization-bot");
     }
 
     #[test]
