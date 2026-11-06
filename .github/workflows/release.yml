@@ -1,13 +1,23 @@
 # Builds oxploy for Linux when a version tag is pushed, and publishes it as a release:
 # the binary with the assets folder it loads, as oxploy-x86_64-linux.tar.gz.
+#
+# A run on a tag can only read caches saved on that tag or on main, so a push to main that
+# changes the dependencies or this workflow builds without publishing, to save the caches
+# the next tags read. GitHub deletes a cache after 7 days without use.
 name: Release
 
 on:
   push:
+    branches: [main]
+    # GitHub ignores the paths for a tag, so every version tag runs.
+    paths: [Cargo.lock, .github/workflows/release.yml]
     tags: ["v*"]
 
 permissions:
   contents: write
+
+env:
+  TOPCOAT_CLI_VERSION: 0.11.0
 
 jobs:
   linux:
@@ -16,10 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A fixed version, because the dependency cache is keyed by it: changing it here
+      # also runs this workflow on main, which saves a cache for the new version.
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
 
       - name: Check the tag against the version
+        if: github.ref_type == 'tag'
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           if [ "$GITHUB_REF_NAME" != "v$version" ]; then
@@ -27,24 +40,48 @@ jobs:
             exit 1
           fi
 
+      # Only main saves it, since no other tag could read a tag's cache. The Topcoat CLI
+      # has its own cache below.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # It writes the files the binary declares with `asset!`, which it loads at runtime.
+      # The CLI writes the files the binary declares with `asset!`, which it loads at
+      # runtime. It takes minutes to build, so main keeps it by its version.
+      - name: Restore the Topcoat CLI
+        id: topcoat-cli
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cargo/bin/topcoat
+          key: topcoat-cli-${{ env.TOPCOAT_CLI_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install the Topcoat CLI
-        run: cargo install topcoat-cli --version 0.11.0 --locked
+        if: steps.topcoat-cli.outputs.cache-hit != 'true'
+        run: cargo install topcoat-cli --version "$TOPCOAT_CLI_VERSION" --locked
+
+      - name: Save the Topcoat CLI
+        if: steps.topcoat-cli.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cargo/bin/topcoat
+          key: ${{ steps.topcoat-cli.outputs.cache-primary-key }}
 
       - name: Build
         run: cargo build --release --locked
 
       - name: Bundle the assets
+        if: github.ref_type == 'tag'
         run: topcoat asset bundle --release
 
       - name: Package
+        if: github.ref_type == 'tag'
         run: |
           tar czf oxploy-x86_64-linux.tar.gz -C target/release oxploy assets
           sha256sum oxploy-x86_64-linux.tar.gz > oxploy-x86_64-linux.tar.gz.sha256
 
       - name: Publish the release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
