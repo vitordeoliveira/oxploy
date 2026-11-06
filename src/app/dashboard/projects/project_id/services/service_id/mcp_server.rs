@@ -20,25 +20,83 @@ use super::{ServiceId, ServiceTab, current_service, settings_card};
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
-use crate::features::app_mcp::{self, ConnectError, DEFAULT_PATH, Effect, MAX_PATH_LEN, McpTool, Tool};
+use crate::features::app_mcp::{
+    self, ConnectError, DEFAULT_PATH, Effect, Listing, MAX_PATH_LEN, McpTool, Tool,
+};
 use crate::features::deploy::{AppStatus, Deployer};
 use crate::features::environment::MCP_TOKEN_VARIABLE;
 use crate::features::project::Project;
 use crate::features::service::Service;
 
-/// Whether the app serves MCP and where, and its tools while it does.
+/// Whether the app serves MCP and where, and its tools while it does. The app's server
+/// is asked once, for the summary at the top and for the tools.
 #[component]
 pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<impl View> {
     let server_url = href!(save_server, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
     let path_id = element_id(cx);
     let on = service.mcp_path.is_some();
     let path = service.mcp_path.as_deref().unwrap_or(DEFAULT_PATH);
+    let running = Deployer::get(cx).status(service) == AppStatus::Running;
+    let listing = match (running, service.port, service.mcp_token_in_use()) {
+        (true, Some(port), Some(token)) => Some(app_mcp::list_tools(port, path, token).await),
+        _ => None,
+    };
+    let enabled = McpTool::enabled_of(cx, service.id).await?;
+    let (dot, status) = match (on, &listing) {
+        (false, _) => ("bg-muted-foreground/60", "Off".to_owned()),
+        (true, None) => ("bg-muted-foreground/60", "On, but the app is not running".to_owned()),
+        (true, Some(Ok(listing))) => {
+            let name = listing.server.title.as_deref().unwrap_or(&listing.server.name);
+            let version = listing.server.version.as_deref().unwrap_or_default();
+            let protocol = &listing.protocol_version;
+            let connected = format!("Connected to {name} {version}");
+            ("bg-emerald-500", format!("{} · protocol {protocol}", connected.trim_end()))
+        }
+        (true, Some(Err(problem))) => ("bg-destructive", sentence(&problem.to_string())),
+    };
+    let address = match service.port {
+        Some(port) => format!("http://127.0.0.1:{port}{path}"),
+        None => format!("{path}, on the port chosen at the first deploy"),
+    };
+    let tools = match &listing {
+        Some(Ok(listing)) => {
+            let on = listing.tools.iter().filter(|tool| enabled.contains(&tool.name)).count();
+            format!("{on} of {} on", listing.tools.len())
+        }
+        _ => format!("{} on", enabled.len()),
+    };
 
     Ok(view! {
         <div class="flex flex-col gap-6">
             settings_card(
                 title: "MCP server",
                 text: "An MCP server the app serves on its own port, over Streamable HTTP. oxploy calls it at 127.0.0.1, and the app's domains answer 404 at its path, so only oxploy reaches it.",
+                <dl class="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
+                    <dt class="font-medium">"Status"</dt>
+                    <dd class="flex items-center gap-2 text-muted-foreground">
+                        <span class=(format!("size-2 shrink-0 rounded-full {dot}"))></span>
+                        (status)
+                    </dd>
+                    if on {
+                        <dt class="font-medium">"Address"</dt>
+                        <dd class="font-mono break-all text-muted-foreground">(address)</dd>
+                    }
+                    <dt class="font-medium">"Variable"</dt>
+                    <dd class="font-mono text-muted-foreground">(MCP_TOKEN_VARIABLE)</dd>
+                    if on {
+                        <dt class="font-medium">"Tools"</dt>
+                        <dd class="text-muted-foreground">(tools)</dd>
+                        <dt class="font-medium">"Named"</dt>
+                        <dd class="text-muted-foreground">
+                            <span class="font-mono break-all">(&service.app_name) "__<tool>"</span>
+                            ", in this organization's MCP"
+                        </dd>
+                    }
+                </dl>
+            )
+            settings_card(
+                title: "Settings",
+                text: "Whether the app serves MCP, and at which path on its port.",
                 <form method="post" action=(&server_url) class="flex flex-col gap-4">
                     option_switch(
                         name: "on",
@@ -88,7 +146,7 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
                 }
             )
             if on {
-                tools_card(project: project, service: service)
+                tools_card(project: project, service: service, listing: listing.as_ref(), enabled: &enabled)
             }
         </div>
     })
@@ -97,21 +155,21 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
 /// The tools the app's MCP server lists now, each with a button that turns it on or
 /// off, or why they could not be listed.
 #[component]
-async fn tools_card(cx: &Cx, project: &Project, service: &Service) -> Result<impl View> {
+async fn tools_card(
+    cx: &Cx,
+    project: &Project,
+    service: &Service,
+    listing: Option<&Result<Listing, ConnectError>>,
+    enabled: &[String],
+) -> Result<impl View> {
     let path = service.mcp_path.as_deref().unwrap_or(DEFAULT_PATH);
-    let running = Deployer::get(cx).status(service) == AppStatus::Running;
-    let listing = match (running, service.port, service.mcp_token_in_use()) {
-        (true, Some(port), Some(token)) => Some(app_mcp::list_tools(port, path, token).await),
-        _ => None,
-    };
-    let enabled = McpTool::enabled_of(cx, service.id).await?;
     let toggle_url = href!(toggle_tool, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
 
     Ok(view! {
         settings_card(
             title: "Tools",
             text: "The tools the app's MCP server offers now. The ones you turn on reach this organization's MCP, through its tokens, and a tool the app starts offering stays off until you turn it on. Clients already connected see a change once they reconnect.",
-            match &listing {
+            match listing {
                 None => {
                     <p class="text-sm text-muted-foreground">"The app is not running. Start it to see its tools."</p>
                 }
@@ -122,17 +180,6 @@ async fn tools_card(cx: &Cx, project: &Project, service: &Service) -> Result<imp
                     </div>
                 }
                 Some(Ok(listing)) => {
-                    <p class="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-                        <span class="size-2 shrink-0 rounded-full bg-emerald-500"></span>
-                        "Connected to "
-                        <strong class="font-medium">
-                            (listing.server.title.as_deref().unwrap_or(&listing.server.name))
-                        </strong>
-                        if let Some(version) = &listing.server.version {
-                            <span class="text-muted-foreground">(version)</span>
-                        }
-                        <span class="text-muted-foreground">"· protocol " (&listing.protocol_version)</span>
-                    </p>
                     if listing.tools.is_empty() {
                         <p class="text-sm text-muted-foreground">"Its MCP server offers no tools."</p>
                     } else {
@@ -200,12 +247,16 @@ fn problem_text(problem: &ConnectError, path: &str) -> String {
         ConnectError::NotFound => format!(
             "Nothing answers MCP at {path} on the app's port. Check the path, and that the app serves MCP there."
         ),
-        problem => {
-            let text = problem.to_string();
-            let mut chars = text.chars();
-            let first = chars.next().map(|c| c.to_uppercase().collect::<String>()).unwrap_or_default();
-            format!("{first}{}.", chars.as_str())
-        }
+        problem => format!("{}.", sentence(&problem.to_string())),
+    }
+}
+
+/// `text` with its first letter in upper case, to start a sentence.
+fn sentence(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
