@@ -8,18 +8,22 @@ use topcoat::{
     icon::{icon, iconify::iconify_icon},
     router::{
         content::Form,
-        error::{SeeOther, bad_request, see_other},
+        error::{RouterErrorExt, SeeOther, bad_request, see_other},
         href, route,
     },
+    runtime::{Event, Signal, procedure, signal},
     view::{View, attributes, component, element_id, view},
 };
 
 use super::super::super::ProjectId;
 use super::hosts::option_switch;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
-use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::app::dashboard::require_organization;
+use crate::components::button::button;
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
+use crate::components::switch::switch;
+use crate::db::db;
 use crate::features::app_mcp::{
     self, ConnectError, DEFAULT_PATH, Effect, Listing, MAX_PATH_LEN, McpTool, Tool,
 };
@@ -58,13 +62,15 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
         Some(port) => format!("http://127.0.0.1:{port}{path}"),
         None => format!("{path}, on the port chosen at the first deploy"),
     };
-    let tools = match &listing {
-        Some(Ok(listing)) => {
-            let on = listing.tools.iter().filter(|tool| enabled.contains(&tool.name)).count();
-            format!("{on} of {} on", listing.tools.len())
-        }
-        _ => format!("{} on", enabled.len()),
+    // How many tools are on, which the switches below change without a reload.
+    let (initially_on, offered) = match &listing {
+        Some(Ok(listing)) => (
+            listing.tools.iter().filter(|tool| enabled.contains(&tool.name)).count(),
+            Some(listing.tools.len()),
+        ),
+        _ => (enabled.len(), None),
     };
+    let tools_on = signal(cx, || initially_on);
 
     Ok(view! {
         <div class="flex flex-col gap-6">
@@ -85,7 +91,13 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
                     <dd class="font-mono text-muted-foreground">(MCP_TOKEN_VARIABLE)</dd>
                     if on {
                         <dt class="font-medium">"Tools"</dt>
-                        <dd class="text-muted-foreground">(tools)</dd>
+                        <dd class="text-muted-foreground">
+                            $(tools_on.get())
+                            if let Some(offered) = offered {
+                                " of " (offered.to_string())
+                            }
+                            " on"
+                        </dd>
                         <dt class="font-medium">"Named"</dt>
                         <dd class="text-muted-foreground">
                             <span class="font-mono break-all">(&service.app_name) "__<tool>"</span>
@@ -146,24 +158,22 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
                 }
             )
             if on {
-                tools_card(project: project, service: service, listing: listing.as_ref(), enabled: &enabled)
+                tools_card(service: service, listing: listing.as_ref(), enabled: &enabled, tools_on: &tools_on)
             }
         </div>
     })
 }
 
-/// The tools the app's MCP server lists now, each with a button that turns it on or
+/// The tools the app's MCP server lists now, each with a switch that turns it on or
 /// off, or why they could not be listed.
 #[component]
 async fn tools_card(
-    cx: &Cx,
-    project: &Project,
     service: &Service,
     listing: Option<&Result<Listing, ConnectError>>,
     enabled: &[String],
+    tools_on: &Signal<usize>,
 ) -> Result<impl View> {
     let path = service.mcp_path.as_deref().unwrap_or(DEFAULT_PATH);
-    let toggle_url = href!(toggle_tool, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
 
     Ok(view! {
         settings_card(
@@ -186,7 +196,12 @@ async fn tools_card(
                         <ul class="flex flex-col divide-y divide-border rounded-lg border border-border">
                             #[key(tool.name.clone())]
                             for tool in &listing.tools {
-                                tool_row(tool: tool, on: enabled.contains(&tool.name), action: &toggle_url)
+                                tool_row(
+                                    service_id: service.id,
+                                    tool: tool,
+                                    on: enabled.contains(&tool.name),
+                                    tools_on: tools_on
+                                )
                             }
                         </ul>
                     }
@@ -196,46 +211,103 @@ async fn tools_card(
     })
 }
 
-/// One tool: its name, what it does to the app's data, and a button that turns it on or
-/// off.
+/// How a tool's row looks while it is on: a bar along its left edge, as the sidebar
+/// marks the open page, over a tinted background.
+const ROW_ON: &str = "relative flex flex-wrap items-center gap-3 bg-primary/5 px-4 py-3 transition-colors before:absolute before:inset-y-2 before:left-0 before:w-0.75 before:rounded-full before:bg-primary";
+
+/// How a tool's row looks while it is off.
+const ROW_OFF: &str = "relative flex flex-wrap items-center gap-3 px-4 py-3 transition-colors";
+
+/// One tool: its name, what it does to the app's data, and a switch that turns it on
+/// or off without opening the page again. Its look, and the count at the top of the
+/// tab, follow the switch.
 #[component]
-async fn tool_row(tool: &Tool, on: bool, action: &str) -> Result<impl View> {
+async fn tool_row(
+    cx: &Cx,
+    service_id: u64,
+    tool: &Tool,
+    on: bool,
+    tools_on: &Signal<usize>,
+) -> Result<impl View> {
     let (effect, effect_class) = match tool.effect {
         Effect::ReadOnly => ("Read-only", "border-border text-muted-foreground"),
         Effect::Writes => ("Writes", "border-border text-foreground"),
         Effect::Destructive => ("Destructive", "border-destructive/40 text-destructive"),
     };
     let about = tool.description.as_deref().or(tool.title.as_deref());
+    let turned_on = signal(&cx.keyed(tool.name.clone()), || on);
+    let tools_on = tools_on.clone();
+    let name = tool.name.clone();
+    let switch_id = element_id(cx);
 
     Ok(view! {
-        <li class="flex flex-wrap items-center gap-3 px-4 py-3">
+        <li :class=$(if turned_on.get() { ROW_ON } else { ROW_OFF })>
             <div class="flex min-w-56 flex-1 flex-col gap-1">
                 <div class="flex flex-wrap items-center gap-2">
-                    <span class="font-mono text-sm font-medium break-all">(&tool.name)</span>
+                    <label
+                        for=(&switch_id)
+                        :class=$(if turned_on.get() {
+                            "cursor-pointer font-mono text-sm font-semibold break-all text-foreground"
+                        } else {
+                            "cursor-pointer font-mono text-sm font-medium break-all text-muted-foreground"
+                        })
+                    >
+                        (&tool.name)
+                    </label>
                     <span class=(format!("rounded-full border px-2 py-0.5 text-xs {effect_class}"))>(effect)</span>
-                    if on {
-                        <span class="inline-flex items-center gap-1 text-xs font-medium text-primary">
-                            icon(data: iconify_icon!("lucide:circle-check"), size: 12)
-                            "On"
-                        </span>
-                    }
                 </div>
                 if let Some(about) = about {
                     <p class="line-clamp-2 text-sm text-muted-foreground">(about)</p>
                 }
             </div>
-            <form method="post" action=(action)>
-                <input type="hidden" name="name" value=(&tool.name)>
-                <input type="hidden" name="on" value=(if on { "false" } else { "true" })>
-                button(
-                    variant: if on { ButtonVariant::Ghost } else { ButtonVariant::Outline },
-                    size: ButtonSize::Sm,
-                    attrs: attributes! { type="submit" },
-                    if on { "Turn off" } else { "Turn on" }
+            <div class="flex items-center gap-2">
+                <span
+                    :class=$(if turned_on.get() {
+                        "w-6 text-right text-xs font-semibold text-primary"
+                    } else {
+                        "w-6 text-right text-xs text-muted-foreground"
+                    })
+                >
+                    $(if turned_on.get() { "On" } else { "Off" })
+                </span>
+                switch(
+                    attrs: attributes! {
+                        id=(&switch_id)
+                        :checked=$(turned_on.get())
+                        @change=$(async |_e: Event| {
+                            let saved = turn_tool(service_id, name, !turned_on.get()).await;
+                            turned_on.set(saved);
+                            if saved {
+                                tools_on.increment()
+                            } else {
+                                tools_on.decrement()
+                            }
+                        })
+                    }
                 )
-            </form>
+            </div>
         </li>
     })
+}
+
+/// Turns one of an app's tools on or off, from the switch in its row, and returns
+/// whether it is on now. It answers requests of its own, so it checks that the service
+/// is in the organization the browser works in.
+#[procedure]
+async fn turn_tool(cx: &Cx, service_id: u64, name: String, on: bool) -> Result<bool> {
+    let organization = require_organization(cx).await?;
+    let service = Service::filter_by_id(service_id)
+        .first()
+        .exec(&mut db(cx))
+        .await?
+        .ok_or_not_found()?;
+    Project::find_in(cx, organization.id, service.project_id)
+        .await?
+        .ok_or_not_found()?;
+    if !McpTool::set(cx, service.id, &name, on).await? {
+        return Err(bad_request("That is not a tool's name").into());
+    }
+    Ok(on)
 }
 
 /// Why the tools could not be listed, with what to check.
@@ -283,19 +355,3 @@ async fn save_server(cx: &Cx, Form(form): Form<ServerForm>) -> Result<SeeOther> 
     Ok(see_other(ServiceTab::Mcp.url(cx, &project, &service)))
 }
 
-/// The form that turns one tool on or off.
-#[derive(Deserialize)]
-struct ToolForm {
-    name: String,
-    on: bool,
-}
-
-/// Turns one of the app's tools on or off.
-#[route(POST "./tools")]
-async fn toggle_tool(cx: &Cx, Form(form): Form<ToolForm>) -> Result<SeeOther> {
-    let (project, service) = current_service(cx).await?;
-    if !McpTool::set(cx, service.id, &form.name, form.on).await? {
-        return Err(bad_request("That is not a tool's name").into());
-    }
-    Ok(see_other(ServiceTab::Mcp.url(cx, &project, &service)))
-}
