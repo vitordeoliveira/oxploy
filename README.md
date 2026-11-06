@@ -128,6 +128,37 @@ folder it is installed in. To go back, stop oxploy, move `previous/oxploy` and
 dates, and the times oxploy writes in the apps' logs and backups. Until one is picked, it
 is the server's own, and the apps keep the server's own either way.
 
+## MCP
+
+`/mcp` lets AI agents, such as a bot or Claude Code, read the server through the
+[Model Context Protocol](https://modelcontextprotocol.io). The super admin makes a token
+for each client on the **MCP** page, which shows it once: oxploy keeps only its hash.
+Clients send it as `Authorization: Bearer <token>`, and a missing or wrong one gets a 401
+after a second. Revoking a token on the same page turns its client away.
+
+A server token reads the machine, oxploy itself and every app it runs, across
+organizations. The tools only read:
+
+| Tool | What it returns |
+| --- | --- |
+| `server_status` | The machine's CPU, memory, disk and network; oxploy's version, updates and Caddy; how many apps stand where |
+| `list_services` | Every app, with its status, port, domains, release, usage now, crashes and latest deployment |
+| `service_usage` | One app's process, its CPU and memory now and over the last 10 minutes, its crashes and its storage |
+| `app_logs` | The end of an app's log, or only its lines with a text |
+| `list_deployments` | An app's latest deployments |
+| `deployment_log` | The end of a deployment's log |
+
+To connect Claude Code:
+
+```sh
+claude mcp add --transport http oxploy https://<panel>/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+`src/app/mcp.rs` answers each JSON-RPC message, sent by POST, with plain JSON, with no
+session and no event stream. Each tool is a file of its own in `src/app/mcp/`, with a line
+each in `definitions` and `call_tool`.
+
 ## Project structure
 
 | Path | Contents |

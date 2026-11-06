@@ -1,6 +1,7 @@
 mod dashboard;
 mod login;
 mod logout;
+mod mcp;
 mod onboarding;
 mod register;
 

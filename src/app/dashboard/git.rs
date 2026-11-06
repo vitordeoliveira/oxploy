@@ -13,16 +13,14 @@ use topcoat::{
     router::{
         content::Form,
         error::{RouterErrorExt, SeeOther, bad_request, see_other},
-        header::HOST,
         href, page, query_params,
-        request::{headers, uri},
         route,
     },
     runtime::{Event, Signal, signal},
     view::{View, attributes, component, element_id, view},
 };
 
-use super::require_organization;
+use super::{panel_url, require_organization};
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button, button_variants};
 use crate::components::dialog::{
@@ -381,24 +379,4 @@ async fn remove(cx: &Cx, Form(form): Form<AppForm>) -> Result<SeeOther> {
         .ok_or_not_found()?;
     app.remove(cx).await?;
     Ok(see_other(href!(page).resolve(cx)))
-}
-
-/// The panel's address as the browser reached it, such as `http://127.0.0.1:3000`,
-/// which GitHub sends the browser back to. Behind a proxy that ends HTTPS, the proxy's
-/// `X-Forwarded-Proto` keeps it `https`.
-fn panel_url(cx: &Cx) -> Option<String> {
-    let headers = headers(cx);
-    let host = match uri(cx).authority() {
-        Some(authority) => authority.as_str(),
-        None => headers.get(HOST)?.to_str().ok()?,
-    };
-    let valid_host = !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
-    let scheme = match headers.get("x-forwarded-proto").map(|value| value.to_str()) {
-        Some(Ok("https")) => "https",
-        _ => "http",
-    };
-    valid_host.then(|| format!("{scheme}://{host}"))
 }

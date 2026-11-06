@@ -12,6 +12,7 @@ pub mod domain;
 pub mod environment;
 pub mod github;
 pub mod machine;
+pub mod mcp;
 pub mod monitoring;
 pub mod organization;
 pub mod project;

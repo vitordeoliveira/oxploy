@@ -1,6 +1,7 @@
 //! The signed-in area: a sidebar beside the page.
 
 pub mod git;
+pub mod mcp;
 pub mod monitoring;
 mod organizations;
 pub mod projects;
@@ -17,7 +18,8 @@ use topcoat::{
         Slot,
         error::{SeeOther, not_found, redirect, see_other},
         href, layout, page,
-        request::uri,
+        header::HOST,
+        request::{headers, uri},
     },
     runtime::{Event, signal},
     view::{View, attributes, component, view},
@@ -80,6 +82,26 @@ fn back(cx: &Cx, return_to: &str) -> SeeOther {
     }
 }
 
+/// The panel's address as the browser reached it, such as `http://127.0.0.1:3000`,
+/// which GitHub sends the browser back to and MCP clients connect to. Behind a proxy
+/// that ends HTTPS, the proxy's `X-Forwarded-Proto` keeps it `https`.
+fn panel_url(cx: &Cx) -> Option<String> {
+    let headers = headers(cx);
+    let host = match uri(cx).authority() {
+        Some(authority) => authority.as_str(),
+        None => headers.get(HOST)?.to_str().ok()?,
+    };
+    let valid_host = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
+    let scheme = match headers.get("x-forwarded-proto").map(|value| value.to_str()) {
+        Some(Ok("https")) => "https",
+        _ => "http",
+    };
+    valid_host.then(|| format!("{scheme}://{host}"))
+}
+
 /// `/dashboard` has no page of its own yet, so it opens the projects.
 #[page]
 async fn page(cx: &Cx) -> Result<()> {
@@ -102,6 +124,7 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let projects = href!(projects::page);
     let projects_url = projects.resolve(cx);
     let git_url = href!(git::page).resolve(cx);
+    let mcp_url = href!(mcp::page).resolve(cx);
     let monitoring_url = href!(monitoring::page).resolve(cx);
     let oxploy_url = href!(monitoring::oxploy::page).resolve(cx);
     let settings_url = href!(settings::page).resolve(cx);
@@ -120,6 +143,7 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let on_server_page = in_monitoring || in_settings;
     let in_projects = within(&projects_url);
     let in_git = within(&git_url);
+    let in_mcp = within(&mcp_url);
     // The breadcrumb names what the page is about: the whole server, or something of
     // the active organization, down to the open project and service.
     let trail = if in_settings {
@@ -132,6 +156,8 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
         trail
     } else if in_git {
         vec![("Git".to_owned(), git_url.clone())]
+    } else if in_mcp {
+        vec![("MCP".to_owned(), mcp_url.clone())]
     } else {
         let mut trail = vec![("Projects".to_owned(), projects_url.clone())];
         trail.extend(projects::trail(cx).await?);
@@ -185,6 +211,16 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                                     attrs: attributes! { class=(CURRENT_PAGE) },
                                     icon(data: iconify_icon!("lucide:git-merge"))
                                     <span>"Git"</span>
+                                )
+                            )
+                            sidebar_menu_item(
+                                sidebar_menu_button(
+                                    href: Some(&mcp_url),
+                                    active: in_mcp,
+                                    tooltip: Some("MCP"),
+                                    attrs: attributes! { class=(CURRENT_PAGE) },
+                                    icon(data: iconify_icon!("lucide:plug"))
+                                    <span>"MCP"</span>
                                 )
                             )
                         )

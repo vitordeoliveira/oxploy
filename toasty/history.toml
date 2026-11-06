@@ -74,3 +74,8 @@ snapshot_name = "0013_snapshot.toml"
 id = 1533788045676834090
 name = "0014_add_default_domains.sql"
 snapshot_name = "0014_snapshot.toml"
+
+[[migrations]]
+id = 8967790953596647357
+name = "0015_add_mcp_tokens.sql"
+snapshot_name = "0015_snapshot.toml"
