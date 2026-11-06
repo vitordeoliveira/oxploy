@@ -108,3 +108,64 @@ como já passa `PORT`.
 
 - se um app que define `TZ` nas variáveis dele ganha do fuso do painel;
 - se mudar o fuso reinicia os apps, ou se vale só a partir do próximo start.
+
+## Preview deployments
+
+### Uma cópia do app para cada pull request
+
+**Problema.** A aba Preview deployments de cada serviço existe, mas é só um placeholder.
+Para ver uma mudança rodando, hoje é preciso fazer o merge na branch que o serviço
+deploya.
+
+**Objetivo.** Cada pull request aberto ganha uma cópia do app no seu próprio subdomínio. O
+oxploy refaz o deploy a cada push e apaga a cópia quando o PR fecha.
+
+**Caminho já discutido:**
+
+- **Por PR, não por branch.** Um PR tem início e fim, então o preview é apagado quando ele
+  fecha ou é mergeado. Também é a hora em que alguém vai revisar. Por branch, toda `wip`
+  ganharia um build e ficaria rodando esquecida.
+- **Polling, sem webhook.** A cada 60s o oxploy lista os PRs abertos, como já faz com as
+  releases. Assim o painel não precisa estar acessível pelo GitHub.
+- **O preview é um serviço filho.** Ele reaproveita o deploy, o runtime, o Caddy, os logs e
+  o storage, sem um sistema paralelo. Tem o app name `<app>-pr-<n>` e uma porta própria.
+- **Build incremental.** O preview usa o mesmo `CARGO_TARGET_DIR` do serviço principal, o
+  que é seguro porque os builds rodam um de cada vez. O deploy de produção sempre passa na
+  frente dos previews na fila.
+- **Domínio gerado no sslip.io.** Algo como `<app>-pr-<n>.1-2-3-4.sslip.io`. Um domínio
+  próprio com wildcard fica para depois.
+- **Variáveis herdadas.** O preview copia as variáveis do serviço principal, com uma caixa
+  para sobrescrever algumas só nos previews. O app recebe também `OXPLOY_PREVIEW=1` e a URL
+  do preview.
+- **Storage próprio e vazio.** O banco SQLite nasce zerado, as migrations rodam, e tudo é
+  apagado junto com o preview. Copiar o banco de produção colocaria dados reais numa URL
+  pública.
+
+**Riscos que definem o desenho:**
+
+- **O código do PR roda no servidor.** O `build.rs` e as macros já executam código no
+  build, e o app roda como o usuário `oxploy`. Esse usuário lê o storage dos outros apps e o
+  banco do painel, que guarda a chave privada da GitHub App. Por isso só sobem PRs de
+  branches do próprio repositório, nunca de fork. Isso importa porque o oxploy é open
+  source: num repositório público, qualquer um abre PR de fork.
+- **Memória.** Cada preview é mais um processo, e cada push é mais um build. Por isso a
+  função começa desligada, com um toggle por serviço, e tem um limite de 3 previews ao
+  mesmo tempo. Os PRs além disso esperam como "waiting".
+
+**Fica de fora:**
+
+- **Serviços em modo Release.** Um PR não tem release para baixar. Uma versão futura
+  poderia baixar o artifact que o GitHub Actions gera no PR, sem compilar na VPS.
+
+**Precisa mudar:**
+
+- **A GitHub App.** Hoje ela pede só `contents: read` e `metadata: read`. Para listar os
+  PRs, precisa de `pull_requests: read`. As apps que já existem precisam aceitar a
+  permissão nova no GitHub, uma vez.
+
+**A decidir:**
+
+- os pontos acima, que são recomendações e ainda não foram confirmados;
+- se o link do preview aparece no próprio PR, com um comentário ou o botão "View
+  deployment" do GitHub. As duas opções precisam de permissão de escrita, então a primeira
+  versão mostra o link só no painel.
