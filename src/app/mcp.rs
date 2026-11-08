@@ -42,7 +42,7 @@ use topcoat::{
 use crate::db::db;
 use crate::features::app_files::tail;
 use crate::features::deploy::{AppStatus, Deployer};
-use crate::features::mcp::{self, McpToken};
+use crate::features::mcp::{self, McpToken, Reach};
 use crate::features::organization::Organization;
 use crate::features::runtime::Exits;
 use crate::features::service::Service;
@@ -76,8 +76,9 @@ const INSTRUCTIONS: &str = "oxploy deploys Rust apps on this server and runs eac
 enum Scope {
     /// The machine, oxploy itself, and every app it runs.
     Server,
-    /// The tools of one organization's apps that were turned on.
-    Organization { id: u64, name: String },
+    /// The tools of one organization's apps that were turned on, all of them or only
+    /// the ones picked for the token.
+    Organization { id: u64, name: String, reach: Reach },
 }
 
 impl Scope {
@@ -86,10 +87,13 @@ impl Scope {
         let Some(id) = token.organization_id else {
             return Ok(Some(Scope::Server));
         };
-        let organization = Organization::filter_by_id(id).first().exec(&mut db(cx)).await?;
-        Ok(organization.map(|organization| Scope::Organization {
+        let Some(organization) = Organization::filter_by_id(id).first().exec(&mut db(cx)).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Scope::Organization {
             id,
             name: organization.name,
+            reach: token.reach(cx).await?,
         }))
     }
 }
@@ -151,12 +155,12 @@ async fn answer(cx: &Cx, scope: &Scope, message: &Value) -> Option<Value> {
         ("initialize", scope) => Ok(initialize(params, scope)),
         ("ping", _) => Ok(json!({})),
         ("tools/list", Scope::Server) => Ok(json!({ "tools": definitions() })),
-        ("tools/list", Scope::Organization { id, .. }) => match apps::definitions(cx, *id).await {
+        ("tools/list", Scope::Organization { id, reach, .. }) => match apps::definitions(cx, *id, reach).await {
             Ok(tools) => Ok(json!({ "tools": tools })),
             Err(error) => Err(failed("tools/list", &error)),
         },
         ("tools/call", Scope::Server) => call_tool(cx, params).await,
-        ("tools/call", Scope::Organization { id, .. }) => match apps::call(cx, *id, params).await {
+        ("tools/call", Scope::Organization { id, reach, .. }) => match apps::call(cx, *id, reach, params).await {
             Ok(outcome) => outcome,
             Err(error) => Err(failed("tools/call", &error)),
         },
@@ -180,9 +184,9 @@ fn initialize(params: &Value, scope: &Scope) -> Value {
         Scope::Organization { name, .. } => format!(
             "oxploy deploys Rust apps on this server. This MCP server passes on the tools of \
              the apps of the organization {name}, which each app's own MCP server offers. \
-             Only the tools turned on in oxploy are listed. Each is named after its app, as \
-             <app>__<tool>, and its description starts with the app it comes from. A tool \
-             of an app that is not running is not listed."
+             Only the tools turned on in oxploy for this token are listed. Each is named \
+             after its app, as <app>__<tool>, and its description starts with the app it \
+             comes from. A tool of an app that is not running is not listed."
         ),
     };
     json!({
@@ -399,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn an_organization_token_reaches_its_apps_and_not_the_server() {
         let cx = CxTestBuilder::new().build();
-        let scope = Scope::Organization { id: 7, name: "Porta Global".to_owned() };
+        let scope = Scope::Organization { id: 7, name: "Porta Global".to_owned(), reach: Reach::All };
 
         let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
         let initialized = answer(&cx, &scope, &message).await.unwrap();

@@ -11,6 +11,7 @@ use super::deploy::Deployer;
 use super::domain::Domain;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
+use super::mcp::McpTokenTool;
 use super::project::{Details, Project, now};
 use crate::db::db;
 
@@ -435,6 +436,7 @@ impl Service {
         Deployer::get(cx).forget(&self).await?;
         Domain::remove_all(&db(cx), self.id).await?;
         McpTool::remove_all(&db(cx), self.id).await?;
+        McpTokenTool::remove_all(&db(cx), self.id).await?;
         Caddy::get(cx).changed();
         Service::filter_by_id(self.id)
             .delete()

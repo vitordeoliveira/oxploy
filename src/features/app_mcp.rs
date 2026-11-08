@@ -19,7 +19,9 @@ use serde_json::{Value, json};
 use toasty::Db;
 use topcoat::{Result, context::Cx};
 
-use super::project::now;
+use super::deploy::{AppStatus, Deployer};
+use super::project::{Project, now};
+use super::service::Service;
 use super::update::VERSION;
 use crate::db::db;
 
@@ -75,7 +77,7 @@ impl McpTool {
     /// Turns the service's tool named `name` on or off. Returns `false`, changing
     /// nothing, if the name cannot be a tool's.
     pub async fn set(cx: &Cx, service_id: u64, name: &str, on: bool) -> Result<bool> {
-        if name.is_empty() || name.chars().count() > MAX_TOOL_NAME_LEN {
+        if !is_tool_name(name) {
             return Ok(false);
         }
         let mut db = db(cx);
@@ -106,6 +108,73 @@ impl McpTool {
             .exec(&mut db.clone())
             .await
     }
+}
+
+/// Whether `name` can be a tool's.
+pub fn is_tool_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().count() <= MAX_TOOL_NAME_LEN
+}
+
+/// An app of an organization that serves MCP and has tools turned on.
+pub struct Serving {
+    pub service: Service,
+    /// The name of the app's project.
+    pub project: String,
+    /// The names of the tools turned on in the app's MCP tab.
+    pub enabled: Vec<String>,
+}
+
+/// The organization's apps that serve MCP and have tools turned on.
+pub async fn serving(cx: &Cx, organization_id: u64) -> Result<Vec<Serving>> {
+    let mut serving = Vec::new();
+    for project in Project::in_organization(cx, organization_id).await? {
+        for service in Service::in_project(cx, project.id).await? {
+            if service.mcp_token_in_use().is_none() {
+                continue;
+            }
+            let enabled = McpTool::enabled_of(cx, service.id).await?;
+            if !enabled.is_empty() {
+                serving.push(Serving {
+                    service,
+                    project: project.name.clone(),
+                    enabled,
+                });
+            }
+        }
+    }
+    Ok(serving)
+}
+
+/// Lists the tools of each app's MCP server, asking them all at once, so a slow one
+/// only delays the answer by its own time. An app that is not running gets `None`.
+pub async fn list_each(cx: &Cx, apps: Vec<Serving>) -> Vec<(Serving, Option<Result<Listing, ConnectError>>)> {
+    let running = Deployer::get(cx);
+    let mut asked = Vec::new();
+    for app in apps {
+        let address = match (&app.service.port, &app.service.mcp_path, app.service.mcp_token_in_use()) {
+            (Some(port), Some(path), Some(token)) if running.status(&app.service) == AppStatus::Running => {
+                Some((*port, path.clone(), token.to_owned()))
+            }
+            _ => None,
+        };
+        let listing = address
+            .map(|(port, path, token)| tokio::spawn(async move { list_tools(port, &path, &token).await }));
+        asked.push((app, listing));
+    }
+
+    let mut listed = Vec::new();
+    for (app, listing) in asked {
+        let listing = match listing {
+            Some(listing) => Some(
+                listing
+                    .await
+                    .unwrap_or_else(|error| Err(ConnectError::Unreachable(error.to_string()))),
+            ),
+            None => None,
+        };
+        listed.push((app, listing));
+    }
+    listed
 }
 
 /// Whether `path` can be where an app serves MCP: a path below the root, such as
@@ -161,7 +230,8 @@ pub struct Tool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     ReadOnly,
-    /// It changes data, but only adds to it.
+    /// It changes data without destroying any, which the protocol takes to mean it only
+    /// adds to it.
     Writes,
     Destructive,
 }

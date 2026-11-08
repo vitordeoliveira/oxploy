@@ -18,6 +18,7 @@ use topcoat::{
 use super::super::super::ProjectId;
 use super::hosts::option_switch;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
+use crate::app::dashboard::mcp::{EFFECT_GROUPS, effect_heading, group_key};
 use crate::app::dashboard::require_organization;
 use crate::components::button::button;
 use crate::components::field::{field, field_description, field_label};
@@ -174,11 +175,15 @@ async fn tools_card(
     tools_on: &Signal<usize>,
 ) -> Result<impl View> {
     let path = service.mcp_path.as_deref().unwrap_or(DEFAULT_PATH);
+    let groups = match listing {
+        Some(Ok(listing)) => by_effect(&listing.tools),
+        _ => Vec::new(),
+    };
 
     Ok(view! {
         settings_card(
             title: "Tools",
-            text: "The tools the app's MCP server offers now. The ones you turn on reach this organization's MCP, through its tokens, and a tool the app starts offering stays off until you turn it on. Clients already connected see a change once they reconnect.",
+            text: "The tools the app's MCP server offers now. The ones you turn on reach this organization's MCP, through the tokens that reach every tool turned on or that have the tool picked. A tool the app starts offering stays off until you turn it on, and turning one off takes it from every token. Clients already connected see a change once they reconnect.",
             match listing {
                 None => {
                     <p class="text-sm text-muted-foreground">"The app is not running. Start it to see its tools."</p>
@@ -193,22 +198,41 @@ async fn tools_card(
                     if listing.tools.is_empty() {
                         <p class="text-sm text-muted-foreground">"Its MCP server offers no tools."</p>
                     } else {
-                        <ul class="flex flex-col divide-y divide-border rounded-lg border border-border">
-                            #[key(tool.name.clone())]
-                            for tool in &listing.tools {
-                                tool_row(
-                                    service_id: service.id,
-                                    tool: tool,
-                                    on: enabled.contains(&tool.name),
-                                    tools_on: tools_on
-                                )
+                        <div class="flex flex-col gap-5">
+                            #[key(group_key(Some(*effect)))]
+                            for (effect, tools) in &groups {
+                                <div class="flex flex-col gap-1.5">
+                                    effect_heading(effect: Some(*effect), count: tools.len())
+                                    <ul class="flex flex-col divide-y divide-border rounded-lg border border-border">
+                                        #[key(tool.name.clone())]
+                                        for tool in tools {
+                                            tool_row(
+                                                service_id: service.id,
+                                                tool: tool,
+                                                on: enabled.contains(&tool.name),
+                                                tools_on: tools_on
+                                            )
+                                        }
+                                    </ul>
+                                </div>
                             }
-                        </ul>
+                        </div>
                     }
                 }
             }
         )
     })
+}
+
+/// The tools in the groups of [`EFFECT_GROUPS`] they belong to, leaving out the empty
+/// ones. A listed tool always says what it does, so none is in the group of unknowns.
+fn by_effect(tools: &[Tool]) -> Vec<(Effect, Vec<&Tool>)> {
+    EFFECT_GROUPS
+        .into_iter()
+        .flatten()
+        .map(|effect| (effect, tools.iter().filter(|tool| tool.effect == effect).collect::<Vec<_>>()))
+        .filter(|(_, tools)| !tools.is_empty())
+        .collect()
 }
 
 /// How a tool's row looks while it is on: a bar along its left edge, as the sidebar
@@ -218,8 +242,8 @@ const ROW_ON: &str = "relative flex flex-wrap items-center gap-3 bg-primary/5 px
 /// How a tool's row looks while it is off.
 const ROW_OFF: &str = "relative flex flex-wrap items-center gap-3 px-4 py-3 transition-colors";
 
-/// One tool: its name, what it does to the app's data, and a switch that turns it on
-/// or off without opening the page again. Its look, and the count at the top of the
+/// One tool: its name, what it does, and a switch that turns it on or off without
+/// opening the page again. Its look, and the count at the top of the
 /// tab, follow the switch.
 #[component]
 async fn tool_row(
@@ -229,11 +253,6 @@ async fn tool_row(
     on: bool,
     tools_on: &Signal<usize>,
 ) -> Result<impl View> {
-    let (effect, effect_class) = match tool.effect {
-        Effect::ReadOnly => ("Read-only", "border-border text-muted-foreground"),
-        Effect::Writes => ("Writes", "border-border text-foreground"),
-        Effect::Destructive => ("Destructive", "border-destructive/40 text-destructive"),
-    };
     let about = tool.description.as_deref().or(tool.title.as_deref());
     let turned_on = signal(&cx.keyed(tool.name.clone()), || on);
     let tools_on = tools_on.clone();
@@ -254,7 +273,6 @@ async fn tool_row(
                     >
                         (&tool.name)
                     </label>
-                    <span class=(format!("rounded-full border px-2 py-0.5 text-xs {effect_class}"))>(effect)</span>
                 </div>
                 if let Some(about) = about {
                     <p class="line-clamp-2 text-sm text-muted-foreground">(about)</p>

@@ -18,13 +18,52 @@ static MIGRATIONS: MigrationSet = toasty::embed_migrations!();
 /// After changing a model, generate a migration with
 /// `cargo run -- toasty migration generate`.
 pub async fn connect() -> toasty::Result<Db> {
-    let url = url();
+    open(&url()).await
+}
+
+/// Opens the database at `url` and applies any pending migrations.
+async fn open(url: &str) -> toasty::Result<Db> {
     let db = Db::builder()
         .models(toasty::models!(crate::*))
-        .connect(&url)
+        .connect(url)
         .await?;
     MIGRATIONS.apply(&db).await?;
     Ok(db)
+}
+
+/// A database of a test's own, in a new SQLite file with every migration applied, which
+/// is deleted when it is dropped.
+#[cfg(test)]
+pub struct TestDb {
+    pub db: Db,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl TestDb {
+    pub async fn new() -> TestDb {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "oxploy-test-{}-{}.db",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = open(&format!("sqlite:{}", path.display())).await.unwrap();
+        TestDb { db, path }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = self.path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 /// The files the database takes, with its write-ahead log, if it is a SQLite file.

@@ -5,15 +5,17 @@
 //! with the sign-in sessions, so a leaked database cannot be used. A token reaches one
 //! of two things: the server, for the super admin, with the machine, oxploy itself and
 //! every app it runs; or one organization, with the tools of its apps that were turned
-//! on.
+//! on, all of them or only the ones picked for it. See [`Reach`].
 
 use sha2::{Digest, Sha256};
+use toasty::Db;
 use topcoat::{
     Result,
     context::Cx,
     router::{header::AUTHORIZATION, request::headers},
 };
 
+use super::app_mcp::is_tool_name;
 use super::project::now;
 use super::service::slug;
 use crate::db::db;
@@ -42,6 +44,54 @@ pub struct McpToken {
     /// When a client last sent it, in seconds since the Unix epoch, to within
     /// [`LAST_USED_PRECISION`].
     pub last_used_at: Option<i64>,
+
+    /// Whether it reaches only the tools picked for it, of those turned on in its
+    /// organization's apps, rather than all of them. `None`, as for a server token or an
+    /// organization's token made before tools could be picked, is no.
+    pub picks_tools: Option<bool>,
+}
+
+/// A tool of an organization's app that was picked for one of its tokens. It reaches the
+/// token only while it is also turned on in the app's MCP tab.
+#[derive(Debug, toasty::Model)]
+pub struct McpTokenTool {
+    #[key]
+    #[auto]
+    pub id: u64,
+
+    #[index]
+    pub token_id: u64,
+
+    /// The service of the app that offers it.
+    #[index]
+    pub service_id: u64,
+
+    /// The tool's name, as the app's server lists it.
+    pub name: String,
+
+    /// When it was picked, in seconds since the Unix epoch.
+    pub picked_at: i64,
+}
+
+/// Which of the tools turned on in an organization's apps a token reaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reach {
+    /// All of them, and each one turned on later.
+    All,
+    /// Only the ones picked for it, each by its app's service and its name.
+    Picked(Vec<(u64, String)>),
+}
+
+impl Reach {
+    /// The names of the service's tools the token reaches, of the names `enabled` in
+    /// the app's MCP tab. Listing the tools and calling one both go through it, so a
+    /// token never calls a tool it is not shown.
+    pub fn reached(&self, service_id: u64, mut enabled: Vec<String>) -> Vec<String> {
+        if let Reach::Picked(picked) = self {
+            enabled.retain(|name| picked.iter().any(|(id, picked)| *id == service_id && picked == name));
+        }
+        enabled
+    }
 }
 
 /// What every token starts with, so one is easy to recognize, as in a leaked file.
@@ -77,13 +127,18 @@ impl McpToken {
 
     /// Makes a token named `name` for the organization, or for the server with `None`,
     /// and returns it with the token itself, which is never stored and so cannot be
-    /// shown again. Returns why not instead if the name has no letters or digits, is too
-    /// long, or reads like the name of another of the same tokens: as clients know each
-    /// token by a name made from it, two such would clash.
+    /// shown again. An organization's token reaches the tools in `picked`, each by its
+    /// app's service and its name, or all of them with `None`; a server token reaches
+    /// the server, whatever `picked` says.
+    ///
+    /// Returns why not instead if the name has no letters or digits, is too long, or
+    /// reads like the name of another of the same tokens: as clients know each token by
+    /// a name made from it, two such would clash.
     pub async fn issue(
         cx: &Cx,
         organization_id: Option<u64>,
         name: &str,
+        picked: Option<&[(u64, String)]>,
     ) -> Result<Result<(McpToken, String), IssueError>> {
         let name = name.trim();
         if slug(name).is_empty() || name.chars().count() > MAX_NAME_LEN {
@@ -96,6 +151,7 @@ impl McpToken {
         if taken {
             return Ok(Err(IssueError::Taken));
         }
+        let picked = organization_id.and(picked);
         let secret = new_secret();
         let token = toasty::create!(McpToken {
             name: name.to_owned(),
@@ -103,25 +159,98 @@ impl McpToken {
             token_hash: hash(&secret),
             created_at: now(),
             last_used_at: None,
+            picks_tools: organization_id.map(|_| picked.is_some()),
         })
         .exec(&mut db(cx))
         .await?;
+        for (service_id, tool) in picked.unwrap_or_default() {
+            token.pick(cx, *service_id, tool, true).await?;
+        }
         Ok(Ok((token, secret)))
     }
 
-    /// Deletes the token. Clients that send it are turned away from then on.
+    /// Whether it reaches only the tools picked for it.
+    pub fn picks_tools(&self) -> bool {
+        self.picks_tools == Some(true)
+    }
+
+    /// The tools picked for it, each by its app's service and its name, whether or not
+    /// it reaches only those.
+    pub async fn picked(&self, cx: &Cx) -> Result<Vec<(u64, String)>> {
+        let picked = McpTokenTool::filter_by_token_id(self.id)
+            .exec(&mut db(cx))
+            .await?;
+        Ok(picked.into_iter().map(|tool| (tool.service_id, tool.name)).collect())
+    }
+
+    /// Which of its organization's tools it reaches.
+    pub async fn reach(&self, cx: &Cx) -> Result<Reach> {
+        Ok(if self.picks_tools() {
+            Reach::Picked(self.picked(cx).await?)
+        } else {
+            Reach::All
+        })
+    }
+
+    /// Has it reach only the tools picked for it, or all of them. The tools picked are
+    /// kept either way, so going back to picking finds them as they were.
+    pub async fn set_picks_tools(&mut self, cx: &Cx, picks: bool) -> Result<()> {
+        self.update().picks_tools(Some(picks)).exec(&mut db(cx)).await?;
+        Ok(())
+    }
+
+    /// Picks the service's tool named `name` for it, or leaves it out. Returns `false`,
+    /// changing nothing, if the name cannot be a tool's.
+    pub async fn pick(&self, cx: &Cx, service_id: u64, name: &str, on: bool) -> Result<bool> {
+        if !is_tool_name(name) {
+            return Ok(false);
+        }
+        let mut db = db(cx);
+        let existing = McpTokenTool::filter_by_token_id(self.id)
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .filter(|tool| tool.service_id == service_id && tool.name == name);
+        for tool in existing {
+            McpTokenTool::filter_by_id(tool.id).delete().exec(&mut db).await?;
+        }
+        if on {
+            toasty::create!(McpTokenTool {
+                token_id: self.id,
+                service_id,
+                name: name.to_owned(),
+                picked_at: now(),
+            })
+            .exec(&mut db)
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// Deletes the token, with the tools picked for it. Clients that send it are turned
+    /// away from then on.
     pub async fn revoke(self, cx: &Cx) -> Result<()> {
+        McpTokenTool::filter_by_token_id(self.id).delete().exec(&mut db(cx)).await?;
         McpToken::filter_by_id(self.id).delete().exec(&mut db(cx)).await?;
         Ok(())
     }
 
     /// Deletes the organization's tokens, as when it is deleted.
     pub async fn remove_all_in(cx: &Cx, organization_id: u64) -> Result<()> {
-        McpToken::filter_by_organization_id(Some(organization_id))
-            .delete()
-            .exec(&mut db(cx))
-            .await?;
+        for token in McpToken::of(cx, Some(organization_id)).await? {
+            token.revoke(cx).await?;
+        }
         Ok(())
+    }
+}
+
+impl McpTokenTool {
+    /// Forgets the tools of a service picked for any token, as when it is deleted.
+    pub async fn remove_all(db: &Db, service_id: u64) -> toasty::Result<()> {
+        McpTokenTool::filter_by_service_id(service_id)
+            .delete()
+            .exec(&mut db.clone())
+            .await
     }
 }
 
@@ -225,6 +354,24 @@ mod tests {
         );
         assert_eq!(client_name(Some("Ação!"), "Bot"), "oxploy-a-o-bot");
         assert_eq!(client_name(Some("🚀"), "Bot"), "oxploy-organization-bot");
+    }
+
+    #[test]
+    fn a_token_reaches_the_tools_turned_on_or_only_those_picked_of_them() {
+        let enabled = || vec!["list_requests".to_owned(), "archive".to_owned(), "purge".to_owned()];
+        assert_eq!(Reach::All.reached(3, enabled()), enabled());
+
+        let picked = Reach::Picked(vec![
+            (3, "list_requests".to_owned()),
+            // Picked, but turned off in the app's MCP tab.
+            (3, "export".to_owned()),
+            // A tool of the same name of another app.
+            (4, "purge".to_owned()),
+        ]);
+        assert_eq!(picked.reached(3, enabled()), ["list_requests"]);
+        assert_eq!(picked.reached(4, enabled()), ["purge"]);
+        assert!(picked.reached(5, enabled()).is_empty());
+        assert!(Reach::Picked(Vec::new()).reached(3, enabled()).is_empty());
     }
 
     #[test]

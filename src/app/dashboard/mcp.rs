@@ -3,7 +3,8 @@
 //!
 //! The super admin makes server tokens here, which read the machine, oxploy itself and
 //! every app it runs. Each organization makes tokens of its own, which reach the tools
-//! of its apps that were turned on in each app's MCP tab.
+//! of its apps that were turned on in each app's MCP tab: all of them, or only the ones
+//! picked for the token, which a new token starts with.
 //!
 //! Making a token sends the browser on to this page with an ID, which shows the token
 //! once. Reloading the page sends the form no more, so it makes no second token.
@@ -19,10 +20,10 @@ use topcoat::{
     icon::{IconData, icon, iconify::iconify_icon},
     router::{
         content::Form,
-        error::{RouterErrorExt, SeeOther, see_other},
+        error::{RouterErrorExt, SeeOther, bad_request, see_other},
         href, page, query_params, route,
     },
-    runtime::{Event, Signal, signal},
+    runtime::{Event, Signal, procedure, signal},
     view::{Child, View, attributes, component, element_id, view},
 };
 
@@ -36,7 +37,9 @@ use crate::components::dialog::{
 };
 use crate::components::field::{field, field_description, field_error, field_label};
 use crate::components::input::input;
-use crate::features::app_mcp::McpTool;
+use crate::components::switch::switch;
+use crate::db::db;
+use crate::features::app_mcp::{self, Effect, McpTool};
 use crate::features::mcp::{IssueError, MAX_NAME_LEN, McpToken, client_name};
 use crate::features::project::Project;
 use crate::features::service::Service;
@@ -88,11 +91,14 @@ struct Issued {
     client: String,
 }
 
-/// A name the form turned down, shown again in its dialog with why.
+/// A name the form turned down, shown again in its dialog with why, and with the tools
+/// it picked.
 struct Refused {
     kind: Kind,
     name: String,
     problem: IssueError,
+    /// The tools picked, or `None` for every tool turned on.
+    picked: Option<Vec<(u64, String)>>,
 }
 
 /// What a form left for the page to show once, after it sent the browser back.
@@ -161,25 +167,48 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
     Ok(view! { mcp_view(shown: shown.as_ref()) })
 }
 
-/// The form that makes a token.
-#[derive(Deserialize)]
-struct IssueForm {
-    kind: String,
-    name: String,
-}
-
 /// Makes a token, and sends the browser on to the page, which shows it once: only its
 /// hash is kept. A name it turns down goes back to the dialog with why.
+///
+/// The form sends `kind` and `name`. An organization's token reaches every tool turned
+/// on when it sends `all`, and otherwise only the tools it sends as `tool`, each as
+/// `<service_id>:<name>`, of those turned on in the organization's apps.
 #[route(POST "./issue")]
-async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<SeeOther> {
-    let kind = Kind::parse(&form.kind).ok_or_bad_request("No such kind of token")?;
+async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<SeeOther> {
+    let value_of = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| name == key)
+            .map_or("", |(_, value)| value.as_str())
+    };
+    let kind = Kind::parse(value_of("kind")).ok_or_bad_request("No such kind of token")?;
+    let name = value_of("name").to_owned();
     let signed_in = require_sign_in(cx).await?;
     let owner = kind.owner(cx).await?;
-    let organization = match kind {
-        Kind::Server => None,
-        Kind::Organization => Some(require_organization(cx).await?.name),
+    let (organization, picked) = match kind {
+        Kind::Server => (None, None),
+        Kind::Organization => {
+            let organization = require_organization(cx).await?;
+            let picked = if fields.iter().any(|(name, _)| name == "all") {
+                None
+            } else {
+                let offered = app_mcp::serving(cx, organization.id).await?;
+                let picked: Vec<_> = fields
+                    .iter()
+                    .filter(|(name, _)| name == "tool")
+                    .filter_map(|(_, value)| tool_choice(value))
+                    .filter(|(service_id, name)| {
+                        offered
+                            .iter()
+                            .any(|app| app.service.id == *service_id && app.enabled.contains(name))
+                    })
+                    .collect();
+                Some(picked)
+            };
+            (Some(organization.name), picked)
+        }
     };
-    let shown = match McpToken::issue(cx, owner, &form.name).await? {
+    let shown = match McpToken::issue(cx, owner, &name, picked.as_deref()).await? {
         Ok((token, secret)) => Shown::Issued(Issued {
             kind,
             client: client_name(organization.as_deref(), &token.name),
@@ -188,12 +217,19 @@ async fn issue(cx: &Cx, Form(form): Form<IssueForm>) -> Result<SeeOther> {
         }),
         Err(problem) => Shown::Refused(Refused {
             kind,
-            name: form.name,
+            name,
             problem,
+            picked,
         }),
     };
     let id = leave(signed_in.user.id, shown);
     Ok(see_other(format!("{}?shown={id}", href!(page).resolve(cx))))
+}
+
+/// A tool as the forms send it, `<service_id>:<name>`, split into the two.
+fn tool_choice(value: &str) -> Option<(u64, String)> {
+    let (service_id, name) = value.split_once(':')?;
+    Some((service_id.parse().ok()?, name.to_owned())).filter(|(_, name)| !name.is_empty())
 }
 
 /// The form that revokes a token.
@@ -216,6 +252,126 @@ async fn revoke(cx: &Cx, Form(form): Form<RevokeForm>) -> Result<SeeOther> {
     Ok(see_other(href!(page).resolve(cx)))
 }
 
+/// Has an organization's token reach every tool turned on, or only the ones picked for
+/// it, from the switch in its tools dialog, and returns whether it reaches every one
+/// now. It answers requests of its own, so it checks that the token is of the
+/// organization the browser works in.
+#[procedure]
+async fn reach_all(cx: &Cx, token_id: u64, all: bool) -> Result<bool> {
+    let organization = require_organization(cx).await?;
+    let mut token = McpToken::find_of(cx, Some(organization.id), token_id)
+        .await?
+        .ok_or_not_found()?;
+    token.set_picks_tools(cx, !all).await?;
+    Ok(all)
+}
+
+/// Picks one of an app's tools for an organization's token, or leaves it out, from the
+/// switch in its row of the token's tools dialog, and returns whether it is picked now.
+/// It answers requests of its own, so it checks that the token and the app are both of
+/// the organization the browser works in.
+#[procedure]
+async fn pick_tool(cx: &Cx, token_id: u64, service_id: u64, name: String, on: bool) -> Result<bool> {
+    let organization = require_organization(cx).await?;
+    let token = McpToken::find_of(cx, Some(organization.id), token_id)
+        .await?
+        .ok_or_not_found()?;
+    let service = Service::filter_by_id(service_id)
+        .first()
+        .exec(&mut db(cx))
+        .await?
+        .ok_or_not_found()?;
+    Project::find_in(cx, organization.id, service.project_id)
+        .await?
+        .ok_or_not_found()?;
+    if !token.pick(cx, service.id, &name, on).await? {
+        return Err(bad_request("That is not a tool's name").into());
+    }
+    Ok(on)
+}
+
+/// A tool turned on in one of the organization's apps, which its tokens are picked from.
+struct Offered {
+    service_id: u64,
+    name: String,
+    /// What it does, as the app describes it, when the app's server could be asked.
+    about: Option<String>,
+    /// What it does to the app's data, when the app's server could be asked.
+    effect: Option<Effect>,
+}
+
+/// One of the organization's apps with tools turned on, and those tools.
+struct OfferingApp {
+    /// The project and the service, as `Project / Service`.
+    label: String,
+    tools: Vec<Offered>,
+}
+
+/// The tools turned on in the organization's apps, by app, each described as its app's
+/// server lists it now. An app that is not running, or cannot be reached, still offers
+/// its tools, only without what they do.
+async fn offered_tools(cx: &Cx, organization_id: u64) -> Result<Vec<OfferingApp>> {
+    let apps = app_mcp::serving(cx, organization_id).await?;
+    let mut offered = Vec::new();
+    for (app, listing) in app_mcp::list_each(cx, apps).await {
+        let listed = match &listing {
+            Some(Ok(listing)) => listing.tools.as_slice(),
+            _ => &[],
+        };
+        let mut tools: Vec<_> = app
+            .enabled
+            .iter()
+            .map(|name| {
+                let listed = listed.iter().find(|tool| &tool.name == name);
+                Offered {
+                    service_id: app.service.id,
+                    name: name.clone(),
+                    about: listed.and_then(|tool| tool.description.clone().or_else(|| tool.title.clone())),
+                    effect: listed.map(|tool| tool.effect),
+                }
+            })
+            .collect();
+        // In the order the app lists them, then the ones it no longer lists by name.
+        tools.sort_by_key(|tool| {
+            let at = listed.iter().position(|listed| listed.name == tool.name);
+            (at.unwrap_or(usize::MAX), tool.name.clone())
+        });
+        offered.push(OfferingApp {
+            label: format!("{} / {}", app.project, app.service.name),
+            tools,
+        });
+    }
+    Ok(offered)
+}
+
+/// How many of the tools `offered` are in `picked`.
+fn picked_on(offered: &[OfferingApp], picked: &[(u64, String)]) -> usize {
+    offered
+        .iter()
+        .flat_map(|app| &app.tools)
+        .filter(|tool| is_picked(picked, tool))
+        .count()
+}
+
+/// Whether `tool` is in `picked`.
+fn is_picked(picked: &[(u64, String)], tool: &Offered) -> bool {
+    picked
+        .iter()
+        .any(|(service_id, name)| *service_id == tool.service_id && *name == tool.name)
+}
+
+/// What an organization's token reaches, as its row and its tools dialog show and
+/// change it.
+#[derive(Clone)]
+struct Reaching {
+    /// Whether it reaches every tool turned on.
+    all: Signal<bool>,
+    /// How many of the tools turned on are picked for it.
+    picked: Signal<usize>,
+    /// Whether its tools dialog is open.
+    choosing: Signal<bool>,
+}
+
 /// The page, with the token a form just made, or the name it just turned down.
 #[component]
 async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
@@ -228,6 +384,7 @@ async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
     let owns_server = signed_in.user.role == Role::SuperAdmin;
     let organization = require_organization(cx).await?;
     let endpoint = format!("{}/mcp", panel_url(cx).unwrap_or_default());
+    let offered = offered_tools(cx, organization.id).await?;
     let issued_server = issued.filter(|issued| issued.kind == Kind::Server);
     let issued_organization = issued.filter(|issued| issued.kind == Kind::Organization);
     let refused_server = refused.filter(|refused| refused.kind == Kind::Server);
@@ -260,17 +417,19 @@ async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
                     symbol: iconify_icon!("lucide:server"),
                     endpoint: &endpoint,
                     issued: issued_server,
-                    refused: refused_server
+                    refused: refused_server,
+                    offered: None
                 )
             }
             tokens_section(
                 kind: Kind::Organization,
                 title: &organization.name,
-                text: "Reaches the tools of this organization's apps that are turned on in each app's MCP tab. Other organizations have tokens of their own.",
+                text: "Reaches the tools of this organization's apps that are turned on in each app's MCP tab: all of them, or only the ones picked for the token. Other organizations have tokens of their own.",
                 symbol: iconify_icon!("lucide:boxes"),
                 endpoint: &endpoint,
                 issued: issued_organization,
                 refused: refused_organization,
+                offered: Some(&offered),
                 apps_list(organization_id: organization.id)
             )
         </div>
@@ -278,6 +437,8 @@ async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
 }
 
 /// One kind of tokens: the token just made, what `child` adds, and the tokens to revoke.
+/// An organization's tokens come with the tools `offered` in its apps, which each one
+/// reaches all of or some of.
 #[component]
 async fn tokens_section(
     cx: &Cx,
@@ -288,6 +449,7 @@ async fn tokens_section(
     endpoint: &str,
     issued: Option<&Issued>,
     refused: Option<&Refused>,
+    offered: Option<&[OfferingApp]>,
     #[default] child: Child<'_>,
 ) -> Result<impl View> {
     let owner = match kind {
@@ -295,12 +457,32 @@ async fn tokens_section(
         Kind::Organization => Some(require_organization(cx).await?.id),
     };
     let tokens = McpToken::of(cx, owner).await?;
+    let mut picked = Vec::new();
+    for token in &tokens {
+        picked.push(match offered {
+            Some(_) => token.picked(cx).await?,
+            None => Vec::new(),
+        });
+    }
+    let total = offered.map_or(0, |apps| apps.iter().map(|app| app.tools.len()).sum());
     // A name turned down opens the dialog again, to be changed.
     let issuing = signal(cx, || refused.is_some());
     let open_issuing = issuing.clone();
     let revoking: Vec<_> = tokens
         .iter()
         .map(|token| signal(&cx.keyed(token.id), || false))
+        .collect();
+    let reaching: Vec<_> = tokens
+        .iter()
+        .zip(&picked)
+        .map(|(token, picked)| {
+            let offered = offered?;
+            Some(Reaching {
+                all: signal(&cx.keyed(token.id), || !token.picks_tools()),
+                picked: signal(&cx.keyed(token.id), || picked_on(offered, picked)),
+                choosing: signal(&cx.keyed(token.id), || false),
+            })
+        })
         .collect();
 
     Ok(view! {
@@ -331,15 +513,18 @@ async fn tokens_section(
                 <ul class="divide-y divide-border">
                     #[key(token.id)]
                     for (index, token) in tokens.iter().enumerate() {
-                        token_row(token: token, revoking: &revoking[index])
+                        token_row(token: token, revoking: &revoking[index], reaching: reaching[index].as_ref(), total: total)
                     }
                 </ul>
             }
         </section>
-        issue_dialog(open: &issuing, kind: kind, title: title, refused: refused)
+        issue_dialog(open: &issuing, kind: kind, title: title, refused: refused, offered: offered)
         #[key(token.id)]
         for (index, token) in tokens.iter().enumerate() {
             revoke_dialog(open: &revoking[index], kind: kind, token: token)
+            if let (Some(reaching), Some(offered)) = (&reaching[index], offered) {
+                tools_dialog(token: token, reaching: reaching, offered: offered, picked: &picked[index])
+            }
         }
     })
 }
@@ -420,11 +605,19 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
     })
 }
 
-/// One token: its name, when it was made and last used, and a button to revoke it.
+/// One token: its name, when it was made and last used, and a button to revoke it. An
+/// organization's token also shows which of the `total` tools turned on it reaches, with
+/// a button that opens its tools dialog.
 #[component]
-async fn token_row(token: &McpToken, revoking: &Signal<bool>) -> Result<impl View> {
+async fn token_row(
+    token: &McpToken,
+    revoking: &Signal<bool>,
+    reaching: Option<&Reaching>,
+    total: usize,
+) -> Result<impl View> {
     let revoking = revoking.clone();
     let label = format!("Revoke {}", token.name);
+    let choosing = reaching.map(|reaching| reaching.choosing.clone());
 
     Ok(view! {
         <li class="flex items-center gap-3 px-5 py-4">
@@ -438,7 +631,23 @@ async fn token_row(token: &McpToken, revoking: &Signal<bool>) -> Result<impl Vie
                         "Never used"
                     }
                 </span>
+                if let Some(reaching) = reaching {
+                    reach_summary(reaching: reaching, total: total)
+                }
             </div>
+            if let Some(choosing) = choosing {
+                button(
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    attrs: attributes! {
+                        type="button"
+                        aria-label=(format!("Tools of {}", token.name))
+                        @click=$(|_e: Event| choosing.set(true))
+                    },
+                    icon(data: iconify_icon!("lucide:wrench"))
+                    "Tools"
+                )
+            }
             button(
                 variant: ButtonVariant::Ghost,
                 size: ButtonSize::Icon,
@@ -455,8 +664,291 @@ async fn token_row(token: &McpToken, revoking: &Signal<bool>) -> Result<impl Vie
     })
 }
 
+/// Which of the `total` tools turned on an organization's token reaches, which its tools
+/// dialog changes without a reload, with a warning when it reaches none.
+#[component]
+async fn reach_summary(reaching: &Reaching, total: usize) -> Result<impl View> {
+    let all = reaching.all.clone();
+    let picked = reaching.picked.clone();
+    let every = match total {
+        1 => "Reaches the 1 tool turned on".to_owned(),
+        total => format!("Reaches all {total} tools turned on"),
+    };
+    let of_total = match total {
+        1 => " of 1 tool turned on".to_owned(),
+        total => format!(" of {total} tools turned on"),
+    };
+
+    Ok(view! {
+        <span class="text-xs text-muted-foreground" :hidden=$(if all.get() { total == 0 } else { true })>(every)</span>
+        <span class="text-xs text-muted-foreground" :hidden=$(if all.get() { true } else { picked.get() == 0 })>
+            "Reaches " $(picked.get()) (of_total)
+        </span>
+        <span
+            class="flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400"
+            :hidden=$(if all.get() { total > 0 } else { picked.get() > 0 })
+        >
+            icon(data: iconify_icon!("lucide:triangle-alert"), size: 12, attrs: attributes! { class="shrink-0" })
+            "Reaches no tool"
+        </span>
+    })
+}
+
+/// A dialog that picks which of the tools `offered` in the organization's apps `token`
+/// reaches, saving each switch as it changes. `picked` are the tools picked for it.
+#[component]
+async fn tools_dialog(
+    cx: &Cx,
+    token: &McpToken,
+    reaching: &Reaching,
+    offered: &[OfferingApp],
+    picked: &[(u64, String)],
+) -> Result<impl View> {
+    let open = reaching.choosing.clone();
+    let close = open.clone();
+    let all = reaching.all.clone();
+    let picked_count = reaching.picked.clone();
+    let title_id = element_id(cx);
+    let all_id = element_id(cx);
+    let token_id = token.id;
+    let nothing_offered = offered.is_empty();
+
+    Ok(view! {
+        dialog(
+            open: $(open.get()),
+            attrs: attributes! { aria-labelledby=(&title_id) },
+            dialog_content(
+                dialog_header(
+                    dialog_title(attrs: attributes! { id=(&title_id) }, "Tools of " (&token.name))
+                    dialog_description(
+                        "Which of the tools turned on in this organization's apps it reaches. Each switch saves at once, and clients already connected see a change once they reconnect."
+                    )
+                )
+                <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+                    <div class="flex flex-col gap-0.5">
+                        <label for=(&all_id) class="text-sm font-medium">"Every tool turned on"</label>
+                        <p class="text-xs text-muted-foreground">
+                            "Also each tool turned on later in an app's MCP tab. Turn it off to pick the ones it reaches."
+                        </p>
+                    </div>
+                    switch(
+                        attrs: attributes! {
+                            id=(&all_id)
+                            class="mt-0.5"
+                            :checked=$(all.get())
+                            @change=$(async |_e: Event| {
+                                let saved = reach_all(token_id, !all.get()).await;
+                                all.set(saved);
+                            })
+                        }
+                    )
+                </div>
+                <div class="flex flex-col gap-3" :hidden=$(all.get())>
+                    <p
+                        class="flex items-center gap-1.5 text-sm text-amber-700 dark:text-amber-400"
+                        :hidden=$(if nothing_offered { true } else { picked_count.get() > 0 })
+                    >
+                        icon(data: iconify_icon!("lucide:triangle-alert"), size: 14, attrs: attributes! { class="shrink-0" })
+                        "It reaches no tool. Pick the ones its client needs."
+                    </p>
+                    tool_picker(offered: offered, picked: picked, saving: Some((token_id, &reaching.picked)))
+                </div>
+                dialog_footer(
+                    button(
+                        attrs: attributes! { type="button" @click=$(|_e: Event| close.set(false)) },
+                        "Done"
+                    )
+                )
+            )
+        )
+    })
+}
+
+/// The tools `offered` in the organization's apps, grouped by what they do to their app's
+/// data, each with the app it comes from and a switch that picks it, on for those in
+/// `picked`.
+///
+/// With `saving`, a token's ID and its count of tools picked, each switch saves at once
+/// and keeps the count. Without it, the switches are fields of the form they are in,
+/// named `tool`, as [`issue`] reads them.
+#[component]
+async fn tool_picker(
+    offered: &[OfferingApp],
+    picked: &[(u64, String)],
+    saving: Option<(u64, &Signal<usize>)>,
+) -> Result<impl View> {
+    let groups: Vec<_> = EFFECT_GROUPS
+        .into_iter()
+        .map(|effect| {
+            let tools: Vec<_> = offered
+                .iter()
+                .flat_map(|app| app.tools.iter().map(move |tool| (app, tool)))
+                .filter(|(_, tool)| tool.effect == effect)
+                .collect();
+            (effect, tools)
+        })
+        .filter(|(_, tools)| !tools.is_empty())
+        .collect();
+
+    Ok(view! {
+        if offered.is_empty() {
+            <p class="text-sm text-muted-foreground">
+                "No app of this organization has tools turned on yet. Turn them on in each app's MCP tab."
+            </p>
+        } else {
+            <div class="flex max-h-96 flex-col gap-4 overflow-y-auto">
+                #[key(group_key(*effect))]
+                for (effect, tools) in &groups {
+                    <div class="flex flex-col gap-1.5">
+                        effect_heading(effect: *effect, count: tools.len())
+                        <ul class="flex flex-col divide-y divide-border rounded-lg border border-border">
+                            #[key(format!("{}:{}", tool.service_id, tool.name))]
+                            for (app, tool) in tools {
+                                tool_choice_row(app: app, tool: tool, on: is_picked(picked, tool), saving: saving)
+                            }
+                        </ul>
+                    </div>
+                }
+            </div>
+        }
+    })
+}
+
+/// One tool to pick: its name, the app it comes from, what it does, and its switch. See
+/// [`tool_picker`].
+#[component]
+async fn tool_choice_row(
+    cx: &Cx,
+    app: &OfferingApp,
+    tool: &Offered,
+    on: bool,
+    saving: Option<(u64, &Signal<usize>)>,
+) -> Result<impl View> {
+    let switch_id = element_id(cx);
+    let value = format!("{}:{}", tool.service_id, tool.name);
+
+    Ok(view! {
+        <li class="flex items-center gap-3 px-3 py-2">
+            <div class="flex min-w-0 flex-1 flex-col gap-0.5">
+                <div class="flex flex-wrap items-baseline gap-x-2">
+                    <label for=(&switch_id) class="cursor-pointer font-mono text-sm break-all">(&tool.name)</label>
+                    <span class="text-xs text-muted-foreground">(&app.label)</span>
+                </div>
+                if let Some(about) = &tool.about {
+                    <p class="line-clamp-1 text-xs text-muted-foreground">(about)</p>
+                }
+            </div>
+            if let Some((token_id, count)) = saving {
+                saved_switch(id: &switch_id, token_id: token_id, tool: tool, on: on, count: count)
+            } else {
+                switch(attrs: attributes! { id=(&switch_id) name="tool" value=(&value) checked=(on.then_some("")) })
+            }
+        </li>
+    })
+}
+
+/// The switch that picks `tool` for a token, saving at once and keeping `count`, the
+/// number of tools picked for it.
+#[component]
+async fn saved_switch(
+    cx: &Cx,
+    id: &str,
+    token_id: u64,
+    tool: &Offered,
+    on: bool,
+    count: &Signal<usize>,
+) -> Result<impl View> {
+    let picked = signal(&cx.keyed(format!("{}:{}", tool.service_id, tool.name)), || on);
+    let count = count.clone();
+    let service_id = tool.service_id;
+    let name = tool.name.clone();
+
+    Ok(view! {
+        switch(
+            attrs: attributes! {
+                id=(id)
+                :checked=$(picked.get())
+                @change=$(async |_e: Event| {
+                    let saved = pick_tool(token_id, service_id, name, !picked.get()).await;
+                    picked.set(saved);
+                    if saved {
+                        count.increment()
+                    } else {
+                        count.decrement()
+                    }
+                })
+            }
+        )
+    })
+}
+
+/// The groups the lists of tools are in, in order, by what the tools do to their app's
+/// data, as each app declares it. `None` holds the tools whose app could not be asked.
+pub const EFFECT_GROUPS: [Option<Effect>; 4] = [
+    Some(Effect::ReadOnly),
+    Some(Effect::Writes),
+    Some(Effect::Destructive),
+    None,
+];
+
+/// What tells a group of [`EFFECT_GROUPS`] apart in a list.
+pub fn group_key(effect: Option<Effect>) -> String {
+    match effect {
+        Some(Effect::ReadOnly) => "read-only",
+        Some(Effect::Writes) => "writes",
+        Some(Effect::Destructive) => "destructive",
+        None => "unknown",
+    }
+    .to_owned()
+}
+
+/// The heading of a group of [`EFFECT_GROUPS`], with how many tools it has. The groups
+/// are what each app declares, which oxploy cannot check.
+#[component]
+pub async fn effect_heading(effect: Option<Effect>, count: usize) -> Result<impl View> {
+    let (symbol, title, about, tone) = match effect {
+        Some(Effect::ReadOnly) => (
+            iconify_icon!("lucide:eye"),
+            "Read-only",
+            "The app declares they only read its data.",
+            "text-foreground",
+        ),
+        Some(Effect::Writes) => (
+            iconify_icon!("lucide:pencil"),
+            "Writes",
+            "The app declares they change its data without destroying any.",
+            "text-foreground",
+        ),
+        Some(Effect::Destructive) => (
+            iconify_icon!("lucide:triangle-alert"),
+            "Destructive",
+            "The app declares they may delete or overwrite its data, or declares nothing, which counts as that.",
+            "text-destructive",
+        ),
+        None => (
+            iconify_icon!("lucide:circle-help"),
+            "Not known now",
+            "Their app is not running, so oxploy cannot ask what they do.",
+            "text-muted-foreground",
+        ),
+    };
+
+    Ok(view! {
+        <div class="flex flex-col gap-0.5">
+            <h4 class=(format!("flex items-center gap-1.5 text-sm font-medium {tone}"))>
+                icon(data: symbol, size: 14, attrs: attributes! { class="shrink-0" })
+                (title)
+                <span class="text-xs font-normal text-muted-foreground">(count.to_string())</span>
+            </h4>
+            <p class="text-xs text-muted-foreground">(about)</p>
+        </div>
+    })
+}
+
 /// A dialog that names a new token of `kind`, for `title`: the server, or the
-/// organization's name. A name just turned down comes back in it, with why.
+/// organization's name. An organization's token reaches every tool turned on, or only
+/// the ones picked of those `offered`, none at first. A name just turned down comes back
+/// in it, with why and what was picked.
 #[component]
 async fn issue_dialog(
     cx: &Cx,
@@ -464,11 +956,15 @@ async fn issue_dialog(
     kind: Kind,
     title: &str,
     refused: Option<&Refused>,
+    offered: Option<&[OfferingApp]>,
 ) -> Result<impl View> {
     let open = open.clone();
     let title_id = element_id(cx);
     let name_id = element_id(cx);
     let hint_id = element_id(cx);
+    let all_id = element_id(cx);
+    let picked = refused.and_then(|refused| refused.picked.as_deref());
+    let all = signal(cx, || refused.is_some_and(|refused| refused.picked.is_none()));
     let problem = refused.map(|refused| match refused.problem {
         IssueError::BadName => format!(
             "Give it a name with letters or digits, of up to {MAX_NAME_LEN} characters."
@@ -489,7 +985,7 @@ async fn issue_dialog(
         ),
         Kind::Organization => (
             format!("New token for {title}"),
-            "A token for one client, such as a bot. It reaches the tools of this organization's apps that are turned on, and is shown only once.",
+            "A token for one client, such as a bot. It reaches the tools you pick of those turned on in this organization's apps, and is shown only once.",
         ),
     };
 
@@ -528,6 +1024,31 @@ async fn issue_dialog(
                             )
                         }
                     )
+                    if let Some(offered) = offered {
+                        <div class="flex flex-col gap-3">
+                            <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+                                <div class="flex flex-col gap-0.5">
+                                    <label for=(&all_id) class="text-sm font-medium">"Every tool turned on"</label>
+                                    <p class="text-xs text-muted-foreground">
+                                        "Also each tool turned on later in an app's MCP tab. Leave it off to pick the ones it reaches."
+                                    </p>
+                                </div>
+                                switch(
+                                    attrs: attributes! {
+                                        id=(&all_id)
+                                        name="all"
+                                        class="mt-0.5"
+                                        :checked=$(all.get())
+                                        @change=$(|_e: Event| all.set(!all.get()))
+                                    }
+                                )
+                            </div>
+                            <div class="flex flex-col gap-2" :hidden=$(all.get())>
+                                <p class="text-sm font-medium">"Tools it reaches"</p>
+                                tool_picker(offered: offered, picked: picked.unwrap_or_default(), saving: None)
+                            </div>
+                        </div>
+                    }
                     dialog_footer(
                         button(
                             variant: ButtonVariant::Ghost,

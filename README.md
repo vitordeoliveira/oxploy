@@ -142,6 +142,14 @@ in each app's **MCP** tab, as described below. Each is named after its app, such
 `porta-global__list_requests`, and a call goes to the app's own server. An app that is
 not running lists none. Other organizations' tokens see none of them.
 
+Each of the organization's tokens reaches all the tools turned on, including the ones
+turned on later, or only the ones picked for it. A new token starts with the ones picked
+in the dialog that makes it, none unless some are; its **Tools** button changes them
+later, and its row warns when it reaches no tool. Turning a tool off in the app's tab
+takes it from every token, and turning it back on gives it back to the tokens that had
+it picked. A call to a tool the token does not reach gets the same error as a tool that
+does not exist. Tokens made before tools could be picked reach all of them.
+
 A server token, which only the super admin makes, reads the machine, oxploy itself and
 every app it runs, across organizations. Its tools only read:
 
@@ -180,7 +188,10 @@ tab turns that on at a path, `/mcp` unless set otherwise. oxploy then gives the 
 domains, so only oxploy reaches it. An app that reads another variable takes the token
 with a line such as `MCP_TOKEN=${OXPLOY_MCP_TOKEN}` in its Environment tab. The tab lists
 the app's tools, each off until it is turned on, and the organization's tokens reach the
-ones turned on. `src/features/app_mcp.rs` is the client, which takes answers in plain JSON
+ones turned on, all of them or the ones picked for each token. The tab and a token's
+tools group them by what the app declares they do to its data: read-only, writes, or
+destructive, where a tool that declares nothing counts as destructive, as the protocol
+says. `src/features/app_mcp.rs` is the client, which takes answers in plain JSON
 or as an event stream, with or without a session.
 
 ## Project structure
