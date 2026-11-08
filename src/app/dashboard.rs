@@ -132,6 +132,11 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
     let owns_server = signed_in.user.role == Role::SuperAdmin;
     // The update dialog, open while an update installs, as after starting one.
     let updating = signal(cx, || owns_server && Updater::get(cx).is_installing());
+    // How many times a page asked GitHub for the latest release, which renders the
+    // update button and dialog again. The settings page's card says it asked with the
+    // `update-checked` event, which reaches the page's wrapper below. See [`update`].
+    let checks = signal(cx, || 0usize);
+    let checked = checks.clone();
     let return_to = uri(cx)
         .path_and_query()
         .map_or_else(|| uri(cx).path().to_owned(), ToString::to_string);
@@ -255,7 +260,7 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                 )
                 sidebar_footer(
                     if owns_server {
-                        update_button(open: updating.clone())
+                        update_button(open: updating.clone(), checks: checks.clone())
                     }
                     account(user: &signed_in.user, version_url: &version_url)
                 )
@@ -303,12 +308,17 @@ async fn layout(cx: &Cx, slot: Slot<'_>) -> Result<impl View> {
                     </nav>
                     server_time()
                 </header>
-                <div class="flex w-full flex-1 flex-col p-6">(slot)</div>
+                <div
+                    class="flex w-full flex-1 flex-col p-6"
+                    @update-checked=$(|_e: Event| checked.increment())
+                >
+                    (slot)
+                </div>
             )
         )
         organization_dialogs(menu: &menu)
         if owns_server {
-            update_dialog(open: updating.clone(), return_to: return_to)
+            update_dialog(open: updating.clone(), checks: checks.clone(), return_to: return_to)
             <script type="module" src=(asset!("assets/update.js"))></script>
         }
     })

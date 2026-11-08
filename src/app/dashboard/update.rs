@@ -1,6 +1,12 @@
 //! Updating oxploy from the panel: a button at the foot of the sidebar once a newer
 //! release is out, the dialog it opens, which installs the release and shows how far it
-//! got, and the routes they and the settings page use.
+//! got, the settings page's card about the version, and the routes they use.
+//!
+//! The card's button asks GitHub without a reload. Each of these shards takes a count
+//! of the checks made, which the button raises after one, and renders again when it
+//! changes. The sidebar's button and dialog belong to the layout, which keeps a count of
+//! its own and raises it on the `update-checked` event the card's button sends up the
+//! page.
 
 use std::time::Duration;
 
@@ -14,7 +20,7 @@ use topcoat::{
         error::{SeeOther, bad_request},
         href, route,
     },
-    runtime::{Event, Signal, connected, shard},
+    runtime::{Event, Signal, connected, procedure, shard, signal},
     view::{View, attributes, component, element_id, emit, live, view},
 };
 
@@ -30,12 +36,16 @@ use crate::features::update::{Blocker, Installation, Release, Step, Updater, VER
 /// How often an open page shows how far an update got, while it installs.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 
+
 /// The button at the foot of the sidebar that opens the update dialog, once a newer
-/// release is out or while one installs. A shard answers requests of its own, so it
-/// checks access itself.
+/// release is out or while one installs. It renders again when `checks`, a count of the
+/// checks made, changes. A shard answers requests of its own, so it checks access
+/// itself.
 #[shard]
-pub(super) async fn update_button(cx: &Cx, open: Signal<bool>) -> Result<impl View> {
+pub(super) async fn update_button(cx: &Cx, open: Signal<bool>, checks: Signal<usize>) -> Result<impl View> {
     require_server_owner(cx).await?;
+    // Read so that a check renders it again.
+    let _ = checks.get();
 
     Ok(view! {
         (live! {
@@ -99,10 +109,18 @@ async fn update_button_view(
 }
 
 /// The dialog that installs the newer release and shows how far it got, open while
-/// `open` is. A shard answers requests of its own, so it checks access itself.
+/// `open` is. It renders again when `checks`, a count of the checks made, changes. A
+/// shard answers requests of its own, so it checks access itself.
 #[shard]
-pub(super) async fn update_dialog(cx: &Cx, open: Signal<bool>, return_to: String) -> Result<impl View> {
+pub(super) async fn update_dialog(
+    cx: &Cx,
+    open: Signal<bool>,
+    checks: Signal<usize>,
+    return_to: String,
+) -> Result<impl View> {
     require_server_owner(cx).await?;
+    // Read so that a check renders it again.
+    let _ = checks.get();
     let shown = open.clone();
     let title_id = element_id(cx);
     let install_url = href!(install).resolve(cx);
@@ -350,12 +368,15 @@ async fn install(cx: &Cx, Form(form): Form<ReturnForm>) -> Result<SeeOther> {
     Ok(back(cx, &form.return_to))
 }
 
-/// Asks GitHub for the latest release now.
-#[route(POST "./check")]
-async fn check(cx: &Cx, Form(form): Form<ReturnForm>) -> Result<SeeOther> {
+/// Asks GitHub for the latest release now, from the settings page's card, and returns
+/// whether it is newer than the running panel. It answers requests of its own, so it
+/// checks access itself.
+#[procedure]
+async fn check_for_updates(cx: &Cx) -> Result<bool> {
     require_server_owner(cx).await?;
-    Updater::get(cx).check_now().await;
-    Ok(back(cx, &form.return_to))
+    let updater = Updater::get(cx);
+    updater.check_now().await;
+    Ok(updater.available().is_some())
 }
 
 /// The version the panel runs. Pages ask for it while an update installs, and reload
@@ -373,13 +394,21 @@ pub(super) fn version_url(cx: &Cx) -> String {
 
 /// The settings page's card about the running version and the latest release, with
 /// buttons that look for a newer one and that open `open`'s dialog to install it.
-#[component]
-pub(super) async fn version_card(cx: &Cx, open: &Signal<bool>, return_to: &str) -> Result<impl View> {
+///
+/// Looking for one asks GitHub without a reload, then raises `checks`, the count of the
+/// checks made, which renders the card and the page's dialog again, and sends the
+/// `update-checked` event up the page for the layout. A shard answers requests of its own, so
+/// it checks access itself.
+#[shard]
+pub(super) async fn version_card(cx: &Cx, open: Signal<bool>, checks: Signal<usize>) -> Result<impl View> {
+    require_server_owner(cx).await?;
+    // Read so that a check renders it again.
+    let _ = checks.get();
     let updater = Updater::get(cx);
     let check_result = updater.check();
     let available = updater.available();
-    let open = open.clone();
-    let check_url = href!(check).resolve(cx);
+    let checking = signal(cx, || false);
+    let button_id = element_id(cx);
 
     Ok(view! {
         settings_card(
@@ -425,15 +454,28 @@ pub(super) async fn version_card(cx: &Cx, open: &Signal<bool>, return_to: &str) 
                 </p>
             }
             <div class="flex flex-wrap gap-2">
-                <form method="post" action=(&check_url)>
-                    <input type="hidden" name="return_to" value=(return_to)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        attrs: attributes! { type="submit" },
+                button(
+                    variant: ButtonVariant::Outline,
+                    attrs: attributes! {
+                        id=(&button_id)
+                        type="button"
+                        :disabled=$(checking.get())
+                        @click=$(async |_e: Event| {
+                            checking.set(true);
+                            check_for_updates().await;
+                            checking.set(false);
+                            checks.increment();
+                            raw!(
+                                "document.getElementById(${button_id})?.dispatchEvent(new CustomEvent('update-checked', { bubbles: true }))",
+                                ()
+                            );
+                        })
+                    },
+                    <span class="inline-flex" :class=$(if checking.get() { "inline-flex animate-spin" } else { "inline-flex" })>
                         icon(data: iconify_icon!("lucide:refresh-cw"))
-                        "Check for updates"
-                    )
-                </form>
+                    </span>
+                    $(if checking.get() { "Checking…" } else { "Check for updates" })
+                )
                 if let Some(release) = &available {
                     button(
                         attrs: attributes! { type="button" @click=$(|_e: Event| open.set(true)) },

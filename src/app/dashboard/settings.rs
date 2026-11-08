@@ -45,6 +45,8 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
     let removing = signal(cx, || false);
     let open_removing = removing.clone();
     let updating = signal(cx, || false);
+    // How many times the version card asked GitHub, which renders it and the dialog again.
+    let checks = signal(cx, || 0usize);
     let here = href!(page).resolve(cx);
     let time_zone_url = href!(set_time_zone).resolve(cx);
     let time_zone_id = element_id(cx);
@@ -177,9 +179,9 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
                     "Change them with OXPLOY_CADDY_ADMIN, OXPLOY_HTTP_PORT and OXPLOY_HTTPS_PORT. The Caddy belongs to oxploy, which replaces its whole configuration."
                 )
             )
-            version_card(open: &updating, return_to: &here)
+            version_card(open: updating.clone(), checks: checks.clone())
         </div>
-        update_dialog(open: updating.clone(), return_to: here.clone())
+        update_dialog(open: updating.clone(), checks: checks.clone(), return_to: here.clone())
         if let Some(panel) = &panel {
             remove_dialog(open: &removing, host: &panel.host, panel: &ports.panel, action: &remove_url)
         }
