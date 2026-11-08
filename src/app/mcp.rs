@@ -22,7 +22,7 @@ mod server_status;
 mod service_usage;
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -77,8 +77,13 @@ enum Scope {
     /// The machine, oxploy itself, and every app it runs.
     Server,
     /// The tools of one organization's apps that were turned on, all of them or only
-    /// the ones picked for the token.
-    Organization { id: u64, name: String, reach: Reach },
+    /// the ones picked for the token, named `token`.
+    Organization {
+        id: u64,
+        name: String,
+        reach: Reach,
+        token: String,
+    },
 }
 
 impl Scope {
@@ -94,6 +99,7 @@ impl Scope {
             id,
             name: organization.name,
             reach: token.reach(cx).await?,
+            token: token.name.clone(),
         }))
     }
 }
@@ -160,10 +166,22 @@ async fn answer(cx: &Cx, scope: &Scope, message: &Value) -> Option<Value> {
             Err(error) => Err(failed("tools/list", &error)),
         },
         ("tools/call", Scope::Server) => call_tool(cx, params).await,
-        ("tools/call", Scope::Organization { id, reach, .. }) => match apps::call(cx, *id, reach, params).await {
-            Ok(outcome) => outcome,
-            Err(error) => Err(failed("tools/call", &error)),
-        },
+        ("tools/call", Scope::Organization { id, name, reach, token }) => {
+            let started = Instant::now();
+            let outcome = match apps::call(cx, *id, reach, params).await {
+                Ok(outcome) => outcome,
+                Err(error) => Err(failed("tools/call", &error)),
+            };
+            // Which client called which app's tool, without its arguments, which may
+            // carry people's data.
+            let tool = params.get("name").and_then(Value::as_str).unwrap_or_default();
+            eprintln!(
+                "oxploy: the MCP token {token:?} of {name} called {tool:?}: {}, in {} ms",
+                how_it_went(&outcome),
+                started.elapsed().as_millis()
+            );
+            outcome
+        }
         _ => Err(Failure::new(METHOD_NOT_FOUND, format!("Unknown method: {method}."))),
     };
     Some(match outcome {
@@ -241,6 +259,16 @@ async fn call_tool(cx: &Cx, params: &Value) -> Result<Value, Failure> {
             eprintln!("oxploy: the MCP tool {name} failed: {error}");
             Err(Failure::new(INTERNAL_ERROR, "The tool failed. Try again later."))
         }
+    }
+}
+
+/// How a call to a tool went, for the log: `ok`, the tool's own failure, or the error
+/// the client got.
+fn how_it_went(outcome: &Result<Value, Failure>) -> String {
+    match outcome {
+        Ok(result) if result.get("isError") == Some(&Value::Bool(true)) => "the tool failed".to_owned(),
+        Ok(_) => "ok".to_owned(),
+        Err(failure) => format!("error {} {:?}", failure.code, failure.message),
     }
 }
 
@@ -403,7 +431,12 @@ mod tests {
     #[tokio::test]
     async fn an_organization_token_reaches_its_apps_and_not_the_server() {
         let cx = CxTestBuilder::new().build();
-        let scope = Scope::Organization { id: 7, name: "Porta Global".to_owned(), reach: Reach::All };
+        let scope = Scope::Organization {
+            id: 7,
+            name: "Porta Global".to_owned(),
+            reach: Reach::All,
+            token: "Telegram bot".to_owned(),
+        };
 
         let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
         let initialized = answer(&cx, &scope, &message).await.unwrap();
@@ -490,6 +523,16 @@ mod tests {
         assert_eq!(lines_of(&dir.join("missing.log"), 10, None), "");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn logs_how_a_call_went() {
+        assert_eq!(how_it_went(&Ok(tool_result("{}".to_owned(), false))), "ok");
+        assert_eq!(how_it_went(&Ok(tool_result("down".to_owned(), true))), "the tool failed");
+        assert_eq!(
+            how_it_went(&Err(Failure::new(INVALID_PARAMS, "Unknown tool: shop__purge."))),
+            "error -32602 \"Unknown tool: shop__purge.\""
+        );
     }
 
     #[test]

@@ -207,6 +207,7 @@ mod tests {
             id: 7,
             name: "Porta Global".to_owned(),
             reach: Reach::Picked(vec![(app.id, "list_requests".to_owned())]),
+            token: "Telegram bot".to_owned(),
         };
         let call = |tool: &str| {
             json!({

@@ -148,7 +148,9 @@ in the dialog that makes it, none unless some are; its **Tools** button changes 
 later, and its row warns when it reaches no tool. Turning a tool off in the app's tab
 takes it from every token, and turning it back on gives it back to the tokens that had
 it picked. A call to a tool the token does not reach gets the same error as a tool that
-does not exist. Tokens made before tools could be picked reach all of them.
+does not exist, and each call an organization's token makes is logged with the token,
+the tool, how it went and how long it took, but not its arguments. Tokens made before
+tools could be picked reach all of them.
 
 A server token, which only the super admin makes, reads the machine, oxploy itself and
 every app it runs, across organizations. Its tools only read:
