@@ -3,6 +3,10 @@
 //! usage, logs and deployments of every app it runs; with an organization's, the tools
 //! of its apps that were turned on, which [`apps`] passes on to each app's own server.
 //!
+//! A server token made to manage also gets the tools in [`MANAGING`], which install
+//! oxploy's updates and manage the organizations' tokens and the tools turned on in
+//! their apps. Every call to one is logged.
+//!
 //! It speaks the Model Context Protocol over Streamable HTTP in its simplest form: each
 //! POST carries one JSON-RPC message and gets plain JSON back, with no session and no
 //! event stream, which is all a server with only tools needs. A client sends one of the
@@ -14,12 +18,20 @@
 //! [`definitions`] and [`call_tool`].
 
 mod app_logs;
+mod app_mcp_tools;
 mod apps;
+mod create_mcp_token;
 mod deployment_log;
 mod list_deployments;
+mod list_mcp_tokens;
 mod list_services;
+mod revoke_mcp_token;
 mod server_status;
 mod service_usage;
+mod set_app_tools;
+mod set_token_tools;
+mod tokens;
+mod update_oxploy;
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
@@ -64,18 +76,44 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 
-/// What the server tells an agent with a server token about itself when it connects.
+/// What the server tells an agent with a server token that reads about itself when it
+/// connects.
 const INSTRUCTIONS: &str = "oxploy deploys Rust apps on this server and runs each as a \
-    process of its own. This MCP server reads the machine, oxploy itself, and the usage, \
-    logs and deployments of every app, across all organizations. It only reads: changes \
-    are made in the oxploy panel. The tools that take one app name it by its app_name, \
-    as list_services returns it. Usage history covers only the last 10 minutes, kept in \
-    memory since oxploy started. Times are in the panel's time zone.";
+    process of its own. This MCP server reads the machine, oxploy itself, the usage, \
+    logs and deployments of every app, across all organizations, and the MCP tokens. \
+    With this token it only reads: changes are made in the oxploy panel. The tools that \
+    take one app name it by its app_name, as list_services returns it. Usage history \
+    covers only the last 10 minutes, kept in memory since oxploy started. Times are in \
+    the panel's time zone.";
+
+/// What the server tells an agent with a server token that manages about itself when it
+/// connects.
+const MANAGING_INSTRUCTIONS: &str = "oxploy deploys Rust apps on this server and runs \
+    each as a process of its own. This MCP server reads the machine, oxploy itself, the \
+    usage, logs and deployments of every app, across all organizations, and the MCP \
+    tokens. With this token it also manages: update_oxploy installs oxploy's newest \
+    release, and the other tools that change something manage the organizations' MCP \
+    tokens and the tools turned on in their apps. Server tokens and everything else are \
+    changed in the oxploy panel. A token's secret is shown once, by create_mcp_token: \
+    hand it to its client and never repeat it in a reply. The tools that take one app \
+    name it by its app_name, as list_services returns it. Usage history covers only the \
+    last 10 minutes, kept in memory since oxploy started. Times are in the panel's time \
+    zone.";
+
+/// The tools only a server token that manages gets.
+const MANAGING: [&str; 5] = [
+    update_oxploy::NAME,
+    set_app_tools::NAME,
+    set_token_tools::NAME,
+    create_mcp_token::NAME,
+    revoke_mcp_token::NAME,
+];
 
 /// What a token reaches.
 enum Scope {
-    /// The machine, oxploy itself, and every app it runs.
-    Server,
+    /// The machine, oxploy itself, and every app it runs, with the tools that manage
+    /// when the token named `token` `manages`.
+    Server { token: String, manages: bool },
     /// The tools of one organization's apps that were turned on, all of them or only
     /// the ones picked for the token, named `token`.
     Organization {
@@ -90,7 +128,10 @@ impl Scope {
     /// What `token` reaches, or `None` if its organization is gone.
     async fn of(cx: &Cx, token: &McpToken) -> Result<Option<Scope>> {
         let Some(id) = token.organization_id else {
-            return Ok(Some(Scope::Server));
+            return Ok(Some(Scope::Server {
+                token: token.name.clone(),
+                manages: token.manages(),
+            }));
         };
         let Some(organization) = Organization::filter_by_id(id).first().exec(&mut db(cx)).await? else {
             return Ok(None);
@@ -160,12 +201,12 @@ async fn answer(cx: &Cx, scope: &Scope, message: &Value) -> Option<Value> {
     let outcome = match (method, scope) {
         ("initialize", scope) => Ok(initialize(params, scope)),
         ("ping", _) => Ok(json!({})),
-        ("tools/list", Scope::Server) => Ok(json!({ "tools": definitions() })),
+        ("tools/list", Scope::Server { manages, .. }) => Ok(json!({ "tools": definitions(*manages) })),
         ("tools/list", Scope::Organization { id, reach, .. }) => match apps::definitions(cx, *id, reach).await {
             Ok(tools) => Ok(json!({ "tools": tools })),
             Err(error) => Err(failed("tools/list", &error)),
         },
-        ("tools/call", Scope::Server) => call_tool(cx, params).await,
+        ("tools/call", Scope::Server { token, manages }) => call_tool(cx, token, *manages, params).await,
         ("tools/call", Scope::Organization { id, name, reach, token }) => {
             let started = Instant::now();
             let outcome = match apps::call(cx, *id, reach, params).await {
@@ -198,7 +239,8 @@ fn initialize(params: &Value, scope: &Scope) -> Value {
         .filter(|version| PROTOCOL_VERSIONS.contains(version))
         .unwrap_or(PROTOCOL_VERSIONS[0]);
     let instructions = match scope {
-        Scope::Server => INSTRUCTIONS.to_owned(),
+        Scope::Server { manages: false, .. } => INSTRUCTIONS.to_owned(),
+        Scope::Server { manages: true, .. } => MANAGING_INSTRUCTIONS.to_owned(),
         Scope::Organization { name, .. } => format!(
             "oxploy deploys Rust apps on this server. This MCP server passes on the tools of \
              the apps of the organization {name}, which each app's own MCP server offers. \
@@ -225,24 +267,45 @@ fn failed(method: &str, error: &topcoat::Error) -> Failure {
     Failure::new(INTERNAL_ERROR, "The request failed. Try again later.")
 }
 
-/// Every tool's name, description and arguments, for `tools/list`.
-fn definitions() -> Vec<Value> {
-    vec![
+/// The name, description and arguments of every tool a server token gets, for
+/// `tools/list`: the ones that read, and the ones that manage when it `manages`.
+fn definitions(manages: bool) -> Vec<Value> {
+    let mut tools = vec![
         server_status::definition(),
         list_services::definition(),
         service_usage::definition(),
         app_logs::definition(),
         list_deployments::definition(),
         deployment_log::definition(),
-    ]
+        list_mcp_tokens::definition(),
+        app_mcp_tools::definition(),
+    ];
+    if manages {
+        tools.extend([
+            update_oxploy::definition(),
+            set_app_tools::definition(),
+            set_token_tools::definition(),
+            create_mcp_token::definition(),
+            revoke_mcp_token::definition(),
+        ]);
+    }
+    tools
 }
 
-/// Runs the tool `params` names. Arguments the tool refuses come back as the tool's own
-/// error, which the agent reads and can correct; an unknown tool or a database failure
-/// is an error of the protocol.
-async fn call_tool(cx: &Cx, params: &Value) -> Result<Value, Failure> {
+/// Runs the tool `params` names for the server token named `token`, which `manages` or
+/// not. Arguments the tool refuses come back as the tool's own error, which the agent
+/// reads and can correct; an unknown tool, one that manages for a token that does not,
+/// or a database failure is an error of the protocol. Each call to a tool that manages
+/// is logged, without its arguments, which may hold a token's name or tools.
+async fn call_tool(cx: &Cx, token: &str, manages: bool, params: &Value) -> Result<Value, Failure> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let unknown = || Failure::new(INVALID_PARAMS, format!("Unknown tool: {name}."));
+    let managing = MANAGING.contains(&name);
+    if managing && !manages {
+        return Err(unknown());
+    }
+    let started = Instant::now();
     let outcome = match name {
         server_status::NAME => server_status::call(cx, arguments).await,
         list_services::NAME => list_services::call(cx, arguments).await,
@@ -250,16 +313,31 @@ async fn call_tool(cx: &Cx, params: &Value) -> Result<Value, Failure> {
         app_logs::NAME => app_logs::call(cx, arguments).await,
         list_deployments::NAME => list_deployments::call(cx, arguments).await,
         deployment_log::NAME => deployment_log::call(cx, arguments).await,
-        _ => return Err(Failure::new(INVALID_PARAMS, format!("Unknown tool: {name}."))),
+        list_mcp_tokens::NAME => list_mcp_tokens::call(cx, arguments).await,
+        app_mcp_tools::NAME => app_mcp_tools::call(cx, arguments).await,
+        update_oxploy::NAME => update_oxploy::call(cx, arguments).await,
+        set_app_tools::NAME => set_app_tools::call(cx, arguments).await,
+        set_token_tools::NAME => set_token_tools::call(cx, arguments).await,
+        create_mcp_token::NAME => create_mcp_token::call(cx, arguments).await,
+        revoke_mcp_token::NAME => revoke_mcp_token::call(cx, arguments).await,
+        _ => return Err(unknown()),
     };
-    match outcome {
+    let result = match outcome {
         Ok(Ok(data)) => Ok(tool_result(data.to_string(), false)),
         Ok(Err(refusal)) => Ok(tool_result(refusal, true)),
         Err(error) => {
             eprintln!("oxploy: the MCP tool {name} failed: {error}");
             Err(Failure::new(INTERNAL_ERROR, "The tool failed. Try again later."))
         }
+    };
+    if managing {
+        eprintln!(
+            "oxploy: the MCP token {token:?} of the server called {name:?}: {}, in {} ms",
+            how_it_went(&result),
+            started.elapsed().as_millis()
+        );
     }
+    result
 }
 
 /// How a call to a tool went, for the log: `ok`, the tool's own failure, or the error
@@ -400,8 +478,13 @@ mod tests {
 
     use super::*;
 
+    /// A server token that only reads.
+    fn reading() -> Scope {
+        Scope::Server { token: "Claude Local".to_owned(), manages: false }
+    }
+
     async fn send(message: Value) -> Option<Value> {
-        answer(&CxTestBuilder::new().build(), &Scope::Server, &message).await
+        answer(&CxTestBuilder::new().build(), &reading(), &message).await
     }
 
     #[tokio::test]
@@ -478,12 +561,55 @@ mod tests {
                 app_logs::NAME,
                 list_deployments::NAME,
                 deployment_log::NAME,
+                list_mcp_tokens::NAME,
+                app_mcp_tools::NAME,
             ]
         );
         for tool in tools {
             assert_eq!(tool["annotations"]["readOnlyHint"], true, "{}", tool["name"]);
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_token_that_manages_gets_the_tools_that_manage() {
+        let cx = CxTestBuilder::new().build();
+        let managing = Scope::Server { token: "Claude Local".to_owned(), manages: true };
+        let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+
+        let listed = answer(&cx, &managing, &list).await.unwrap();
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let changing: Vec<_> = tools
+            .iter()
+            .filter(|tool| tool["annotations"]["readOnlyHint"] == false)
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(changing, MANAGING);
+        for tool in tools {
+            assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
+        }
+
+        // A token that reads is not told of them, and calling one is calling an
+        // unknown tool, before it can do anything.
+        let listed = answer(&cx, &reading(), &list).await.unwrap();
+        let names: Vec<_> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        for name in MANAGING {
+            assert!(!names.iter().any(|listed| listed == name), "{name}");
+            let call = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": name } });
+            let refused = answer(&cx, &reading(), &call).await.unwrap();
+            assert_eq!(refused["error"]["code"], INVALID_PARAMS, "{name}");
+            assert_eq!(refused["error"]["message"], format!("Unknown tool: {name}."), "{name}");
+        }
+
+        let initialized = answer(&cx, &managing, &json!({ "jsonrpc": "2.0", "id": 3, "method": "initialize" })).await.unwrap();
+        assert!(initialized["result"]["instructions"].as_str().unwrap().contains("also manages"));
+        let initialized = answer(&cx, &reading(), &json!({ "jsonrpc": "2.0", "id": 4, "method": "initialize" })).await.unwrap();
+        assert!(initialized["result"]["instructions"].as_str().unwrap().contains("only reads"));
     }
 
     #[tokio::test]

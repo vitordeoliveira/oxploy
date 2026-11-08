@@ -1,11 +1,15 @@
 //! Access to the panel's MCP server: the tokens AI agents, such as a bot or Claude Code,
 //! send to read the server over the Model Context Protocol.
 //!
-//! Each token is made in the panel, which shows it once. Only its hash is stored, as
-//! with the sign-in sessions, so a leaked database cannot be used. A token reaches one
-//! of two things: the server, for the super admin, with the machine, oxploy itself and
-//! every app it runs; or one organization, with the tools of its apps that were turned
-//! on, all of them or only the ones picked for it. See [`Reach`].
+//! Each token is shown once when it is made. Only its hash is stored, as with the
+//! sign-in sessions, so a leaked database cannot be used. A token reaches one of two
+//! things: the server, for the super admin, with the machine, oxploy itself and every
+//! app it runs; or one organization, with the tools of its apps that were turned on, all
+//! of them or only the ones picked for it. See [`Reach`].
+//!
+//! A server token reads, and one made to manage also installs oxploy's updates and
+//! manages the organizations' tokens and the tools turned on in their apps. Server
+//! tokens are only made in the panel, so an agent cannot make itself one that manages.
 
 use sha2::{Digest, Sha256};
 use toasty::Db;
@@ -49,6 +53,11 @@ pub struct McpToken {
     /// organization's apps, rather than all of them. `None`, as for a server token or an
     /// organization's token made before tools could be picked, is no.
     pub picks_tools: Option<bool>,
+
+    /// Whether a server token also manages: installs oxploy's updates, and manages the
+    /// organizations' tokens and the tools turned on in their apps. `None`, as for an
+    /// organization's token or a server token made before tokens could manage, is no.
+    pub manages: Option<bool>,
 }
 
 /// A tool of an organization's app that was picked for one of its tokens. It reaches the
@@ -129,7 +138,8 @@ impl McpToken {
     /// and returns it with the token itself, which is never stored and so cannot be
     /// shown again. An organization's token reaches the tools in `picked`, each by its
     /// app's service and its name, or all of them with `None`; a server token reaches
-    /// the server, whatever `picked` says.
+    /// the server, whatever `picked` says, and also manages with `manages`, which an
+    /// organization's token ignores.
     ///
     /// Returns why not instead if the name has no letters or digits, is too long, or
     /// reads like the name of another of the same tokens: as clients know each token by
@@ -139,6 +149,7 @@ impl McpToken {
         organization_id: Option<u64>,
         name: &str,
         picked: Option<&[(u64, String)]>,
+        manages: bool,
     ) -> Result<Result<(McpToken, String), IssueError>> {
         let name = name.trim();
         if slug(name).is_empty() || name.chars().count() > MAX_NAME_LEN {
@@ -160,18 +171,28 @@ impl McpToken {
             created_at: now(),
             last_used_at: None,
             picks_tools: organization_id.map(|_| picked.is_some()),
+            manages: organization_id.is_none().then_some(manages),
         })
         .exec(&mut db(cx))
         .await?;
-        for (service_id, tool) in picked.unwrap_or_default() {
-            token.pick(cx, *service_id, tool, true).await?;
-        }
+        token.set_picked(cx, picked.unwrap_or_default()).await?;
         Ok(Ok((token, secret)))
     }
 
     /// Whether it reaches only the tools picked for it.
     pub fn picks_tools(&self) -> bool {
         self.picks_tools == Some(true)
+    }
+
+    /// Whether it is a server token that also manages.
+    pub fn manages(&self) -> bool {
+        self.organization_id.is_none() && self.manages == Some(true)
+    }
+
+    /// The token with this ID, if it is an organization's, with that organization's ID.
+    pub async fn find_of_organization(cx: &Cx, id: u64) -> Result<Option<(McpToken, u64)>> {
+        let token = McpToken::filter_by_id(id).first().exec(&mut db(cx)).await?;
+        Ok(token.and_then(|token| token.organization_id.map(|organization_id| (token, organization_id))))
     }
 
     /// The tools picked for it, each by its app's service and its name, whether or not
@@ -196,6 +217,16 @@ impl McpToken {
     /// kept either way, so going back to picking finds them as they were.
     pub async fn set_picks_tools(&mut self, cx: &Cx, picks: bool) -> Result<()> {
         self.update().picks_tools(Some(picks)).exec(&mut db(cx)).await?;
+        Ok(())
+    }
+
+    /// Has the tools in `picked` be the ones picked for it, each by its app's service and
+    /// its name, in place of those picked before.
+    pub async fn set_picked(&self, cx: &Cx, picked: &[(u64, String)]) -> Result<()> {
+        McpTokenTool::filter_by_token_id(self.id).delete().exec(&mut db(cx)).await?;
+        for (service_id, name) in picked {
+            self.pick(cx, *service_id, name, true).await?;
+        }
         Ok(())
     }
 

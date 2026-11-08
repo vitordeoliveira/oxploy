@@ -99,6 +99,8 @@ struct Refused {
     problem: IssueError,
     /// The tools picked, or `None` for every tool turned on.
     picked: Option<Vec<(u64, String)>>,
+    /// Whether a server token was to manage.
+    manages: bool,
 }
 
 /// What a form left for the page to show once, after it sent the browser back.
@@ -170,9 +172,10 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
 /// Makes a token, and sends the browser on to the page, which shows it once: only its
 /// hash is kept. A name it turns down goes back to the dialog with why.
 ///
-/// The form sends `kind` and `name`. An organization's token reaches every tool turned
-/// on when it sends `all`, and otherwise only the tools it sends as `tool`, each as
-/// `<service_id>:<name>`, of those turned on in the organization's apps.
+/// The form sends `kind` and `name`. A server token also manages when it sends
+/// `manages`. An organization's token reaches every tool turned on when it sends `all`,
+/// and otherwise only the tools it sends as `tool`, each as `<service_id>:<name>`, of
+/// those turned on in the organization's apps.
 #[route(POST "./issue")]
 async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<SeeOther> {
     let value_of = |key: &str| {
@@ -208,7 +211,8 @@ async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<See
             (Some(organization.name), picked)
         }
     };
-    let shown = match McpToken::issue(cx, owner, &name, picked.as_deref()).await? {
+    let manages = kind == Kind::Server && fields.iter().any(|(name, _)| name == "manages");
+    let shown = match McpToken::issue(cx, owner, &name, picked.as_deref(), manages).await? {
         Ok((token, secret)) => Shown::Issued(Issued {
             kind,
             client: client_name(organization.as_deref(), &token.name),
@@ -220,6 +224,7 @@ async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<See
             name,
             problem,
             picked,
+            manages,
         }),
     };
     let id = leave(signed_in.user.id, shown);
@@ -413,7 +418,7 @@ async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
                 tokens_section(
                     kind: Kind::Server,
                     title: "Server",
-                    text: "Reads the machine, oxploy itself, and the usage, logs and deployments of every app on it. Only you see this, as the server's owner, and it is the same in every organization. Its tools only read.",
+                    text: "Reads the machine, oxploy itself, and the usage, logs and deployments of every app on it. A token made to manage also installs oxploy's updates and manages the organizations' tokens and the tools turned on in their apps. Only you see this, as the server's owner, and it is the same in every organization.",
                     symbol: iconify_icon!("lucide:server"),
                     endpoint: &endpoint,
                     issued: issued_server,
@@ -633,6 +638,13 @@ async fn token_row(
                 </span>
                 if let Some(reaching) = reaching {
                     reach_summary(reaching: reaching, total: total)
+                } else if token.manages() {
+                    <span class="flex items-center gap-1 text-xs font-medium text-primary">
+                        icon(data: iconify_icon!("lucide:shield-check"), size: 12, attrs: attributes! { class="shrink-0" })
+                        "Reads and manages"
+                    </span>
+                } else {
+                    <span class="text-xs text-muted-foreground">"Reads only"</span>
                 }
             </div>
             if let Some(choosing) = choosing {
@@ -965,6 +977,8 @@ async fn issue_dialog(
     let all_id = element_id(cx);
     let picked = refused.and_then(|refused| refused.picked.as_deref());
     let all = signal(cx, || refused.is_some_and(|refused| refused.picked.is_none()));
+    let manages_id = element_id(cx);
+    let manages = refused.is_some_and(|refused| refused.manages);
     let problem = refused.map(|refused| match refused.problem {
         IssueError::BadName => format!(
             "Give it a name with letters or digits, of up to {MAX_NAME_LEN} characters."
@@ -981,7 +995,7 @@ async fn issue_dialog(
     let (heading, about) = match kind {
         Kind::Server => (
             "New server token".to_owned(),
-            "A token for one client, such as a bot. It reads the server and every app on it, and is shown only once.",
+            "A token for one client, such as Claude Code. It reads the server and every app on it, and is shown only once.",
         ),
         Kind::Organization => (
             format!("New token for {title}"),
@@ -1024,6 +1038,17 @@ async fn issue_dialog(
                             )
                         }
                     )
+                    if kind == Kind::Server {
+                        <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+                            <div class="flex flex-col gap-0.5">
+                                <label for=(&manages_id) class="text-sm font-medium">"Can manage"</label>
+                                <p class="text-xs text-muted-foreground">
+                                    "It also installs oxploy's updates and manages the organizations' tokens and the tools turned on in their apps, over MCP. Clients such as Claude Code ask you before each change, unless told not to. Server tokens are only made here."
+                                </p>
+                            </div>
+                            switch(attrs: attributes! { id=(&manages_id) name="manages" class="mt-0.5" checked=(manages.then_some("")) })
+                        </div>
+                    }
                     if let Some(offered) = offered {
                         <div class="flex flex-col gap-3">
                             <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">

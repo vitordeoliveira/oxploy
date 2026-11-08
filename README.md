@@ -153,16 +153,35 @@ the tool, how it went and how long it took, but not its arguments. Tokens made b
 tools could be picked reach all of them.
 
 A server token, which only the super admin makes, reads the machine, oxploy itself and
-every app it runs, across organizations. Its tools only read:
+every app it runs, across organizations, with these tools:
 
 | Tool | What it returns |
 | --- | --- |
-| `server_status` | The machine's CPU, memory, disk and network; oxploy's version, updates and Caddy; how many apps stand where |
+| `server_status` | The machine's CPU, memory, disk and network; oxploy's version, updates and the one being installed, and Caddy; how many apps stand where |
 | `list_services` | Every app, with its status, port, domains, release, usage now, crashes and latest deployment |
 | `service_usage` | One app's process, its CPU and memory now and over the last 10 minutes, its crashes and its storage |
 | `app_logs` | The end of an app's log, or only its lines with a text |
 | `list_deployments` | An app's latest deployments |
 | `deployment_log` | The end of a deployment's log |
+| `list_mcp_tokens` | The server's tokens and each organization's, with the tools turned on in its apps and the ones each token reaches, never their secrets |
+| `app_mcp_tools` | The tools an app's MCP server offers, what each declares it does, and which are turned on |
+
+A server token made with **Can manage** on also gets the tools that change something,
+and its row says so. Clients such as Claude Code ask before each call unless told not
+to, and each call is logged with the token, the tool, how it went and how long it took:
+
+| Tool | What it does |
+| --- | --- |
+| `update_oxploy` | Installs oxploy's newest release, as the Update button does, and answers at once |
+| `set_app_tools` | Turns tools of an app's MCP server on or off, as its MCP tab does |
+| `set_token_tools` | Has an organization's token reach every tool turned on, or only the ones given |
+| `create_mcp_token` | Makes an organization's token with the tools picked, and returns its secret and the `claude mcp add` command once |
+| `revoke_mcp_token` | Revokes an organization's token |
+
+Server tokens are only made and revoked on the page, so an agent cannot make itself a
+token that manages, and the tools that manage reach only the organizations' tokens. A
+token that only reads gets the same error for them as for a tool that does not exist.
+Server tokens made before tokens could manage only read.
 
 With a new token, the page gives the command that connects Claude Code to it, under a
 name made from the token's: `oxploy-server-<token>` for a server token, or

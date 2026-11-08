@@ -85,7 +85,7 @@ fn back(cx: &Cx, return_to: &str) -> SeeOther {
 /// The panel's address as the browser reached it, such as `http://127.0.0.1:3000`,
 /// which GitHub sends the browser back to and MCP clients connect to. Behind a proxy
 /// that ends HTTPS, the proxy's `X-Forwarded-Proto` keeps it `https`.
-fn panel_url(cx: &Cx) -> Option<String> {
+pub(crate) fn panel_url(cx: &Cx) -> Option<String> {
     let headers = headers(cx);
     let host = match uri(cx).authority() {
         Some(authority) => authority.as_str(),

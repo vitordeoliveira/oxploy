@@ -10,7 +10,7 @@ use crate::features::caddy::{Caddy, CaddyStatus};
 use crate::features::deploy::Deployer;
 use crate::features::monitoring::Monitor;
 use crate::features::service::Service;
-use crate::features::update::{Updater, VERSION};
+use crate::features::update::{Step, Updater, VERSION};
 use crate::features::usage::Load;
 
 /// The name agents call the tool by.
@@ -19,7 +19,8 @@ pub const NAME: &str = "server_status";
 /// What the tool does, for the agent deciding whether to call it.
 const DESCRIPTION: &str = "How the server is doing now. The machine: its name, \
     system, CPUs and uptime, and its CPU, memory, disk and network now, with the peaks \
-    of the last 10 minutes. oxploy itself: its version, whether an update is out, \
+    of the last 10 minutes. oxploy itself: its version, whether an update is out and \
+    how far the one being installed got, \
     whether Caddy, the web server in front of the apps, runs oxploy's configuration, \
     the deployments in progress, and what the panel, its builds and all the apps \
     together take. And how many apps are running, stopped, restarting after a crash, \
@@ -142,10 +143,26 @@ fn oxploy(cx: &Cx) -> Value {
         "uptime": duration(seconds_since(started_at)),
         "update_available": updater.available().map(|release| release.version),
         "update_checked_at": check.at.and_then(super::moment),
+        "update_installing": updater.installation().map(|installation| json!({
+            "version": installation.version,
+            "step": step_code(&installation.step),
+        })),
         "caddy": caddy,
         "deployments_in_progress": deployer.deploying(),
         "now": now,
     })
+}
+
+/// How far the installation of an update got, as the tools say it, with why it failed
+/// when it did.
+pub(super) fn step_code(step: &Step) -> String {
+    match step {
+        Step::Downloading => "downloading".to_owned(),
+        Step::Checking => "checking".to_owned(),
+        Step::WaitingForDeployments(count) => format!("waiting for {count} deployments"),
+        Step::Restarting => "restarting".to_owned(),
+        Step::Failed(why) => format!("failed: {why}"),
+    }
 }
 
 /// What some processes take.

@@ -121,7 +121,7 @@ fn passed_on(definition: &Value, app: &Serving) -> Value {
         "From the app {} ({} / {}).",
         app.service.app_name, app.project, app.service.name
     );
-    tool["name"] = json!(format!("{}{SEPARATOR}{name}", app.service.app_name));
+    tool["name"] = json!(tool_name(&app.service.app_name, name));
     tool["description"] = json!(match definition.get("description").and_then(Value::as_str) {
         Some(description) => format!("{from} {description}"),
         None => from,
@@ -129,14 +129,19 @@ fn passed_on(definition: &Value, app: &Serving) -> Value {
     tool
 }
 
-/// The app's name and the tool's own name in a name as [`passed_on`] makes it.
-fn split(name: &str) -> Option<(&str, &str)> {
+/// The name agents call the app's tool `tool` by, such as `porta-global__list_requests`.
+pub(super) fn tool_name(app_name: &str, tool: &str) -> String {
+    format!("{app_name}{SEPARATOR}{tool}")
+}
+
+/// The app's name and the tool's own name in a name as [`tool_name`] makes it.
+pub(super) fn split(name: &str) -> Option<(&str, &str)> {
     name.split_once(SEPARATOR)
         .filter(|(app, tool)| !app.is_empty() && !tool.is_empty())
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use topcoat::context::CxTestBuilder;
 
     use super::super::{Scope, answer};
@@ -146,7 +151,7 @@ mod tests {
 
     /// An app of the organization that serves MCP, with `list_requests` and `purge`
     /// turned on.
-    async fn app_with_tools(cx: &Cx, organization_id: u64, project: &str) -> Service {
+    pub(in crate::app::mcp) async fn app_with_tools(cx: &Cx, organization_id: u64, project: &str) -> Service {
         let project = Project::add(cx, organization_id, &Details { name: project, description: "" })
             .await
             .unwrap()

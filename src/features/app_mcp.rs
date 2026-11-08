@@ -81,11 +81,16 @@ impl McpTool {
             return Ok(false);
         }
         let mut db = db(cx);
-        let existing = McpTool::filter_by_service_id(service_id)
+        let existing: Vec<_> = McpTool::filter_by_service_id(service_id)
             .exec(&mut db)
             .await?
             .into_iter()
-            .filter(|tool| tool.name == name);
+            .filter(|tool| tool.name == name)
+            .collect();
+        // A tool already on stays as it is, with when it was turned on.
+        if on && !existing.is_empty() {
+            return Ok(true);
+        }
         for tool in existing {
             McpTool::filter_by_id(tool.id).delete().exec(&mut db).await?;
         }
