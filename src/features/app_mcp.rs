@@ -6,12 +6,19 @@
 //! `OXPLOY_MCP_TOKEN` as `Authorization: Bearer <token>`. Caddy answers 404 at that path
 //! on the app's domains, so only oxploy reaches it.
 //!
+//! An external MCP server runs elsewhere, as a service of its own kind, and oxploy calls
+//! it at its URL with the token it takes. Those calls go only over HTTPS, follow no
+//! redirect, which would carry the token elsewhere, and never reach an address of this
+//! machine or its private network, whatever the URL's host resolves to: otherwise a URL
+//! could have oxploy post to a service only it should reach, such as Caddy's admin API.
+//!
 //! oxploy speaks the protocol as a client: it opens a session, then lists the tools or
 //! calls one. A server may answer each request with plain JSON or with an event stream,
 //! and may give the session an ID to send back; oxploy handles both.
 
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -30,6 +37,12 @@ pub const DEFAULT_PATH: &str = "/mcp";
 
 /// The most characters the path may have.
 pub const MAX_PATH_LEN: usize = 200;
+
+/// The most characters an external MCP server's URL may have.
+pub const MAX_URL_LEN: usize = 500;
+
+/// The most characters a token an external MCP server takes may have.
+pub const MAX_TOKEN_LEN: usize = 512;
 
 /// The most characters a tool's name may have, as the protocol suggests.
 const MAX_TOOL_NAME_LEN: usize = 128;
@@ -129,12 +142,13 @@ pub struct Serving {
     pub enabled: Vec<String>,
 }
 
-/// The organization's apps that serve MCP and have tools turned on.
+/// The organization's apps and external MCP servers that serve MCP and have tools
+/// turned on.
 pub async fn serving(cx: &Cx, organization_id: u64) -> Result<Vec<Serving>> {
     let mut serving = Vec::new();
     for project in Project::in_organization(cx, organization_id).await? {
         for service in Service::in_project(cx, project.id).await? {
-            if service.mcp_token_in_use().is_none() {
+            if !service.serves_mcp() {
                 continue;
             }
             let enabled = McpTool::enabled_of(cx, service.id).await?;
@@ -153,17 +167,10 @@ pub async fn serving(cx: &Cx, organization_id: u64) -> Result<Vec<Serving>> {
 /// Lists the tools of each app's MCP server, asking them all at once, so a slow one
 /// only delays the answer by its own time. An app that is not running gets `None`.
 pub async fn list_each(cx: &Cx, apps: Vec<Serving>) -> Vec<(Serving, Option<Result<Listing, ConnectError>>)> {
-    let running = Deployer::get(cx);
     let mut asked = Vec::new();
     for app in apps {
-        let address = match (&app.service.port, &app.service.mcp_path, app.service.mcp_token_in_use()) {
-            (Some(port), Some(path), Some(token)) if running.status(&app.service) == AppStatus::Running => {
-                Some((*port, path.clone(), token.to_owned()))
-            }
-            _ => None,
-        };
-        let listing = address
-            .map(|(port, path, token)| tokio::spawn(async move { list_tools(port, &path, &token).await }));
+        let listing = endpoint(cx, &app.service)
+            .map(|endpoint| tokio::spawn(async move { list_tools(&endpoint).await }));
         asked.push((app, listing));
     }
 
@@ -181,6 +188,158 @@ pub async fn list_each(cx: &Cx, apps: Vec<Serving>) -> Vec<(Serving, Option<Resu
     }
     listed
 }
+
+/// Where oxploy reaches a service's MCP server, and the token it sends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub url: String,
+    pub token: String,
+    /// Whether it runs elsewhere, so the calls go through [`EXTERNAL`] and
+    /// [`EXTERNAL_CALLS`].
+    pub external: bool,
+}
+
+/// Where oxploy reaches the service's MCP server now: an external MCP server's URL, or
+/// an app's port on 127.0.0.1 while it runs. `None` when it serves no MCP, or is an app
+/// that is not running.
+pub fn endpoint(cx: &Cx, service: &Service) -> Option<Endpoint> {
+    if service.is_external() {
+        let (url, token) = (service.mcp_url.clone()?, service.mcp_token.clone()?);
+        return Some(Endpoint { url, token, external: true });
+    }
+    let (port, path, token) = (service.port?, service.mcp_path.as_deref()?, service.mcp_token_in_use()?);
+    (Deployer::get(cx).status(service) == AppStatus::Running).then(|| Endpoint {
+        url: format!("http://127.0.0.1:{port}{path}"),
+        token: token.to_owned(),
+        external: false,
+    })
+}
+
+/// An external MCP server's URL as oxploy keeps it, trimmed, or `None` if oxploy does
+/// not call it: an `https` URL with a host, without a user or a fragment, of up to
+/// [`MAX_URL_LEN`] characters. Where its host resolves is checked on each call.
+pub fn external_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.len() > MAX_URL_LEN || url.contains('#') || url.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let uri: ureq::http::Uri = url.parse().ok()?;
+    let authority = uri.authority()?;
+    // What follows the host, which is a port when there is any.
+    let after_host = authority.as_str().strip_prefix(authority.host()).unwrap_or(":");
+    let port_is_valid = after_host.is_empty()
+        || after_host
+            .strip_prefix(':')
+            .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0));
+    let valid = uri.scheme_str() == Some("https")
+        && !authority.host().is_empty()
+        && !authority.as_str().contains('@')
+        && port_is_valid;
+    valid.then(|| url.to_owned())
+}
+
+/// Whether `token` can be one an external MCP server takes, sent in a header: from 1
+/// to [`MAX_TOKEN_LEN`] visible ASCII characters.
+pub fn is_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= MAX_TOKEN_LEN && token.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Whether oxploy may call `ip` for an external MCP server: an address on the public
+/// internet, not one of this machine or of a private, shared or reserved network.
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_v4(ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(mapped) => is_public_v4(mapped),
+            None => is_public_v6(ip),
+        },
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || a == 0
+        // Shared address space, as behind a carrier's NAT.
+        || (a == 100 && (64..128).contains(&b))
+        // Protocol assignments.
+        || (a == 192 && b == 0 && c == 0)
+        // Benchmarking.
+        || (a == 198 && (b == 18 || b == 19))
+        // Reserved.
+        || a >= 240)
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        // Unique local addresses.
+        || (first & 0xfe00) == 0xfc00
+        // Link-local addresses.
+        || (first & 0xffc0) == 0xfe80
+        // Documentation.
+        || (first == 0x2001 && ip.segments()[1] == 0x0db8)
+        // IPv4-compatible and other addresses under ::/96.
+        || ip.segments()[..6] == [0; 6])
+}
+
+/// Resolves hosts as `ureq` does, keeping only the public addresses, so a call to an
+/// external MCP server never reaches this machine or its private network.
+#[derive(Debug, Default)]
+struct PublicOnly(ureq::unversioned::resolver::DefaultResolver);
+
+impl ureq::unversioned::resolver::Resolver for PublicOnly {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let resolved = self.0.resolve(uri, config, timeout)?;
+        let mut public = self.empty();
+        for address in resolved.iter().filter(|address| is_public(address.ip())) {
+            public.push(*address);
+        }
+        if public.is_empty() {
+            return Err(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "its host is an address of this machine or of a private network, which oxploy does not call",
+            )));
+        }
+        Ok(public)
+    }
+}
+
+/// An agent for external MCP servers, which waits up to `timeout`.
+fn external_agent(timeout: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .user_agent("oxploy")
+        .https_only(true)
+        .max_redirects(0)
+        .proxy(None)
+        .build();
+    ureq::Agent::with_parts(
+        config,
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PublicOnly::default(),
+    )
+}
+
+/// Calls external MCP servers.
+static EXTERNAL: LazyLock<ureq::Agent> = LazyLock::new(|| external_agent(TIMEOUT));
+
+/// Calls a tool of an external MCP server, which may take longer than listing.
+static EXTERNAL_CALLS: LazyLock<ureq::Agent> = LazyLock::new(|| external_agent(CALL_TIMEOUT));
 
 /// Whether `path` can be where an app serves MCP: a path below the root, such as
 /// `/mcp` or `/api/mcp`. The root would hide the whole app from its domains.
@@ -263,57 +422,51 @@ pub enum ConnectError {
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unreachable(error) => write!(f, "the app could not be reached: {error}"),
-            Self::Refused(status) => write!(f, "the app turned oxploy away with {status}"),
-            Self::NotFound => f.write_str("the app serves no MCP at this path"),
-            Self::NotMcp(problem) => write!(f, "the app's answer is not MCP: {problem}"),
+            Self::Unreachable(error) => write!(f, "the MCP server could not be reached: {error}"),
+            Self::Refused(status) => write!(f, "the MCP server turned oxploy away with {status}"),
+            Self::NotFound => f.write_str("nothing serves MCP at this address"),
+            Self::NotMcp(problem) => write!(f, "the answer is not MCP: {problem}"),
             Self::Rpc { method, message, .. } => {
-                write!(f, "the app's MCP server answered {method} with an error: {message}")
+                write!(f, "the MCP server answered {method} with an error: {message}")
             }
         }
     }
 }
 
-/// Lists the tools of the MCP server an app serves at `path` on `port`, calling it with
-/// `token`.
-pub async fn list_tools(port: u64, path: &str, token: &str) -> Result<Listing, ConnectError> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let token = token.to_owned();
+/// Lists the tools of the MCP server at `endpoint`.
+pub async fn list_tools(endpoint: &Endpoint) -> Result<Listing, ConnectError> {
+    let endpoint = endpoint.clone();
     // `ureq` blocks, so the calls run off the async threads.
-    tokio::task::spawn_blocking(move || fetch_tools(&url, &token))
+    tokio::task::spawn_blocking(move || fetch_tools(&endpoint))
         .await
         .unwrap_or_else(|error| Err(ConnectError::Unreachable(error.to_string())))
 }
 
-/// Calls the tool `name` of the MCP server an app serves at `path` on `port` with
-/// `arguments`, and returns the result as the server gave it: its content, and whether
-/// the tool failed. The server's own JSON-RPC errors come back as
-/// [`ConnectError::Rpc`].
-pub async fn call_tool(
-    port: u64,
-    path: &str,
-    token: &str,
-    name: &str,
-    arguments: Value,
-) -> Result<Value, ConnectError> {
-    let url = format!("http://127.0.0.1:{port}{path}");
-    let (token, name) = (token.to_owned(), name.to_owned());
-    tokio::task::spawn_blocking(move || fetch_call(&url, &token, &name, arguments))
+/// Calls the tool `name` of the MCP server at `endpoint` with `arguments`, and returns
+/// the result as the server gave it: its content, and whether the tool failed. The
+/// server's own JSON-RPC errors come back as [`ConnectError::Rpc`].
+pub async fn call_tool(endpoint: &Endpoint, name: &str, arguments: Value) -> Result<Value, ConnectError> {
+    let (endpoint, name) = (endpoint.clone(), name.to_owned());
+    tokio::task::spawn_blocking(move || fetch_call(&endpoint, &name, arguments))
         .await
         .unwrap_or_else(|error| Err(ConnectError::Unreachable(error.to_string())))
 }
 
-/// Opens a session with the server at `url`, lists its tools and closes the session.
-fn fetch_tools(url: &str, token: &str) -> Result<Listing, ConnectError> {
-    let mut session = Session::new(&AGENT, url, token);
+/// Opens a session with the server at `endpoint`, lists its tools and closes the
+/// session.
+fn fetch_tools(endpoint: &Endpoint) -> Result<Listing, ConnectError> {
+    let agent = if endpoint.external { &EXTERNAL } else { &AGENT };
+    let mut session = Session::new(agent, &endpoint.url, &endpoint.token);
     let listing = session.list();
     session.close();
     listing
 }
 
-/// Opens a session with the server at `url`, calls one tool and closes the session.
-fn fetch_call(url: &str, token: &str, name: &str, arguments: Value) -> Result<Value, ConnectError> {
-    let mut session = Session::new(&CALLS, url, token);
+/// Opens a session with the server at `endpoint`, calls one tool and closes the
+/// session.
+fn fetch_call(endpoint: &Endpoint, name: &str, arguments: Value) -> Result<Value, ConnectError> {
+    let agent = if endpoint.external { &EXTERNAL_CALLS } else { &CALLS };
+    let mut session = Session::new(agent, &endpoint.url, &endpoint.token);
     let result = session
         .initialize()
         .and_then(|_| session.request("tools/call", json!({ "name": name, "arguments": arguments })));
@@ -568,6 +721,16 @@ mod tests {
 
     use super::*;
 
+    /// An app's MCP server at `url`, which takes `token`.
+    fn local(url: &str, token: &str) -> Endpoint {
+        Endpoint { url: url.to_owned(), token: token.to_owned(), external: false }
+    }
+
+    /// An external MCP server at `url`.
+    fn external(url: &str) -> Endpoint {
+        Endpoint { url: url.to_owned(), token: "secret".to_owned(), external: true }
+    }
+
     /// A request the fake server got: its method, headers in lowercase, and body.
     #[derive(Clone, Debug)]
     struct Got {
@@ -668,7 +831,7 @@ mod tests {
             _ => (202, Vec::new(), String::new()),
         });
 
-        let listing = fetch_tools(&url, "secret").unwrap();
+        let listing = fetch_tools(&local(&url, "secret")).unwrap();
         assert_eq!(listing.server.name, "portaglobal");
         assert_eq!(listing.server.title.as_deref(), Some("Porta Global"));
         assert_eq!(listing.protocol_version, "2025-06-18");
@@ -717,7 +880,7 @@ mod tests {
             }
         });
 
-        let listing = fetch_tools(&url, "secret").unwrap();
+        let listing = fetch_tools(&local(&url, "secret")).unwrap();
         let names: Vec<_> = listing.tools.iter().map(|tool| tool.name.as_str()).collect();
         assert_eq!(names, ["first", "second"]);
 
@@ -731,27 +894,27 @@ mod tests {
     #[test]
     fn says_why_it_could_not_list() {
         let (refusing, _) = serve(|_| (401, Vec::new(), "Unauthorized".to_owned()));
-        assert_eq!(fetch_tools(&refusing, "wrong").unwrap_err(), ConnectError::Refused(401));
+        assert_eq!(fetch_tools(&local(&refusing, "wrong")).unwrap_err(), ConnectError::Refused(401));
 
         let (missing, _) = serve(|_| (404, Vec::new(), "Not found".to_owned()));
-        assert_eq!(fetch_tools(&missing, "secret").unwrap_err(), ConnectError::NotFound);
+        assert_eq!(fetch_tools(&local(&missing, "secret")).unwrap_err(), ConnectError::NotFound);
 
         let (page, _) = serve(|_| (200, vec![("Content-Type", "text/html".to_owned())], "<html>".to_owned()));
-        assert!(matches!(fetch_tools(&page, "secret"), Err(ConnectError::NotMcp(_))));
+        assert!(matches!(fetch_tools(&local(&page, "secret")), Err(ConnectError::NotMcp(_))));
 
         let (failing, _) = serve(|got| {
             let body = json!({ "jsonrpc": "2.0", "id": got.body["id"], "error": { "code": -32603, "message": "boom" } });
             (200, vec![("Content-Type", "application/json".to_owned())], body.to_string())
         });
         assert_eq!(
-            fetch_tools(&failing, "secret").unwrap_err(),
+            fetch_tools(&local(&failing, "secret")).unwrap_err(),
             ConnectError::Rpc { method: "initialize".to_owned(), code: -32603, message: "boom".to_owned() }
         );
 
         // A port nothing listens on: bound, then let go.
         let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(matches!(
-            fetch_tools(&format!("http://{free}/mcp"), "secret"),
+            fetch_tools(&local(&format!("http://{free}/mcp"), "secret")),
             Err(ConnectError::Unreachable(_))
         ));
     }
@@ -771,16 +934,87 @@ mod tests {
             _ => (202, Vec::new(), String::new()),
         });
 
-        let result = fetch_call(&url, "secret", "list_requests", json!({ "stage": "new" })).unwrap();
+        let result = fetch_call(&local(&url, "secret"), "list_requests", json!({ "stage": "new" })).unwrap();
         assert_eq!(result["content"][0]["text"], "{\"count\":0}");
         let sent = got.lock().unwrap().iter().find(|got| got.rpc() == "tools/call").cloned().unwrap();
         assert_eq!(sent.body["params"], json!({ "name": "list_requests", "arguments": { "stage": "new" } }));
         assert_eq!(sent.header("authorization"), Some("Bearer secret"));
 
         assert_eq!(
-            fetch_call(&url, "secret", "delete_all", json!({})).unwrap_err(),
+            fetch_call(&local(&url, "secret"), "delete_all", json!({})).unwrap_err(),
             ConnectError::Rpc { method: "tools/call".to_owned(), code: -32602, message: "Unknown tool".to_owned() }
         );
+    }
+
+    #[test]
+    fn takes_https_urls_with_a_host_for_external_servers() {
+        for url in [
+            "https://api.example.com/mcp",
+            " https://mcp.example.com:8443/v1?team=a ",
+            "https://example.com",
+            "https://[2606:4700::1111]:8443/mcp",
+        ] {
+            assert_eq!(external_url(url).as_deref(), Some(url.trim()), "{url}");
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_URL_LEN));
+        for url in [
+            "http://api.example.com/mcp",
+            "ftp://example.com/mcp",
+            "https:///mcp",
+            "https://user:pass@example.com/mcp",
+            "https://example.com/mcp#tools",
+            "https://exa mple.com/mcp",
+            "https://example.com:x/mcp",
+            "https://example.com:0/mcp",
+            "https://example.com:70000/mcp",
+            "api.example.com/mcp",
+            "",
+            &long,
+        ] {
+            assert_eq!(external_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn takes_tokens_that_fit_in_a_header() {
+        assert!(is_token("oxp_3f9a1c"));
+        assert!(is_token("sk-live.A1/b2+c3=="));
+        assert!(is_token(&"a".repeat(MAX_TOKEN_LEN)));
+        for token in ["", "two words", "line\nbreak", "ção", &"a".repeat(MAX_TOKEN_LEN + 1)] {
+            assert!(!is_token(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn calls_only_public_addresses_for_external_servers() {
+        for public in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111", "::ffff:93.184.216.34"] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        for private in [
+            "127.0.0.1", "10.0.0.5", "172.16.3.4", "192.168.1.10", "169.254.169.254", "0.0.0.0",
+            "100.64.0.1", "255.255.255.255", "224.0.0.1", "240.0.0.1", "::1", "::", "fc00::1",
+            "fd12:3456::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "2001:db8::1",
+        ] {
+            assert!(!is_public(private.parse().unwrap()), "{private}");
+        }
+    }
+
+    #[test]
+    fn refuses_external_servers_on_this_machine_before_connecting() {
+        let (url, got) = serve(|got| json_answer(got, initialized()));
+        let address = url.trim_start_matches("http://");
+
+        let refused = fetch_tools(&external(&format!("https://{address}"))).unwrap_err();
+        assert!(
+            matches!(&refused, ConnectError::Unreachable(why) if why.contains("private network")),
+            "{refused:?}"
+        );
+        let port = address.split([':', '/']).nth(1).unwrap();
+        let refused = fetch_tools(&external(&format!("https://localhost:{port}/mcp"))).unwrap_err();
+        assert!(matches!(refused, ConnectError::Unreachable(_)), "{refused:?}");
+        // Plain HTTP goes nowhere either.
+        assert!(fetch_tools(&external(&url)).is_err());
+        assert!(got.lock().unwrap().is_empty());
     }
 
     #[test]

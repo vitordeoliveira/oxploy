@@ -10,7 +10,6 @@ use topcoat::context::Cx;
 use super::{Failure, INVALID_PARAMS, tool_result};
 use crate::db::db;
 use crate::features::app_mcp::{self, ConnectError, McpTool, Serving};
-use crate::features::deploy::{AppStatus, Deployer};
 use crate::features::mcp::Reach;
 use crate::features::project::Project;
 use crate::features::service::Service;
@@ -71,19 +70,13 @@ pub async fn call(
     let Some(service) = reached_app(cx, organization_id, reach, app_name, tool).await? else {
         return Ok(Err(unknown()));
     };
-    let (Some(path), Some(token)) = (service.mcp_path.as_deref(), service.mcp_token_in_use()) else {
-        return Ok(Err(unknown()));
+    let Some(endpoint) = app_mcp::endpoint(cx, &service) else {
+        return Ok(Ok(tool_result(
+            format!("The app {app_name} is not running, so its tools cannot be called now."),
+            true,
+        )));
     };
-    let port = match (Deployer::get(cx).status(&service), service.port) {
-        (AppStatus::Running, Some(port)) => port,
-        _ => {
-            return Ok(Ok(tool_result(
-                format!("The app {app_name} is not running, so its tools cannot be called now."),
-                true,
-            )));
-        }
-    };
-    Ok(match app_mcp::call_tool(port, path, token, tool, arguments).await {
+    Ok(match app_mcp::call_tool(&endpoint, tool, arguments).await {
         Ok(result) => Ok(result),
         Err(ConnectError::Rpc { code, message, .. }) => Err(Failure::new(code, message)),
         Err(problem) => Ok(tool_result(format!("The app {app_name} could not run the tool: {problem}."), true)),
@@ -103,7 +96,7 @@ async fn reached_app(
     let Some(service) = Service::filter_by_app_name(app_name).first().exec(&mut db(cx)).await? else {
         return Ok(None);
     };
-    if service.mcp_token_in_use().is_none()
+    if !service.serves_mcp()
         || Project::find_in(cx, organization_id, service.project_id).await?.is_none()
     {
         return Ok(None);

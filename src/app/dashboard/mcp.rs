@@ -541,7 +541,7 @@ async fn apps_list(cx: &Cx, organization_id: u64) -> Result<impl View> {
     let mut apps = Vec::new();
     for project in Project::in_organization(cx, organization_id).await? {
         for service in Service::in_project(cx, project.id).await? {
-            if service.mcp_path.is_none() {
+            if !service.serves_mcp() {
                 continue;
             }
             let on = McpTool::enabled_of(cx, service.id).await?.len();

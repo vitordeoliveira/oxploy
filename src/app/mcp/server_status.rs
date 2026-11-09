@@ -24,7 +24,8 @@ const DESCRIPTION: &str = "How the server is doing now. The machine: its name, \
     whether Caddy, the web server in front of the apps, runs oxploy's configuration, \
     the deployments in progress, and what the panel, its builds and all the apps \
     together take. And how many apps are running, stopped, restarting after a crash, \
-    deploying or never deployed. CPU is the busy share of all CPUs together, from 0 to \
+    deploying or never deployed, and how many are external MCP servers that run \
+    elsewhere. CPU is the busy share of all CPUs together, from 0 to \
     100.";
 
 /// The tool's name, description and arguments, for `tools/list`.
@@ -58,9 +59,14 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
         "restarting": 0,
         "deploying": 0,
         "not_deployed": 0,
+        "external": 0,
     });
     for service in &services {
-        let code = status_code(deployer.status(service));
+        let code = if service.is_external() {
+            "external"
+        } else {
+            status_code(deployer.status(service))
+        };
         apps[code] = json!(apps[code].as_u64().unwrap_or(0) + 1);
     }
 

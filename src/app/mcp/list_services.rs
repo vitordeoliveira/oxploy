@@ -1,5 +1,5 @@
 //! The `list_services` tool: every app on the server, across organizations, with where
-//! it stands and what it takes now.
+//! it stands and what it takes now, and every external MCP server, with its URL.
 
 use std::collections::HashMap;
 
@@ -19,14 +19,17 @@ use crate::features::service::Service;
 /// The name agents call the tool by.
 pub const NAME: &str = "list_services";
 
-/// The statuses an app can be in, as the tools name them.
-const STATUSES: [&str; 5] = ["running", "stopped", "restarting", "deploying", "not_deployed"];
+/// The statuses an app can be in, as the tools name them, and the one of an external
+/// MCP server.
+const STATUSES: [&str; 6] = ["running", "stopped", "restarting", "deploying", "not_deployed", "external"];
 
 /// What the tool does, for the agent deciding whether to call it.
 const DESCRIPTION: &str = "Lists every app oxploy runs on this server, across all \
     organizations, sorted by organization, project and name. Each has its app_name, \
     which the other tools take; its status: running, stopped by a user, restarting \
-    after it exited on its own, deploying, or not_deployed yet; the port it listens on \
+    after it exited on its own, deploying, or not_deployed yet, or external for an MCP \
+    server that runs elsewhere, which comes with its mcp_url and nothing oxploy runs; \
+    the port it listens on \
     at 127.0.0.1 and the URLs of its domains; the release that runs, by deployment, \
     commit or GitHub release tag; the CPU and memory it takes now, with how many \
     processes it runs; how often it exited on its own since it was last deployed or \
@@ -97,7 +100,11 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
 
     let mut listed = Vec::new();
     for service in Service::all().exec(&mut db).await? {
-        let status = status_code(deployer.status(&service));
+        let status = if service.is_external() {
+            "external"
+        } else {
+            status_code(deployer.status(&service))
+        };
         if arguments.status.as_deref().is_some_and(|wanted| wanted != status) {
             continue;
         }
@@ -137,6 +144,8 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
                 "organization": organization,
                 "project": project.map(|project| &project.name),
                 "status": status,
+                "kind": if service.is_external() { "external_mcp" } else { "app" },
+                "mcp_url": service.mcp_url.as_ref().filter(|_| service.is_external()),
                 "port": service.port,
                 "domains": domains.remove(&service.id).unwrap_or_default(),
                 "release": release.map(|release| json!({

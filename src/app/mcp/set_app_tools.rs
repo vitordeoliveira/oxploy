@@ -7,7 +7,6 @@ use topcoat::context::Cx;
 
 use super::service_named;
 use crate::features::app_mcp::{self, McpTool};
-use crate::features::deploy::{AppStatus, Deployer};
 
 /// The name agents call the tool by.
 pub const NAME: &str = "set_app_tools";
@@ -81,12 +80,12 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
         Ok(service) => service,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    let (Some(path), Some(token)) = (service.mcp_path.as_deref(), service.mcp_token_in_use()) else {
+    if !service.serves_mcp() {
         return Ok(Err(format!(
             "The app {} serves no MCP. Its MCP tab in the panel turns that on.",
             service.app_name
         )));
-    };
+    }
     let all = arguments.turn_on.iter().chain(&arguments.turn_off);
     if let Some(bad) = all.into_iter().find(|name| !app_mcp::is_tool_name(name)) {
         return Ok(Err(format!("{bad:?} cannot be a tool's name.")));
@@ -95,16 +94,13 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
         return Ok(Err(format!("{both} is both to turn on and to turn off.")));
     }
     if !arguments.turn_on.is_empty() {
-        let port = match (Deployer::get(cx).status(&service), service.port) {
-            (AppStatus::Running, Some(port)) => port,
-            _ => {
-                return Ok(Err(format!(
-                    "The app {} is not running, so it cannot be checked that it offers the tools. Start it first.",
-                    service.app_name
-                )));
-            }
+        let Some(endpoint) = app_mcp::endpoint(cx, &service) else {
+            return Ok(Err(format!(
+                "The app {} is not running, so it cannot be checked that it offers the tools. Start it first.",
+                service.app_name
+            )));
         };
-        let listing = match app_mcp::list_tools(port, path, token).await {
+        let listing = match app_mcp::list_tools(&endpoint).await {
             Ok(listing) => listing,
             Err(problem) => {
                 return Ok(Err(format!("The app {} could not be asked: {problem}.", service.app_name)));

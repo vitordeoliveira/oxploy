@@ -119,8 +119,47 @@ pub struct Service {
 
     /// The token oxploy gives the app in `OXPLOY_MCP_TOKEN` and calls its MCP server
     /// with. Made the first time MCP is turned on, and kept when it is turned off, so
-    /// turning it on again needs no restart.
+    /// turning it on again needs no restart. An external MCP server's is the one it
+    /// takes, which oxploy made or the user gave.
     pub mcp_token: Option<String>,
+
+    /// What the service is. `None` is an app, as for services made before external MCP
+    /// servers.
+    pub kind: Option<ServiceKind>,
+
+    /// Where an external MCP server answers, such as `https://api.example.com/mcp`.
+    /// See [`app_mcp::external_url`].
+    pub mcp_url: Option<String>,
+}
+
+/// What a service is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, toasty::Embed)]
+pub enum ServiceKind {
+    /// A Rust app that oxploy builds and runs.
+    App,
+    /// An MCP server that runs elsewhere, which oxploy only calls, at its URL.
+    ExternalMcp,
+}
+
+/// Why an external MCP server's URL or token was turned down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalProblem {
+    /// The name or description is not valid.
+    Details,
+    /// The URL is not one oxploy calls; see [`app_mcp::external_url`].
+    Url,
+    /// The token cannot be sent in a header; see [`app_mcp::is_token`].
+    Token,
+}
+
+impl std::fmt::Display for ExternalProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Details => "The name is required, and the name and description must not be too long.",
+            Self::Url => "The URL starts with https:// and names a host, such as https://api.example.com/mcp, without a user or a #.",
+            Self::Token => "The token has letters, digits and symbols only, without spaces, and up to 512 of them.",
+        })
+    }
 }
 
 /// How a service is built.
@@ -205,12 +244,92 @@ impl Service {
         Ok(service.filter(|service| service.project_id == project_id))
     }
 
-    /// Creates a service in `project`. Returns `None`, creating nothing, if the details
+    /// Creates an app in `project`. Returns `None`, creating nothing, if the details
     /// are invalid.
     pub async fn add(cx: &Cx, project: &Project, details: &Details<'_>) -> Result<Option<Service>> {
         let Some((name, description)) = details.normalize() else {
             return Ok(None);
         };
+        Self::insert(cx, project, name, description, None).await.map(Some)
+    }
+
+    /// Creates an external MCP server in `project`, which oxploy calls at `url` with
+    /// `token`, or with a token it makes when there is none. Returns why not instead,
+    /// creating nothing, if the details, the URL or the token are not valid.
+    pub async fn add_external(
+        cx: &Cx,
+        project: &Project,
+        details: &Details<'_>,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<Result<Service, ExternalProblem>> {
+        let Some((name, description)) = details.normalize() else {
+            return Ok(Err(ExternalProblem::Details));
+        };
+        let (url, token) = match external_settings(url, token) {
+            Ok(settings) => settings,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let external = (url, token.unwrap_or_else(app_mcp::new_token));
+        Self::insert(cx, project, name, description, Some(external)).await.map(Ok)
+    }
+
+    /// Changes where an external MCP server answers and the token it takes, keeping the
+    /// token when `token` is `None`. Returns why not instead, changing nothing, if the
+    /// URL or the token are not valid.
+    pub async fn set_external_mcp(
+        &mut self,
+        cx: &Cx,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<Result<(), ExternalProblem>> {
+        let (url, token) = match external_settings(url, token) {
+            Ok(settings) => settings,
+            Err(problem) => return Ok(Err(problem)),
+        };
+        let token = token.or_else(|| self.mcp_token.clone()).unwrap_or_else(app_mcp::new_token);
+        self.update()
+            .mcp_url(Some(url))
+            .mcp_token(Some(token))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(Ok(()))
+    }
+
+    /// Gives an external MCP server a new token oxploy made, for the server to take in
+    /// place of the old one.
+    pub async fn renew_mcp_token(&mut self, cx: &Cx) -> Result<()> {
+        self.update()
+            .mcp_token(Some(app_mcp::new_token()))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(())
+    }
+
+    /// Whether it is an MCP server that runs elsewhere, rather than an app.
+    pub fn is_external(&self) -> bool {
+        self.kind == Some(ServiceKind::ExternalMcp)
+    }
+
+    /// Whether it serves MCP: an app with MCP turned on in its MCP tab, or an external
+    /// MCP server.
+    pub fn serves_mcp(&self) -> bool {
+        if self.is_external() {
+            self.mcp_url.is_some() && self.mcp_token.is_some()
+        } else {
+            self.mcp_token_in_use().is_some()
+        }
+    }
+
+    /// Creates a service named `name`, an app or, with `external`'s URL and token, an
+    /// external MCP server.
+    async fn insert(
+        cx: &Cx,
+        project: &Project,
+        name: String,
+        description: Option<String>,
+        external: Option<(String, String)>,
+    ) -> Result<Service> {
         let _naming = NAMING.lock().await;
         let app_name = unused_app_name(cx, &project.name, &name).await?;
         let service = toasty::create!(Service {
@@ -239,10 +358,14 @@ impl Service {
             stopped_at: None,
             domain_offered_at: None,
             default_domain_id: None,
+            mcp_path: None,
+            mcp_token: external.as_ref().map(|(_, token)| token.clone()),
+            kind: Some(if external.is_some() { ServiceKind::ExternalMcp } else { ServiceKind::App }),
+            mcp_url: external.map(|(url, _)| url),
         })
         .exec(&mut db(cx))
         .await?;
-        Ok(Some(service))
+        Ok(service)
     }
 
     /// Replaces the name and description. The app name stays. Returns `false`, changing
@@ -452,6 +575,17 @@ impl Service {
         }
         Ok(())
     }
+}
+
+/// An external MCP server's URL, as oxploy keeps it, and the token the user gave, or
+/// why either is not valid. An empty token is none.
+fn external_settings(url: &str, token: Option<&str>) -> Result<(String, Option<String>), ExternalProblem> {
+    let url = app_mcp::external_url(url).ok_or(ExternalProblem::Url)?;
+    let token = token.map(str::trim).filter(|token| !token.is_empty());
+    if token.is_some_and(|token| !app_mcp::is_token(token)) {
+        return Err(ExternalProblem::Token);
+    }
+    Ok((url, token.map(str::to_owned)))
 }
 
 /// Returns an app name no other service uses, such as `shop-api`, or `shop-api-2`
@@ -697,7 +831,83 @@ fn normalize_features(features: &str) -> Option<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use topcoat::context::CxTestBuilder;
+
     use super::*;
+    use crate::db::TestDb;
+
+    #[tokio::test]
+    async fn an_external_mcp_server_is_called_at_its_url_with_its_token() {
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        let project = Project::add(&cx, 7, &Details { name: "Inumero", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let details = Details { name: "API", description: "" };
+
+        let made = Service::add_external(&cx, &project, &details, " https://api.inumero.test/mcp ", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(made.is_external() && made.serves_mcp());
+        assert_eq!(made.app_name, "inumero-api");
+        assert_eq!(made.mcp_url.as_deref(), Some("https://api.inumero.test/mcp"));
+        let made_token = made.mcp_token.clone().unwrap();
+        assert_eq!(made_token.len(), 64);
+        // No Deployer is needed: an external server is called whether or not anything
+        // runs here.
+        let endpoint = app_mcp::endpoint(&cx, &made).unwrap();
+        assert_eq!(endpoint.url, "https://api.inumero.test/mcp");
+        assert_eq!(endpoint.token, made_token);
+        assert!(endpoint.external);
+
+        let mut pasted = Service::add_external(&cx, &project, &details, "https://mcp.example.com", Some(" sk-live-1 "))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pasted.app_name, "inumero-api-2");
+        assert_eq!(pasted.mcp_token.as_deref(), Some("sk-live-1"));
+
+        // A bad URL, token or name makes nothing.
+        for (url, token, problem) in [
+            ("http://api.inumero.test/mcp", None, ExternalProblem::Url),
+            ("https://api.inumero.test/mcp", Some("two words"), ExternalProblem::Token),
+        ] {
+            let refused = Service::add_external(&cx, &project, &details, url, token).await.unwrap();
+            assert_eq!(refused.unwrap_err(), problem);
+        }
+        let nameless = Details { name: " ", description: "" };
+        let refused = Service::add_external(&cx, &project, &nameless, "https://a.test", None).await.unwrap();
+        assert_eq!(refused.unwrap_err(), ExternalProblem::Details);
+        assert_eq!(Service::count_in(&cx, project.id).await.unwrap(), 2);
+
+        // Changing the URL keeps the token unless one is given.
+        pasted.set_external_mcp(&cx, "https://mcp.example.com/v2", None).await.unwrap().unwrap();
+        assert_eq!(pasted.mcp_url.as_deref(), Some("https://mcp.example.com/v2"));
+        assert_eq!(pasted.mcp_token.as_deref(), Some("sk-live-1"));
+        pasted.set_external_mcp(&cx, "https://mcp.example.com/v2", Some("sk-live-2")).await.unwrap().unwrap();
+        assert_eq!(pasted.mcp_token.as_deref(), Some("sk-live-2"));
+        assert_eq!(
+            pasted.set_external_mcp(&cx, "https://10.0.0.1:x/mcp", None).await.unwrap(),
+            Err(ExternalProblem::Url)
+        );
+        pasted.renew_mcp_token(&cx).await.unwrap();
+        assert_ne!(pasted.mcp_token.as_deref(), Some("sk-live-2"));
+
+        // Its tools reach the organization once turned on, as an app's do.
+        McpTool::set(&cx, made.id, "list_clients", true).await.unwrap();
+        let serving = app_mcp::serving(&cx, 7).await.unwrap();
+        let names: Vec<_> = serving.iter().map(|app| (app.service.app_name.as_str(), app.enabled.clone())).collect();
+        assert_eq!(names, [("inumero-api", vec!["list_clients".to_owned()])]);
+
+        // An app is none of this.
+        let app = Service::add(&cx, &project, &Details { name: "Site", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!app.is_external() && !app.serves_mcp());
+    }
 
     #[test]
     fn build_paths_stay_inside_the_repository() {

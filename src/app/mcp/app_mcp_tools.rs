@@ -8,7 +8,6 @@ use topcoat::context::Cx;
 use super::apps::tool_name;
 use super::service_named;
 use crate::features::app_mcp::{self, Effect, McpTool};
-use crate::features::deploy::{AppStatus, Deployer};
 
 /// The name agents call the tool by.
 pub const NAME: &str = "app_mcp_tools";
@@ -18,8 +17,9 @@ const DESCRIPTION: &str = "The tools an app's own MCP server offers now, asked o
     app, each with what it does, what the app declares it does to its data (read_only, \
     writes or destructive), whether it is turned on, and the name its organization's \
     tokens call it by, <app_name>__<tool>. Only the tools turned on reach the \
-    organization's tokens. The app must be running to be asked; while it is not, only \
-    the names of the tools turned on are known.";
+    organization's tokens. An app must be running to be asked; while it is not, only \
+    the names of the tools turned on are known. An external MCP server, which runs \
+    elsewhere, is asked at its URL.";
 
 /// The tool's name, description and arguments, for `tools/list`.
 pub fn definition() -> Value {
@@ -60,24 +60,21 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
         Ok(service) => service,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    let (Some(path), Some(token)) = (service.mcp_path.as_deref(), service.mcp_token_in_use()) else {
+    if !service.serves_mcp() {
         return Ok(Err(format!(
             "The app {} serves no MCP. Its MCP tab in the panel turns that on.",
             service.app_name
         )));
-    };
+    }
     let enabled = McpTool::enabled_of(cx, service.id).await?;
-    let port = match (Deployer::get(cx).status(&service), service.port) {
-        (AppStatus::Running, Some(port)) => port,
-        _ => {
-            return Ok(Ok(json!({
-                "app_name": service.app_name,
-                "running": false,
-                "tools_turned_on": enabled,
-            })));
-        }
+    let Some(endpoint) = app_mcp::endpoint(cx, &service) else {
+        return Ok(Ok(json!({
+            "app_name": service.app_name,
+            "running": false,
+            "tools_turned_on": enabled,
+        })));
     };
-    let listing = match app_mcp::list_tools(port, path, token).await {
+    let listing = match app_mcp::list_tools(&endpoint).await {
         Ok(listing) => listing,
         Err(problem) => {
             return Ok(Err(format!("The app {} could not be asked: {problem}.", service.app_name)));
@@ -99,6 +96,7 @@ pub async fn call(cx: &Cx, arguments: Value) -> topcoat::Result<Result<Value, St
         .collect();
     Ok(Ok(json!({
         "app_name": service.app_name,
+        "external_mcp_url": service.mcp_url.as_ref().filter(|_| service.is_external()),
         "running": true,
         "server": listing.server.title.as_ref().unwrap_or(&listing.server.name),
         "tools": tools,

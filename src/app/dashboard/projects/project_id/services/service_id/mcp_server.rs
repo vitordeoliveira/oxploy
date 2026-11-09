@@ -1,5 +1,5 @@
-//! The MCP tab: the MCP server the app serves, and which of its tools the user turned
-//! on. See [`app_mcp`].
+//! The MCP tab: the MCP server the app serves, or where an external MCP server answers,
+//! and which of its tools the user turned on. See [`app_mcp`].
 
 use serde::Deserialize;
 use topcoat::{
@@ -20,31 +20,30 @@ use super::hosts::option_switch;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
 use crate::app::dashboard::mcp::{EFFECT_GROUPS, effect_heading, group_key};
 use crate::app::dashboard::require_organization;
-use crate::components::button::button;
+use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
 use crate::components::switch::switch;
 use crate::db::db;
 use crate::features::app_mcp::{
-    self, ConnectError, DEFAULT_PATH, Effect, Listing, MAX_PATH_LEN, McpTool, Tool,
+    self, ConnectError, DEFAULT_PATH, Effect, Listing, MAX_PATH_LEN, MAX_TOKEN_LEN, MAX_URL_LEN, McpTool, Tool,
 };
-use crate::features::deploy::{AppStatus, Deployer};
 use crate::features::environment::MCP_TOKEN_VARIABLE;
 use crate::features::project::Project;
 use crate::features::service::Service;
 
-/// Whether the app serves MCP and where, and its tools while it does. The app's server
-/// is asked once, for the summary at the top and for the tools.
+/// Whether the app serves MCP and where, or where an external MCP server answers, and
+/// its tools while it serves them. The server is asked once, for the summary at the top
+/// and for the tools.
 #[component]
 pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<impl View> {
     let server_url = href!(save_server, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
     let path_id = element_id(cx);
-    let on = service.mcp_path.is_some();
+    let on = service.serves_mcp();
     let path = service.mcp_path.as_deref().unwrap_or(DEFAULT_PATH);
-    let running = Deployer::get(cx).status(service) == AppStatus::Running;
-    let listing = match (running, service.port, service.mcp_token_in_use()) {
-        (true, Some(port), Some(token)) => Some(app_mcp::list_tools(port, path, token).await),
-        _ => None,
+    let listing = match app_mcp::endpoint(cx, service).filter(|_| on) {
+        Some(endpoint) => Some(app_mcp::list_tools(&endpoint).await),
+        None => None,
     };
     let enabled = McpTool::enabled_of(cx, service.id).await?;
     let (dot, status) = match (on, &listing) {
@@ -75,6 +74,16 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
 
     Ok(view! {
         <div class="flex flex-col gap-6">
+            if service.is_external() {
+                external_cards(
+                    project: project,
+                    service: service,
+                    dot: dot,
+                    status: &status,
+                    tools_on: &tools_on,
+                    offered: offered
+                )
+            } else {
             settings_card(
                 title: "MCP server",
                 text: "An MCP server the app serves on its own port, over Streamable HTTP. oxploy calls it at 127.0.0.1, and the app's domains answer 404 at its path, so only oxploy reaches it.",
@@ -158,10 +167,123 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
                     </div>
                 }
             )
+            }
             if on {
                 tools_card(service: service, listing: listing.as_ref(), enabled: &enabled, tools_on: &tools_on)
             }
         </div>
+    })
+}
+
+/// An external MCP server's summary, with the status `dot` and `status` its server's
+/// answer gave, and its connection: its URL and the token it takes.
+#[component]
+async fn external_cards(
+    cx: &Cx,
+    project: &Project,
+    service: &Service,
+    dot: &str,
+    status: &str,
+    tools_on: &Signal<usize>,
+    offered: Option<usize>,
+) -> Result<impl View> {
+    let save_url = href!(save_external, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
+    let renew_url = href!(renew_token, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
+    let url = service.mcp_url.as_deref().unwrap_or_default();
+    let token = service.mcp_token.as_deref().unwrap_or_default();
+    let (url_id, token_id) = (element_id(cx), element_id(cx));
+    let shown = signal(cx, || false);
+    let show = shown.clone();
+    let tools_on = tools_on.clone();
+
+    Ok(view! {
+        settings_card(
+            title: "External MCP server",
+            text: "An MCP server that runs elsewhere. oxploy calls it at its URL over HTTPS, sending its token as Authorization: Bearer <token>, and passes its tools on to this organization's MCP. It never follows a redirect, nor calls an address of this machine or of a private network.",
+            <dl class="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
+                <dt class="font-medium">"Status"</dt>
+                <dd class="flex items-center gap-2 text-muted-foreground">
+                    <span class=(format!("size-2 shrink-0 rounded-full {dot}"))></span>
+                    (status)
+                </dd>
+                <dt class="font-medium">"URL"</dt>
+                <dd class="font-mono break-all text-muted-foreground">(url)</dd>
+                <dt class="font-medium">"Tools"</dt>
+                <dd class="text-muted-foreground">
+                    $(tools_on.get())
+                    if let Some(offered) = offered {
+                        " of " (offered.to_string())
+                    }
+                    " on"
+                </dd>
+                <dt class="font-medium">"Named"</dt>
+                <dd class="text-muted-foreground">
+                    <span class="font-mono break-all">(&service.app_name) "__<tool>"</span>
+                    ", in this organization's MCP"
+                </dd>
+            </dl>
+        )
+        settings_card(
+            title: "Connection",
+            text: "Where the server answers, and the token it takes.",
+            <form method="post" action=(&save_url) class="flex flex-col gap-4">
+                field(
+                    field_label(attrs: attributes! { for=(&url_id) }, "URL")
+                    input(
+                        attrs: attributes! {
+                            id=(&url_id)
+                            name="url"
+                            type="url"
+                            value=(url)
+                            placeholder="https://api.example.com/mcp"
+                            maxlength=(MAX_URL_LEN.to_string())
+                            pattern="https://.+"
+                            title="An https:// URL, such as https://api.example.com/mcp"
+                            required=""
+                            class="font-mono"
+                            spellcheck="false"
+                            autocomplete="off"
+                            autocapitalize="off"
+                        }
+                    )
+                    field_description("Where the server answers MCP over Streamable HTTP, such as https://api.example.com/mcp.")
+                )
+                field(
+                    field_label(attrs: attributes! { for=(&token_id) }, "Token")
+                    <div class="flex items-center gap-2">
+                        input(
+                            attrs: attributes! {
+                                id=(&token_id)
+                                name="token"
+                                :type=$(if shown.get() { "text" } else { "password" })
+                                value=(token)
+                                maxlength=(MAX_TOKEN_LEN.to_string())
+                                required=""
+                                class="font-mono"
+                                spellcheck="false"
+                                autocomplete="off"
+                                autocapitalize="off"
+                            }
+                        )
+                        button(
+                            variant: ButtonVariant::Outline,
+                            attrs: attributes! { type="button" @click=$(|_e: Event| show.set(!show.get())) },
+                            $(if show.get() { "Hide" } else { "Show" })
+                        )
+                    </div>
+                    field_description(
+                        "oxploy made this one: put it in the server's configuration, for it to answer only the requests that send it. Or paste the token the server already takes."
+                    )
+                )
+                <div class="flex justify-end">
+                    button(attrs: attributes! { type="submit" }, "Save")
+                </div>
+            </form>
+            <form method="post" action=(&renew_url) class="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-muted px-4 py-3 text-sm">
+                <p class="text-muted-foreground">"A new token oxploy makes, which the server then has to take in place of this one."</p>
+                button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Make a new token")
+            </form>
+        )
     })
 }
 
@@ -191,7 +313,7 @@ async fn tools_card(
                 Some(Err(problem)) => {
                     <div class="flex items-start gap-2 text-sm">
                         icon(data: iconify_icon!("lucide:circle-alert"), size: 16, attrs: attributes! { class="mt-0.5 shrink-0 text-destructive" })
-                        <p>(problem_text(problem, path))</p>
+                        <p>(problem_text(problem, path, service.is_external()))</p>
                     </div>
                 }
                 Some(Ok(listing)) => {
@@ -328,9 +450,16 @@ async fn turn_tool(cx: &Cx, service_id: u64, name: String, on: bool) -> Result<b
     Ok(on)
 }
 
-/// Why the tools could not be listed, with what to check.
-fn problem_text(problem: &ConnectError, path: &str) -> String {
+/// Why the tools could not be listed, with what to check: on an app, or on an
+/// `external` MCP server.
+fn problem_text(problem: &ConnectError, path: &str, external: bool) -> String {
     match problem {
+        ConnectError::Refused(status) if external => format!(
+            "The server turned oxploy away with {status}. Check that it takes the token above, as Authorization: Bearer <token>."
+        ),
+        ConnectError::NotFound if external => {
+            "Nothing answers MCP at this URL. Check it, and that the server serves MCP there over Streamable HTTP.".to_owned()
+        }
         ConnectError::Refused(status) => format!(
             "The app turned oxploy away with {status}. Restart it, so it gets {MCP_TOKEN_VARIABLE}, and check that it takes the token from there."
         ),
@@ -348,6 +477,38 @@ fn sentence(text: &str) -> String {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
     }
+}
+
+/// The form that changes where an external MCP server answers and its token.
+#[derive(Deserialize)]
+struct ExternalForm {
+    url: String,
+    #[serde(default)]
+    token: String,
+}
+
+/// Saves where an external MCP server answers and the token it takes.
+#[route(POST "./external")]
+async fn save_external(cx: &Cx, Form(form): Form<ExternalForm>) -> Result<SeeOther> {
+    let (project, mut service) = current_service(cx).await?;
+    if !service.is_external() {
+        return Err(bad_request("Only an external MCP server has a URL").into());
+    }
+    if let Err(problem) = service.set_external_mcp(cx, &form.url, Some(&form.token)).await? {
+        return Err(bad_request(problem.to_string()).into());
+    }
+    Ok(see_other(ServiceTab::Mcp.url(cx, &project, &service)))
+}
+
+/// Gives an external MCP server a new token oxploy made.
+#[route(POST "./renew-token")]
+async fn renew_token(cx: &Cx) -> Result<SeeOther> {
+    let (project, mut service) = current_service(cx).await?;
+    if !service.is_external() {
+        return Err(bad_request("Only an external MCP server takes a token from here").into());
+    }
+    service.renew_mcp_token(cx).await?;
+    Ok(see_other(ServiceTab::Mcp.url(cx, &project, &service)))
 }
 
 /// The form that turns the app's MCP server on or off.

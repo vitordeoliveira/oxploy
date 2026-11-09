@@ -24,7 +24,7 @@ use topcoat::{
     router::{
         Uri,
         content::Form,
-        error::{RouterErrorExt, SeeOther, bad_request, see_other},
+        error::{RouterErrorExt, SeeOther, bad_request, not_found, see_other},
         header::HOST,
         href, module_param, page, path_param,
         request::{headers, uri},
@@ -238,9 +238,16 @@ pub async fn page() -> Result<impl View> {
 
 /// The service's name and actions above its tabs, with `tab` open. `draft` holds
 /// variables that could not be saved, to show again on the Environment tab.
+///
+/// An external MCP server has nothing to build, run or route, so its page is its MCP
+/// tab alone, without the others.
 #[component]
 async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>) -> Result<impl View> {
     let (project, service) = current_service(cx).await?;
+    let external = service.is_external();
+    if external && !matches!(tab, ServiceTab::General | ServiceTab::Mcp) {
+        return Err(not_found().into());
+    }
     let editing = signal(cx, || false);
     let deleting = signal(cx, || false);
     let open_editing = editing.clone();
@@ -258,12 +265,20 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
             <div class="flex flex-wrap items-start justify-between gap-4">
                 <div class="flex min-w-0 items-start gap-3">
                     <span class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                        icon(data: iconify_icon!("lucide:box"), size: 22)
+                        if external {
+                            icon(data: iconify_icon!("lucide:plug"), size: 22)
+                        } else {
+                            icon(data: iconify_icon!("lucide:box"), size: 22)
+                        }
                     </span>
                     <div class="flex min-w-0 flex-col gap-1">
                         <div class="flex min-w-0 flex-wrap items-center gap-2">
                             <h1 class="truncate text-2xl font-semibold tracking-tight">(&service.name)</h1>
-                            service_status(project_id: project_id, service_id: service_id, local: local)
+                            if external {
+                                external_badge()
+                            } else {
+                                service_status(project_id: project_id, service_id: service_id, local: local)
+                            }
                         </div>
                         <p class="flex flex-wrap items-center gap-x-2 text-sm text-muted-foreground">
                             <span class="font-mono text-xs" title="App name">(&service.app_name)</span>
@@ -301,6 +316,9 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                     )
                 </div>
             </div>
+            if external {
+                mcp_tab(project: &project, service: &service)
+            } else {
             tabs(
                 attrs: attributes! { class="flex-1" },
                 // The tabs scroll sideways when they do not fit.
@@ -359,6 +377,7 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                     }
                 )
             )
+            }
         </div>
         details_dialog(
             open: &editing,
@@ -374,9 +393,20 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
             open: &deleting,
             title: "Delete service",
             name: &service.name,
-            consequence: " with the files in its storage".to_owned(),
+            consequence: if external { String::new() } else { " with the files in its storage".to_owned() },
             action: href!(remove, ProjectId(project.id), ServiceId(service.id)).resolve(cx)
         )
+    })
+}
+
+/// What an external MCP server's page shows in place of an app's status.
+#[component]
+pub(crate) async fn external_badge() -> Result<impl View> {
+    Ok(view! {
+        <span class="inline-flex items-center gap-1.5 rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+            icon(data: iconify_icon!("lucide:globe"), size: 12)
+            "External MCP"
+        </span>
     })
 }
 

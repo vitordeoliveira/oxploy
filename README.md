@@ -220,6 +220,17 @@ destructive, where a tool that declares nothing counts as destructive, as the pr
 says. `src/features/app_mcp.rs` is the client, which takes answers in plain JSON
 or as an event stream, with or without a session.
 
+An MCP server that runs elsewhere, such as one of an app hosted on another platform,
+joins an organization as a service of its own kind: **New service**, then **External
+MCP server**, with the URL it answers at, such as `https://api.example.com/mcp`, and the
+token it takes as `Authorization: Bearer <token>`. Left empty, oxploy makes one, to put
+in the server's configuration. Its page is its MCP tab alone, with the URL and the token,
+and its tools are turned on and picked for tokens as an app's are. oxploy calls it over
+HTTPS only, follows no redirect, which would carry the token elsewhere, and never calls
+an address of its own machine or of a private network, whatever the URL's host resolves
+to. A server that cannot be reached lists no tools until it can. Servers that need a
+sign-in, such as OAuth, are not supported.
+
 ## Project structure
 
 | Path | Contents |

@@ -246,7 +246,8 @@ fn initialize(params: &Value, scope: &Scope) -> Value {
              the apps of the organization {name}, which each app's own MCP server offers. \
              Only the tools turned on in oxploy for this token are listed. Each is named \
              after its app, as <app>__<tool>, and its description starts with the app it \
-             comes from. A tool of an app that is not running is not listed."
+             comes from. A tool of an app that is not running, or of an external MCP \
+             server that cannot be reached, is not listed."
         ),
     };
     json!({
