@@ -40,7 +40,7 @@ use crate::components::input::input;
 use crate::components::switch::switch;
 use crate::db::db;
 use crate::features::app_mcp::{self, Effect, McpTool};
-use crate::features::mcp::{IssueError, MAX_NAME_LEN, McpToken, client_name};
+use crate::features::mcp::{ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, claude_code_command, client_name};
 use crate::features::project::Project;
 use crate::features::service::Service;
 use crate::features::user::Role;
@@ -582,13 +582,20 @@ async fn apps_list(cx: &Cx, organization_id: u64) -> Result<impl View> {
     })
 }
 
-/// The token just made, with the command that connects Claude Code to it.
+/// The token just made, with the commands that connect Claude Code to it: in the
+/// project it runs in, or in every project of its user.
 #[component]
 async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
-    let command = format!(
-        "claude mcp add --transport http {} {endpoint} --header \"Authorization: Bearer {}\"",
-        issued.client, issued.secret
-    );
+    let commands = [
+        (
+            "Only in the project you run it in",
+            claude_code_command(&issued.client, endpoint, &issued.secret, ClaudeScope::Local),
+        ),
+        (
+            "In every project of your user",
+            claude_code_command(&issued.client, endpoint, &issued.secret, ClaudeScope::User),
+        ),
+    ];
 
     Ok(view! {
         <div class="flex flex-col gap-3 border-b border-border bg-primary/5 p-5">
@@ -602,10 +609,18 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
             <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-sm break-all select-all">
                 (&issued.secret)
             </code>
-            <p class="text-sm text-muted-foreground">"To connect Claude Code:"</p>
-            <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap select-all">
-                (command)
-            </code>
+            <p class="text-sm text-muted-foreground">
+                "To connect Claude Code, run one of these in your own terminal, not in a Claude conversation, which would keep the token in its history:"
+            </p>
+            #[key(index)]
+            for (index, (label, command)) in commands.iter().enumerate() {
+                <div class="flex flex-col gap-1.5">
+                    <p class="text-xs font-medium">(label)</p>
+                    <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap select-all">
+                        (command)
+                    </code>
+                </div>
+            }
         </div>
     })
 }

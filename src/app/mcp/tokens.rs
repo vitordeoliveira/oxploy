@@ -125,8 +125,10 @@ mod tests {
         assert!(secret.starts_with("oxp_"));
         assert_eq!(made["token"]["reaches"], "picked");
         assert_eq!(made["token"]["tools"], json!([tool("list_requests")]));
-        let command = made["claude_code_command"].as_str().unwrap();
-        assert!(command.contains("oxploy-porta-global-telegram-bot https://panel.test/mcp"), "{command}");
+        let command = made["claude_code_commands"]["this_project"].as_str().unwrap();
+        assert!(command.contains("--scope local oxploy-porta-global-telegram-bot https://panel.test/mcp"), "{command}");
+        let command = made["claude_code_commands"]["every_project"].as_str().unwrap();
+        assert!(command.contains("--scope user oxploy-porta-global-telegram-bot"), "{command}");
         let stored = McpToken::filter_by_id(made["token"]["id"].as_u64().unwrap())
             .first()
             .exec(&mut db(&cx))

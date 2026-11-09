@@ -175,7 +175,7 @@ to, and each call is logged with the token, the tool, how it went and how long i
 | `update_oxploy` | Installs oxploy's newest release, as the Update button does, and answers at once |
 | `set_app_tools` | Turns tools of an app's MCP server on or off, as its MCP tab does |
 | `set_token_tools` | Has an organization's token reach every tool turned on, or only the ones given |
-| `create_mcp_token` | Makes an organization's token with the tools picked, and returns its secret and the `claude mcp add` command once |
+| `create_mcp_token` | Makes an organization's token with the tools picked, and returns its secret and the `claude mcp add` commands once |
 | `revoke_mcp_token` | Revokes an organization's token |
 
 Server tokens are only made and revoked on the page, so an agent cannot make itself a
@@ -183,13 +183,18 @@ token that manages, and the tools that manage reach only the organizations' toke
 token that only reads gets the same error for them as for a tool that does not exist.
 Server tokens made before tokens could manage only read.
 
-With a new token, the page gives the command that connects Claude Code to it, under a
+With a new token, the page gives the commands that connect Claude Code to it, under a
 name made from the token's: `oxploy-server-<token>` for a server token, or
 `oxploy-<organization>-<token>` for an organization's, so a client that holds several
-tells them apart. For a server token named Claude Local:
+tells them apart. One adds it only in the project Claude Code runs in, with
+`--scope local`, and the other in every project of its user, with `--scope user`; both
+keep it in `~/.claude.json`. Neither uses `--scope project`, which would write the token
+into the repository's `.mcp.json`. Run them in a terminal of your own: in a Claude
+conversation, the token would stay in its history. For a server token named Claude
+Local:
 
 ```sh
-claude mcp add --transport http oxploy-server-claude-local https://<panel>/mcp \
+claude mcp add --transport http --scope local oxploy-server-claude-local https://<panel>/mcp \
   --header "Authorization: Bearer <token>"
 ```
 

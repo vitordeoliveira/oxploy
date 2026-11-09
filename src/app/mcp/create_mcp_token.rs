@@ -8,7 +8,7 @@ use topcoat::context::Cx;
 use super::tokens::{describe, picks_named};
 use crate::app::dashboard::panel_url;
 use crate::db::db;
-use crate::features::mcp::{IssueError, MAX_NAME_LEN, McpToken, client_name};
+use crate::features::mcp::{ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, claude_code_command, client_name};
 use crate::features::organization::Organization;
 
 /// The name agents call the tool by.
@@ -19,9 +19,10 @@ const DESCRIPTION: &str = "Makes an MCP token for one client of an organization,
     as a bot, as the panel's New token button does. It reaches the tools picked for it, \
     each named as list_mcp_tokens lists them, <app_name>__<tool>, or, with all, every \
     tool turned on in the organization's apps. It returns the token's secret this once, \
-    as oxploy keeps only its hash, with the command that connects Claude Code to it: \
-    hand them to the client they are for, and never repeat the secret in a reply. A \
-    token of the server cannot be made here.";
+    as oxploy keeps only its hash, with the commands that connect Claude Code to it, in \
+    the project it runs in or in every project of its user: hand them to the client \
+    they are for, and never repeat the secret in a reply. A token of the server cannot \
+    be made here.";
 
 /// The tool's name, description and arguments, for `tools/list`.
 pub fn definition() -> Value {
@@ -131,8 +132,9 @@ pub(super) async fn issue(cx: &Cx, arguments: Arguments, endpoint: &str) -> topc
         "organization": organization.name,
         "secret": secret,
         "endpoint": endpoint,
-        "claude_code_command": format!(
-            "claude mcp add --transport http {client} {endpoint} --header \"Authorization: Bearer {secret}\""
-        ),
+        "claude_code_commands": {
+            "this_project": claude_code_command(&client, endpoint, &secret, ClaudeScope::Local),
+            "every_project": claude_code_command(&client, endpoint, &secret, ClaudeScope::User),
+        },
     })))
 }

@@ -311,6 +311,30 @@ pub fn client_name(organization: Option<&str>, token: &str) -> String {
         .join("-")
 }
 
+/// Where Claude Code keeps an MCP server it adds, as `claude mcp add --scope` names it.
+/// Neither is the `project` scope, which writes the token into the repository's
+/// `.mcp.json`, shared with everyone who clones it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeScope {
+    /// Only the project Claude Code runs in, for its user alone.
+    Local,
+    /// Every project of its user.
+    User,
+}
+
+/// The command that adds the server a token reaches to Claude Code, in `scope`, under
+/// the name `client` made by [`client_name`], for clients that reach oxploy at
+/// `endpoint`.
+pub fn claude_code_command(client: &str, endpoint: &str, secret: &str, scope: ClaudeScope) -> String {
+    let scope = match scope {
+        ClaudeScope::Local => "local",
+        ClaudeScope::User => "user",
+    };
+    format!(
+        "claude mcp add --transport http --scope {scope} {client} {endpoint} --header \"Authorization: Bearer {secret}\""
+    )
+}
+
 /// The token the current request carries, if it is one of the tokens, and notes that it
 /// was used.
 pub async fn authorized(cx: &Cx) -> Result<Option<McpToken>> {
@@ -403,6 +427,19 @@ mod tests {
         assert_eq!(picked.reached(4, enabled()), ["purge"]);
         assert!(picked.reached(5, enabled()).is_empty());
         assert!(Reach::Picked(Vec::new()).reached(3, enabled()).is_empty());
+    }
+
+    #[test]
+    fn adds_a_token_to_claude_code_for_one_project_or_for_every_one() {
+        let endpoint = "https://panel.test/mcp";
+        assert_eq!(
+            claude_code_command("oxploy-server-claude", endpoint, "oxp_1", ClaudeScope::Local),
+            "claude mcp add --transport http --scope local oxploy-server-claude https://panel.test/mcp --header \"Authorization: Bearer oxp_1\""
+        );
+        assert!(
+            claude_code_command("oxploy-server-claude", endpoint, "oxp_1", ClaudeScope::User)
+                .starts_with("claude mcp add --transport http --scope user oxploy-server-claude ")
+        );
     }
 
     #[test]
