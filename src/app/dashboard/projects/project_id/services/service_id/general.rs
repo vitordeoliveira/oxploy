@@ -11,7 +11,7 @@ use topcoat::{
         error::{RouterErrorExt, SeeOther, bad_request, see_other},
         href, query_params, route,
     },
-    runtime::{Event, Signal, connected, shard, signal},
+    runtime::{Event, Signal, connected, procedure, shard, signal},
     view::{View, attributes, component, element_id, view},
 };
 
@@ -33,6 +33,7 @@ use crate::features::deployment::Deployment;
 use crate::features::github::{Branches, GithubApp, Release, Repository};
 use crate::features::project::Project;
 use crate::features::machine::{Machine, named_for_this_machine};
+use crate::features::time_zone;
 use crate::features::service::{
     BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, ReleaseBuild, Service, Source,
     cargo_command, guess_binary, release_file_matches, release_file_pattern,
@@ -66,10 +67,12 @@ pub async fn general_tab(
     let account_id = element_id(cx);
     let build_path_id = element_id(cx);
     let source_url = href!(save_source, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
+    // How many times the deploy card's buttons restarted, started or stopped the app.
+    let changes = signal(cx, || 0usize);
 
     Ok(view! {
         <div class="flex flex-col gap-6">
-            deploy_card(project: project, service: service)
+            deploy_card(project_id: project.id, service_id: service.id, changes: changes)
             settings_card(
                 title: "Source",
                 text: "Where oxploy gets the code to build.",
@@ -394,19 +397,27 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
 }
 
 /// The buttons that deploy, stop and restart the service, with the release that runs.
-#[component]
-async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<impl View> {
-    let status = Deployer::get(cx).status(service);
+///
+/// Restarting, starting and stopping happen without a reload: while one runs, the
+/// buttons wait and the card says so, then it says what became of it, with the time,
+/// and renders again, as `changes` counts each one. Deploying opens the deployment's
+/// log, and says it is on its way until then. A shard answers requests of its own, so
+/// it checks access itself.
+#[shard]
+pub(super) async fn deploy_card(cx: &Cx, project_id: u64, service_id: u64, changes: Signal<usize>) -> Result<impl View> {
+    let (project, service) = find_service(cx, project_id, service_id).await?;
+    // Read so that each change renders the card again.
+    let _ = changes.get();
+    let status = Deployer::get(cx).status(&service);
     let release = match service.release_id {
         Some(id) => Deployment::find_of(cx, service.id, id).await?,
         None => None,
     };
     let has_source = service.repository.is_some() && service.branch.is_some();
-    let (project_id, service_id) = (ProjectId(project.id), ServiceId(service.id));
-    let deploy_url = href!(deploy, project_id, service_id).resolve(cx);
-    let restart_url = href!(restart, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
-    let stop_url = href!(stop, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
+    let can_deploy = has_source && status != AppStatus::Deploying;
+    let deploy_url = href!(deploy, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
     let releases = service.builds_with() == BuildKind::Release;
+    let stopped = status == AppStatus::Stopped;
     let text = match (status, releases) {
         (AppStatus::NotDeployed, false) => "Fetch the branch, build it and start it.",
         (AppStatus::NotDeployed, true) => "Download the repository's latest release and start it.",
@@ -417,47 +428,102 @@ async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<im
         (AppStatus::Stopped, false) => "The app is stopped. Start it again, or deploy the latest commit.",
         (AppStatus::Stopped, true) => "The app is stopped. Start it again, or deploy the latest release.",
     };
+    // What the last button did, or does now, said under the buttons.
+    let busy = signal(cx, || false);
+    let failed = signal(cx, || false);
+    let note = signal(cx, String::new);
+    let (deploying, restarting, stopping) = (busy.clone(), busy.clone(), busy.clone());
+    let (deploy_note, restart_note, stop_note) = (note.clone(), note.clone(), note.clone());
+    let (restart_failed, stop_failed) = (failed.clone(), failed.clone());
+    let (restart_done, stop_done) = (changes.clone(), changes.clone());
+    let restart_doing = if stopped { "Starting…" } else { "Restarting…" };
 
     Ok(view! {
         settings_card(
             title: "Deploy",
             text: text,
             <div class="flex flex-wrap items-center gap-2">
-                <form method="post" action=(&deploy_url)>
+                <form method="post" action=(&deploy_url) @submit=$(|_e: Event| {
+                    deploying.set(true);
+                    deploy_note.set("Starting a deployment…".to_owned());
+                })>
                     button(
                         attrs: attributes! {
                             type="submit"
-                            disabled=((!has_source || status == AppStatus::Deploying).then_some(""))
+                            :disabled=$(if can_deploy { busy.get() } else { true })
                         },
                         icon(data: iconify_icon!("lucide:rocket"))
                         "Deploy"
                     )
                 </form>
                 if release.is_some() {
-                    <form method="post" action=(&restart_url)>
+                    button(
+                        variant: ButtonVariant::Outline,
+                        attrs: attributes! {
+                            type="button"
+                            :disabled=$(busy.get())
+                            @click=$(async |_e: Event| {
+                                restarting.set(true);
+                                restart_note.set(restart_doing.to_owned());
+                                let outcome = restart_app(project_id, service_id).await;
+                                restart_failed.set(!outcome.0);
+                                restart_note.set(outcome.1);
+                                restarting.set(false);
+                                restart_done.increment();
+                            })
+                        },
+                        if stopped {
+                            icon(data: iconify_icon!("lucide:play"))
+                            "Start"
+                        } else {
+                            icon(data: iconify_icon!("lucide:rotate-cw"))
+                            "Restart"
+                        }
+                    )
+                    if !stopped {
                         button(
                             variant: ButtonVariant::Outline,
-                            attrs: attributes! { type="submit" },
-                            if status == AppStatus::Stopped {
-                                icon(data: iconify_icon!("lucide:play"))
-                                "Start"
-                            } else {
-                                icon(data: iconify_icon!("lucide:rotate-cw"))
-                                "Restart"
-                            }
+                            attrs: attributes! {
+                                type="button"
+                                class="hover:text-destructive"
+                                :disabled=$(busy.get())
+                                @click=$(async |_e: Event| {
+                                    stopping.set(true);
+                                    stop_note.set("Stopping…".to_owned());
+                                    let outcome = stop_app(project_id, service_id).await;
+                                    stop_failed.set(!outcome.0);
+                                    stop_note.set(outcome.1);
+                                    stopping.set(false);
+                                    stop_done.increment();
+                                })
+                            },
+                            icon(data: iconify_icon!("lucide:square"))
+                            "Stop"
                         )
-                    </form>
-                    if status != AppStatus::Stopped {
-                        <form method="post" action=(&stop_url)>
-                            button(
-                                variant: ButtonVariant::Outline,
-                                attrs: attributes! { type="submit" class="hover:text-destructive" },
-                                icon(data: iconify_icon!("lucide:square"))
-                                "Stop"
-                            )
-                        </form>
                     }
                 }
+                <p
+                    role="status"
+                    :hidden=$(note.get().is_empty())
+                    :class=$(if busy.get() {
+                        "flex items-center gap-1.5 text-sm text-muted-foreground"
+                    } else if failed.get() {
+                        "flex items-center gap-1.5 text-sm text-destructive"
+                    } else {
+                        "flex items-center gap-1.5 text-sm text-emerald-700 dark:text-emerald-400"
+                    })
+                >
+                    <span class="inline-flex animate-spin" :hidden=$(!busy.get())>
+                        icon(data: iconify_icon!("lucide:loader-circle"), size: 14)
+                    </span>
+                    <span class="inline-flex" :hidden=$(if busy.get() { true } else { failed.get() })>
+                        icon(data: iconify_icon!("lucide:circle-check"), size: 14)
+                    </span>
+                    <span class="inline-flex" :hidden=$(if busy.get() { true } else { !failed.get() })>
+                        icon(data: iconify_icon!("lucide:circle-x"), size: 14)
+                    </span>
+                    $(note.get())
+                </p>
             </div>
             if !has_source {
                 field_description("Save a source below to deploy.")
@@ -483,6 +549,49 @@ async fn deploy_card(cx: &Cx, project: &Project, service: &Service) -> Result<im
             }
         )
     })
+}
+
+/// The service with this ID in the project with this ID, if both belong to the
+/// organization the browser works in, as a procedure or a shard, which answer requests
+/// of their own, must check.
+async fn find_service(cx: &Cx, project_id: u64, service_id: u64) -> Result<(Project, Service)> {
+    let organization = require_organization(cx).await?;
+    let project = Project::find_in(cx, organization.id, project_id)
+        .await?
+        .ok_or_not_found()?;
+    let service = Service::find_in(cx, project.id, service_id)
+        .await?
+        .ok_or_not_found()?;
+    Ok((project, service))
+}
+
+/// What a button did, for the deploy card: whether it worked, and what to say, such as
+/// `Restarted at 14:05:09`.
+fn outcome(done: &str) -> (bool, String) {
+    let time = time_zone::at(jiff::Timestamp::now()).strftime("%H:%M:%S").to_string();
+    (true, format!("{done} at {time}"))
+}
+
+/// Starts the service's release again, whether it was stopped or running, from the
+/// deploy card, and says what became of it.
+#[procedure]
+async fn restart_app(cx: &Cx, project_id: u64, service_id: u64) -> Result<(bool, String)> {
+    let (_, mut service) = find_service(cx, project_id, service_id).await?;
+    let was_stopped = service.stopped_at.is_some();
+    Ok(match Deployer::get(cx).restart(&mut service).await? {
+        Ok(()) if was_stopped => outcome("Started"),
+        Ok(()) => outcome("Restarted"),
+        Err(error) => (false, format!("The app could not start: {error}")),
+    })
+}
+
+/// Stops the service until it is started or deployed again, from the deploy card, and
+/// says so.
+#[procedure]
+async fn stop_app(cx: &Cx, project_id: u64, service_id: u64) -> Result<(bool, String)> {
+    let (_, mut service) = find_service(cx, project_id, service_id).await?;
+    Deployer::get(cx).stop(&mut service).await?;
+    Ok(outcome("Stopped"))
 }
 
 /// What the GitHub release tab's fields offer to choose from.
@@ -1058,22 +1167,6 @@ pub(super) async fn deploy(cx: &Cx) -> Result<SeeOther> {
             Err(bad_request("Choose a repository and a branch before deploying").into())
         }
     }
-}
-
-/// Stops the service until it is started or deployed again.
-#[route(POST "./stop")]
-async fn stop(cx: &Cx) -> Result<SeeOther> {
-    let (project, mut service) = current_service(cx).await?;
-    Deployer::get(cx).stop(&mut service).await?;
-    Ok(see_other(general_url(cx, &project, &service)))
-}
-
-/// Starts the service's release again, whether it was stopped or running.
-#[route(POST "./restart")]
-async fn restart(cx: &Cx) -> Result<SeeOther> {
-    let (project, mut service) = current_service(cx).await?;
-    Deployer::get(cx).restart(&mut service).await??;
-    Ok(see_other(general_url(cx, &project, &service)))
 }
 
 /// The service's page, which opens on this tab.

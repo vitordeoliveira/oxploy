@@ -147,6 +147,11 @@ impl Deployer {
         }
     }
 
+    /// When the service's app started, while it runs.
+    pub fn running_since(&self, service_id: u64) -> Option<std::time::SystemTime> {
+        self.runtime.running_since(service_id)
+    }
+
     pub fn is_deploying(&self, service_id: u64) -> bool {
         lock(&self.deploying).contains(&service_id)
     }

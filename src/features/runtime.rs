@@ -137,7 +137,10 @@ struct Process {
     /// The child, when this run of the panel started it. A process taken back after the
     /// panel restarted is not its child.
     child: Option<Child>,
+    /// When this run of the panel started it, or took it back.
     started: Instant,
+    /// When it started, as the system says for one taken back.
+    since: SystemTime,
 }
 
 impl Process {
@@ -211,6 +214,13 @@ impl Runtime {
             runtime: self,
             service_id,
         }
+    }
+
+    /// When the service's process started, while it runs.
+    pub fn running_since(&self, service_id: u64) -> Option<SystemTime> {
+        let mut processes = lock(&self.processes);
+        let process = processes.get_mut(&service_id)?;
+        process.exited().is_none().then_some(process.since)
     }
 
     /// Returns whether the service's process runs.
@@ -306,6 +316,7 @@ impl Runtime {
                 pid: child.id(),
                 child: Some(child),
                 started: Instant::now(),
+                since: SystemTime::now(),
             },
         );
         Ok(())
@@ -316,10 +327,11 @@ impl Runtime {
     pub async fn stop(&self, service_id: u64, files: &AppFiles) {
         let process = lock(&self.processes)
             .remove(&service_id)
-            .or_else(|| running_from(files).map(|(pid, _)| Process {
+            .or_else(|| running_from(files).map(|(pid, _, since)| Process {
                 pid,
                 child: None,
                 started: Instant::now(),
+                since,
             }));
         if let Some(mut process) = process {
             signal_group(process.pid, libc::SIGTERM);
@@ -432,7 +444,7 @@ impl Runtime {
     /// Tracks the process a previous run of the panel started for `launch`, if it still
     /// runs that release.
     fn take_back(&self, launch: &Launch) -> bool {
-        let Some((pid, release_id)) = running_from(&launch.files) else {
+        let Some((pid, release_id, since)) = running_from(&launch.files) else {
             return false;
         };
         if release_id != launch.release_id {
@@ -444,6 +456,7 @@ impl Runtime {
                 pid,
                 child: None,
                 started: Instant::now(),
+                since,
             },
         );
         true
@@ -535,10 +548,10 @@ pub fn system_env() -> impl Iterator<Item = (&'static str, String)> {
         .filter_map(|name| Some((name, std::env::var(name).ok()?)))
 }
 
-/// Returns the process in the app's PID file and the release it runs, if it is alive
-/// and runs one of the app's binaries, which rules out a PID since reused by another
-/// program.
-fn running_from(files: &AppFiles) -> Option<(u32, u64)> {
+/// Returns the process in the app's PID file, the release it runs and when it started,
+/// if it is alive and runs one of the app's binaries, which rules out a PID since reused
+/// by another program.
+fn running_from(files: &AppFiles) -> Option<(u32, u64, SystemTime)> {
     let text = fs::read_to_string(files.pid_file()).ok()?;
     let mut lines = text.lines();
     let pid: u32 = lines.next()?.parse().ok()?;
@@ -547,9 +560,10 @@ fn running_from(files: &AppFiles) -> Option<(u32, u64)> {
     let mut system = System::new().ok()?;
     let process_id = Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[process_id]), true);
-    let exe = system.process(process_id)?.exe()?;
-    let exe = fs::canonicalize(exe).ok()?;
-    exe.starts_with(&releases).then_some((pid, release_id))
+    let process = system.process(process_id)?;
+    let since = SystemTime::UNIX_EPOCH + Duration::from_secs(process.start_time());
+    let exe = fs::canonicalize(process.exe()?).ok()?;
+    exe.starts_with(&releases).then_some((pid, release_id, since))
 }
 
 /// Returns whether a process with this PID exists.

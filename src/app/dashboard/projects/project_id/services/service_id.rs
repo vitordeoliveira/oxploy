@@ -15,7 +15,7 @@ mod variables;
 use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use topcoat::{
     Result,
@@ -440,7 +440,10 @@ async fn service_status(cx: &Cx, project_id: u64, service_id: u64, local: bool) 
                         .filter(|_| local && status == AppStatus::Running)
                         .map(|port| format!("http://127.0.0.1:{port}")),
                 };
-                let token = emit! { status_line(status: status, open: open.as_deref()) }?;
+                let since = Deployer::get(cx)
+                    .running_since(service.id)
+                    .filter(|_| status == AppStatus::Running);
+                let token = emit! { status_line(status: status, open: open.as_deref(), since: since) }?;
                 if !connected(cx) {
                     break Ok(token);
                 }
@@ -450,12 +453,20 @@ async fn service_status(cx: &Cx, project_id: u64, service_id: u64, local: bool) 
     })
 }
 
-/// The service's status, with a link that opens the app when the browser can reach it.
+/// The service's status, with when the app started while it runs, so a restart shows,
+/// and a link that opens the app when the browser can reach it.
 #[component]
-async fn status_line(status: AppStatus, open: Option<&str>) -> Result<impl View> {
+async fn status_line(status: AppStatus, open: Option<&str>, since: Option<SystemTime>) -> Result<impl View> {
+    let since = since.and_then(|since| since.duration_since(SystemTime::UNIX_EPOCH).ok());
+
     Ok(view! {
         <span class="inline-flex items-center gap-2">
             deploy_status(status: status)
+            if let Some(since) = since {
+                <span class="text-xs text-muted-foreground">
+                    "started " created_at(seconds: since.as_secs() as i64)
+                </span>
+            }
             if let Some(open) = open {
                 <a
                     href=(open)
