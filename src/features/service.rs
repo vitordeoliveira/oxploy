@@ -11,7 +11,7 @@ use super::deploy::Deployer;
 use super::domain::Domain;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
-use super::mcp::McpTokenTool;
+use super::mcp::{McpToken, McpTokenTool};
 use super::project::{Details, Project, now};
 use crate::db::db;
 
@@ -440,6 +440,18 @@ impl Service {
         if let Err(error) = environment::parse(text, &databases::set_elsewhere(&databases)) {
             return Ok(Err(error));
         }
+        let project = Project::filter_by_id(self.project_id).first().exec(&mut db(cx)).await?;
+        let available: Vec<String> = match project {
+            Some(project) => McpToken::for_apps(&db(cx), project.organization_id)
+                .await?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Err(error) = environment::check_tokens(text, &available) {
+            return Ok(Err(error));
+        }
         let text = (!text.is_empty()).then(|| text.to_owned());
         self.update().environment(text).exec(&mut db(cx)).await?;
         Ok(Ok(()))
@@ -835,6 +847,58 @@ mod tests {
 
     use super::*;
     use crate::db::TestDb;
+
+    #[tokio::test]
+    async fn an_app_gets_only_the_organizations_tokens_its_variables_use() {
+        use crate::features::app_files::AppFiles;
+        use crate::features::mcp::NewToken;
+        use crate::features::runtime::{FromOxploy, variables_with_port};
+
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        let project = Project::add(&cx, 7, &Details { name: "Oxmate", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bot = Service::add(&cx, &project, &Details { name: "Bot", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let for_apps = |name| NewToken { name, for_apps: true, ..NewToken::default() };
+        let (token, secret) = McpToken::issue(&cx, Some(7), &for_apps("Receptionist")).await.unwrap().unwrap();
+        McpToken::issue(&cx, Some(7), &for_apps("Other bot")).await.unwrap().unwrap();
+        McpToken::issue(&cx, Some(8), &for_apps("Shop bot")).await.unwrap().unwrap();
+        let plain = NewToken { name: "Claude", ..NewToken::default() };
+        McpToken::issue(&cx, Some(7), &plain).await.unwrap().unwrap();
+
+        // Only a token of the organization made for apps can be used.
+        for unknown in ["${OXPLOY_MCP_SHOP_BOT}", "${OXPLOY_MCP_CLAUDE}", "${OXPLOY_MCP_GONE}"] {
+            let refused = bot.set_environment(&cx, &format!("A=1\nTOKEN={unknown}")).await.unwrap().unwrap_err();
+            assert_eq!(refused.line, 2, "{unknown}");
+        }
+        let text = "A=1\nTOKEN=${OXPLOY_MCP_RECEPTIONIST}\nMCP=${OXPLOY_MCP_URL}";
+        bot.set_environment(&cx, text).await.unwrap().unwrap();
+
+        let gets = |bot: &Service, oxploy: &FromOxploy| {
+            variables_with_port(bot, &AppFiles::of(&bot.app_name), "4000", &[], oxploy)
+        };
+        let oxploy = FromOxploy::of(&test.db, &bot).await.unwrap();
+        let variables = gets(&bot, &oxploy);
+        let value = |name: &str| variables.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        assert_eq!(value("TOKEN"), Some(secret));
+        assert!(value("MCP").is_some_and(|url| url.starts_with("http://") && url.ends_with("/mcp")));
+        assert_eq!(value("OXPLOY_MCP_URL"), value("MCP"));
+        // The tokens it does not use stay out.
+        assert!(variables.iter().all(|(key, _)| !key.starts_with("OXPLOY_MCP_") || key == "OXPLOY_MCP_URL"));
+
+        // A token revoked since is empty, and the app keeps its other variables.
+        token.revoke(&cx).await.unwrap();
+        let oxploy = FromOxploy::of(&test.db, &bot).await.unwrap();
+        let variables = gets(&bot, &oxploy);
+        let value = |name: &str| variables.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        assert_eq!(value("A").as_deref(), Some("1"));
+        assert_eq!(value("TOKEN").as_deref(), Some(""));
+    }
 
     #[tokio::test]
     async fn an_external_mcp_server_is_called_at_its_url_with_its_token() {

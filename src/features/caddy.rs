@@ -117,6 +117,16 @@ impl Ports {
     }
 }
 
+/// Where the panel listens, as `HOST` and `PORT` say, reached from this machine, such as
+/// `127.0.0.1:3000`.
+pub fn local_panel_address() -> String {
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000);
+    panel_address(std::env::var("HOST").ok().as_deref(), port)
+}
+
 /// Where Caddy reaches a panel that listens at `host` and `port`: on 127.0.0.1 when it
 /// listens on every address.
 fn panel_address(host: Option<&str>, port: u16) -> String {

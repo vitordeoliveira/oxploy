@@ -21,8 +21,8 @@ const DESCRIPTION: &str = "The MCP tokens clients reach oxploy with. Server toke
     the organizations' tokens. Each organization comes with its id, the tools turned on \
     in its apps, named as its tokens' clients call them, <app_name>__<tool>, and its \
     tokens, each with its id, whether it reaches all the tools turned on or only the \
-    ones picked for it, and the tools it reaches now. Never the tokens' secrets, which \
-    oxploy does not keep.";
+    ones picked for it, the tools it reaches now, and, when it is available to the \
+    organization's apps, the variable they take it as. Never the tokens' secrets.";
 
 /// The tool's name, description and arguments, for `tools/list`.
 pub fn definition() -> Value {

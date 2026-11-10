@@ -10,6 +10,11 @@
 //! A server token reads, and one made to manage also installs oxploy's updates and
 //! manages the organizations' tokens and the tools turned on in their apps. Server
 //! tokens are only made in the panel, so an agent cannot make itself one that manages.
+//!
+//! An organization's token can also be made available to its apps, for an app that is
+//! an MCP client of its organization, such as a bot. oxploy then keeps the token itself
+//! too, to hand it to an app that uses its variable, such as
+//! `${OXPLOY_MCP_TELEGRAM_BOT}`; see [`environment`](super::environment).
 
 use sha2::{Digest, Sha256};
 use toasty::Db;
@@ -20,6 +25,7 @@ use topcoat::{
 };
 
 use super::app_mcp::is_tool_name;
+use super::environment::{TOKEN_PREFIX, is_set_by_oxploy};
 use super::project::now;
 use super::service::slug;
 use crate::db::db;
@@ -58,6 +64,25 @@ pub struct McpToken {
     /// organizations' tokens and the tools turned on in their apps. `None`, as for an
     /// organization's token or a server token made before tokens could manage, is no.
     pub manages: Option<bool>,
+
+    /// The token itself, kept only for an organization's token made available to its
+    /// apps, to hand it to the ones that use its variable. Every other token is kept
+    /// only as its hash.
+    pub secret: Option<String>,
+}
+
+/// A token to make, with [`McpToken::issue`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NewToken<'a> {
+    /// What the user calls it, such as the client that uses it.
+    pub name: &'a str,
+    /// For an organization's token, the tools it reaches, each by its app's service and
+    /// its name, or `None` for every tool turned on.
+    pub picked: Option<&'a [(u64, String)]>,
+    /// For a server token, whether it also manages.
+    pub manages: bool,
+    /// For an organization's token, whether its apps can use it, as a variable.
+    pub for_apps: bool,
 }
 
 /// A tool of an organization's app that was picked for one of its tokens. It reaches the
@@ -134,23 +159,21 @@ impl McpToken {
         Ok(token.filter(|token| token.organization_id == organization_id))
     }
 
-    /// Makes a token named `name` for the organization, or for the server with `None`,
-    /// and returns it with the token itself, which is never stored and so cannot be
-    /// shown again. An organization's token reaches the tools in `picked`, each by its
-    /// app's service and its name, or all of them with `None`; a server token reaches
-    /// the server, whatever `picked` says, and also manages with `manages`, which an
-    /// organization's token ignores.
+    /// Makes the token `new` describes for the organization, or for the server with
+    /// `None`, and returns it with the token itself, which is shown once: oxploy keeps
+    /// only its hash, unless it is an organization's token made available to its apps.
+    /// A server token ignores what `new` says of organizations' tokens, and the other
+    /// way around.
     ///
     /// Returns why not instead if the name has no letters or digits, is too long, or
-    /// reads like the name of another of the same tokens: as clients know each token by
-    /// a name made from it, two such would clash.
+    /// reads like the name of another of the same tokens, as clients know each token by
+    /// a name made from it, or if a token for apps would have a variable oxploy sets.
     pub async fn issue(
         cx: &Cx,
         organization_id: Option<u64>,
-        name: &str,
-        picked: Option<&[(u64, String)]>,
-        manages: bool,
+        new: &NewToken<'_>,
     ) -> Result<Result<(McpToken, String), IssueError>> {
+        let NewToken { name, picked, manages, for_apps } = *new;
         let name = name.trim();
         if slug(name).is_empty() || name.chars().count() > MAX_NAME_LEN {
             return Ok(Err(IssueError::BadName));
@@ -162,6 +185,10 @@ impl McpToken {
         if taken {
             return Ok(Err(IssueError::Taken));
         }
+        let for_apps = organization_id.is_some() && for_apps;
+        if for_apps && is_set_by_oxploy(&variable_name(name)) {
+            return Ok(Err(IssueError::Reserved));
+        }
         let picked = organization_id.and(picked);
         let secret = new_secret();
         let token = toasty::create!(McpToken {
@@ -172,11 +199,50 @@ impl McpToken {
             last_used_at: None,
             picks_tools: organization_id.map(|_| picked.is_some()),
             manages: organization_id.is_none().then_some(manages),
+            secret: for_apps.then(|| secret.clone()),
         })
         .exec(&mut db(cx))
         .await?;
         token.set_picked(cx, picked.unwrap_or_default()).await?;
         Ok(Ok((token, secret)))
+    }
+
+    /// The variable its organization's apps use it as, such as
+    /// `OXPLOY_MCP_TELEGRAM_BOT`, if it is available to them.
+    pub fn variable(&self) -> Option<String> {
+        (self.organization_id.is_some() && self.secret.is_some()).then(|| variable_name(&self.name))
+    }
+
+    /// Makes an organization's token available to its apps. oxploy kept only the hash
+    /// of the token it had, so it gets a new one, which it keeps: clients that send the
+    /// old one are turned away from then on. Returns why not instead, changing nothing,
+    /// for a server token, or if its variable would be one oxploy sets.
+    pub async fn share_with_apps(&mut self, cx: &Cx) -> Result<Result<(), IssueError>> {
+        if self.organization_id.is_none() {
+            return Ok(Err(IssueError::Server));
+        }
+        if is_set_by_oxploy(&variable_name(&self.name)) {
+            return Ok(Err(IssueError::Reserved));
+        }
+        let secret = new_secret();
+        self.update()
+            .token_hash(hash(&secret))
+            .secret(Some(secret))
+            .exec(&mut db(cx))
+            .await?;
+        Ok(Ok(()))
+    }
+
+    /// The variables of the organization's tokens available to its apps, each with the
+    /// token, for oxploy to hand to the apps that use them.
+    pub async fn for_apps(db: &Db, organization_id: u64) -> toasty::Result<Vec<(String, String)>> {
+        let tokens = McpToken::filter_by_organization_id(Some(organization_id))
+            .exec(&mut db.clone())
+            .await?;
+        Ok(tokens
+            .into_iter()
+            .filter_map(|token| Some((variable_name(&token.name), token.secret?)))
+            .collect())
     }
 
     /// Whether it reaches only the tools picked for it.
@@ -292,6 +358,17 @@ pub enum IssueError {
     BadName,
     /// Another of the same tokens has a name that reads the same.
     Taken,
+    /// The token is for apps, and its variable would be one oxploy sets, such as
+    /// `OXPLOY_MCP_URL`.
+    Reserved,
+    /// A server token is never made available to apps.
+    Server,
+}
+
+/// The variable an organization's apps use its token named `name` as, such as
+/// `OXPLOY_MCP_TELEGRAM_BOT` for Telegram bot.
+pub fn variable_name(name: &str) -> String {
+    format!("{TOKEN_PREFIX}{}", slug(name).to_ascii_uppercase().replace('-', "_"))
 }
 
 /// The name an MCP client knows a token's server by, such as
@@ -381,7 +458,47 @@ fn bearer(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use topcoat::context::CxTestBuilder;
+
     use super::*;
+    use crate::db::TestDb;
+
+    #[tokio::test]
+    async fn keeps_only_the_tokens_made_for_apps() {
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        let for_apps = |name| NewToken { name, for_apps: true, ..NewToken::default() };
+
+        let (bot, secret) = McpToken::issue(&cx, Some(7), &for_apps("Telegram bot")).await.unwrap().unwrap();
+        assert_eq!(bot.secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(bot.variable().as_deref(), Some("OXPLOY_MCP_TELEGRAM_BOT"));
+        let plain = NewToken { name: "Claude", ..NewToken::default() };
+        let (mut claude, _) = McpToken::issue(&cx, Some(7), &plain).await.unwrap().unwrap();
+        assert_eq!((claude.secret.as_deref(), claude.variable()), (None, None));
+        // A server token is never for apps.
+        let (mut server, _) = McpToken::issue(&cx, None, &for_apps("Server bot")).await.unwrap().unwrap();
+        assert_eq!((server.secret.as_deref(), server.variable()), (None, None));
+        // A token whose variable oxploy sets is not made.
+        for name in ["url", "Token"] {
+            let refused = McpToken::issue(&cx, Some(7), &for_apps(name)).await.unwrap();
+            assert_eq!(refused.unwrap_err(), IssueError::Reserved, "{name}");
+        }
+        assert_eq!(
+            McpToken::for_apps(&test.db, 7).await.unwrap(),
+            [("OXPLOY_MCP_TELEGRAM_BOT".to_owned(), secret.clone())]
+        );
+        assert!(McpToken::for_apps(&test.db, 8).await.unwrap().is_empty());
+
+        // Made available later, a token gets a new secret, which is kept.
+        let old_hash = claude.token_hash.clone();
+        claude.share_with_apps(&cx).await.unwrap().unwrap();
+        let kept = claude.secret.clone().unwrap();
+        assert_ne!(claude.token_hash, old_hash);
+        assert_eq!(claude.token_hash, hash(&kept));
+        assert_eq!(claude.variable().as_deref(), Some("OXPLOY_MCP_CLAUDE"));
+        assert_eq!(McpToken::for_apps(&test.db, 7).await.unwrap().len(), 2);
+        assert_eq!(server.share_with_apps(&cx).await.unwrap(), Err(IssueError::Server));
+    }
 
     #[test]
     fn makes_tokens_that_differ_and_are_easy_to_recognize() {
@@ -427,6 +544,17 @@ mod tests {
         assert_eq!(picked.reached(4, enabled()), ["purge"]);
         assert!(picked.reached(5, enabled()).is_empty());
         assert!(Reach::Picked(Vec::new()).reached(3, enabled()).is_empty());
+    }
+
+    #[test]
+    fn names_the_variable_of_a_token_for_apps_after_it() {
+        assert_eq!(variable_name("oxmate receptionist"), "OXPLOY_MCP_OXMATE_RECEPTIONIST");
+        assert_eq!(variable_name("Telegram-bot 2"), "OXPLOY_MCP_TELEGRAM_BOT_2");
+        assert_eq!(variable_name("2FA"), "OXPLOY_MCP_2FA");
+        assert!(crate::features::environment::is_key(&variable_name("Ação!")));
+        // These would be the variables oxploy sets itself.
+        assert!(is_set_by_oxploy(&variable_name("Token")));
+        assert!(is_set_by_oxploy(&variable_name("url")));
     }
 
     #[test]

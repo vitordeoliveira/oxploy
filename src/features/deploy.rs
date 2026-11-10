@@ -31,7 +31,7 @@ use super::archive;
 use super::github::{GithubApp, Release, ReleaseFile};
 use super::machine::Machine;
 use super::project::{Project, now};
-use super::runtime::{Exits, Launch, Readiness, Runtime, app_variables, system_env};
+use super::runtime::{Exits, FromOxploy, Launch, Readiness, Runtime, app_variables, system_env};
 use super::service::{BuildKind, Service, release_file_matches};
 use super::storage;
 use super::usage::Usage;
@@ -487,7 +487,8 @@ impl Deployer {
         let databases = ManagedDatabase::of_service_in(&self.db, service.id)
             .await
             .map_err(saved)?;
-        let variables = app_variables(service, files, port, &databases);
+        let oxploy = FromOxploy::of(&self.db, service).await.map_err(saved)?;
+        let variables = app_variables(service, files, port, &databases, &oxploy);
         let build = Build {
             service,
             files,

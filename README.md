@@ -152,6 +152,16 @@ does not exist, and each call an organization's token makes is logged with the t
 the tool, how it went and how long it took, but not its arguments. Tokens made before
 tools could be picked reach all of them.
 
+An organization's token can be **available to this organization's apps**, for a client
+that runs here as one of them, such as a bot. oxploy then keeps the token itself, not
+only its hash, and an app takes it as a variable named after it, `${OXPLOY_MCP_<NAME>}`,
+such as `MCP_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT}` in its Environment tab, which the
+token's row shows. Only an app whose variables use it gets it, saving checks that the
+token exists, and one revoked since is empty, without the app losing its other
+variables. A token made before, whose secret oxploy did not keep, is made available with
+**For apps**, which gives it a new one. Every app also gets `OXPLOY_MCP_URL`, where this
+server's MCP answers on 127.0.0.1. Server tokens are never available to apps.
+
 A server token, which only the super admin makes, reads the machine, oxploy itself and
 every app it runs, across organizations, with these tools:
 

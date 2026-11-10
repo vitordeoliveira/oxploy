@@ -16,9 +16,10 @@ use crate::components::textarea::textarea;
 use crate::features::app_files::AppFiles;
 use crate::features::databases::{self, ManagedDatabase};
 use crate::features::environment::{
-    self, MAX_LEN, MCP_TOKEN_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE,
+    self, MAX_LEN, MCP_TOKEN_VARIABLE, MCP_URL_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE,
 };
-use crate::features::runtime::{system_env, variables_with_port};
+use crate::db::db;
+use crate::features::runtime::{FromOxploy, system_env, variables_with_port};
 use crate::features::service::Service;
 
 /// Variables the user submitted that could not be saved, with what is wrong.
@@ -142,7 +143,8 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
     let port = service
         .port
         .map_or_else(|| format!("${{{PORT_VARIABLE}}}"), |port| port.to_string());
-    let resolved = variables_with_port(service, &files, &port, managed);
+    let oxploy = FromOxploy::of(&db(cx), service).await?;
+    let resolved = variables_with_port(service, &files, &port, managed, &oxploy);
     let databases: Vec<(&str, &str)> = managed
         .iter()
         .filter_map(|database| Some((database.variable.as_deref()?, database.file.as_str())))
@@ -156,7 +158,9 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
 
     let yours: Vec<Row> = resolved
         .iter()
-        .filter(|(name, _)| name != MCP_TOKEN_VARIABLE && !databases.iter().any(|(set, _)| set == name))
+        .filter(|(name, _)| {
+            name != MCP_TOKEN_VARIABLE && name != MCP_URL_VARIABLE && !databases.iter().any(|(set, _)| set == name)
+        })
         .map(|(name, value)| row(name, value, None, true))
         .collect();
     let mut by_oxploy = vec![
@@ -175,7 +179,26 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             Some("The folder for the app's data, which deploys and restarts keep.".to_owned()),
             false,
         ),
+        row(
+            MCP_URL_VARIABLE,
+            &oxploy.mcp_url,
+            Some("Where this server's MCP answers, for an app that is an MCP client of its organization.".to_owned()),
+            false,
+        ),
     ];
+    // The organization's tokens the app may use, which it gets only if its variables do.
+    let tokens: Vec<Row> = oxploy
+        .tokens
+        .iter()
+        .map(|(name, _)| Row {
+            name: name.clone(),
+            value: None,
+            note: Some(format!(
+                "An MCP token of this organization, from the MCP page. The app gets it only with a line such as MCP_TOKEN=${{{name}}}."
+            )),
+            secret: true,
+        })
+        .collect();
     if let Some(token) = service.mcp_token_in_use() {
         by_oxploy.push(row(
             MCP_TOKEN_VARIABLE,
@@ -212,6 +235,13 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             title: "From the Storage tab",
             text: "",
             rows: from_storage,
+        });
+    }
+    if !tokens.is_empty() {
+        groups.push(Group {
+            title: "MCP tokens it can use",
+            text: "This organization's tokens made available to its apps, which a line above can use.",
+            rows: tokens,
         });
     }
     groups.push(Group {

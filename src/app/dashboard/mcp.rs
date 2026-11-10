@@ -40,7 +40,9 @@ use crate::components::input::input;
 use crate::components::switch::switch;
 use crate::db::db;
 use crate::features::app_mcp::{self, Effect, McpTool};
-use crate::features::mcp::{ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, claude_code_command, client_name};
+use crate::features::mcp::{
+    ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, NewToken, claude_code_command, client_name,
+};
 use crate::features::project::Project;
 use crate::features::service::Service;
 use crate::features::user::Role;
@@ -89,6 +91,8 @@ struct Issued {
     secret: String,
     /// The name the client knows the token's server by, for the command that adds it.
     client: String,
+    /// The variable the organization's apps use it as, if it is available to them.
+    variable: Option<String>,
 }
 
 /// A name the form turned down, shown again in its dialog with why, and with the tools
@@ -101,6 +105,8 @@ struct Refused {
     picked: Option<Vec<(u64, String)>>,
     /// Whether a server token was to manage.
     manages: bool,
+    /// Whether an organization's token was to be available to its apps.
+    for_apps: bool,
 }
 
 /// What a form left for the page to show once, after it sent the browser back.
@@ -175,7 +181,8 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
 /// The form sends `kind` and `name`. A server token also manages when it sends
 /// `manages`. An organization's token reaches every tool turned on when it sends `all`,
 /// and otherwise only the tools it sends as `tool`, each as `<service_id>:<name>`, of
-/// those turned on in the organization's apps.
+/// those turned on in the organization's apps, and is available to its apps when it
+/// sends `for_apps`.
 #[route(POST "./issue")]
 async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<SeeOther> {
     let value_of = |key: &str| {
@@ -211,11 +218,20 @@ async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<See
             (Some(organization.name), picked)
         }
     };
-    let manages = kind == Kind::Server && fields.iter().any(|(name, _)| name == "manages");
-    let shown = match McpToken::issue(cx, owner, &name, picked.as_deref(), manages).await? {
+    let sent = |key: &str| fields.iter().any(|(name, _)| name == key);
+    let manages = kind == Kind::Server && sent("manages");
+    let for_apps = kind == Kind::Organization && sent("for_apps");
+    let new = NewToken {
+        name: &name,
+        picked: picked.as_deref(),
+        manages,
+        for_apps,
+    };
+    let shown = match McpToken::issue(cx, owner, &new).await? {
         Ok((token, secret)) => Shown::Issued(Issued {
             kind,
             client: client_name(organization.as_deref(), &token.name),
+            variable: token.variable(),
             name: token.name,
             secret,
         }),
@@ -225,6 +241,7 @@ async fn issue(cx: &Cx, Form(fields): Form<Vec<(String, String)>>) -> Result<See
             problem,
             picked,
             manages,
+            for_apps,
         }),
     };
     let id = leave(signed_in.user.id, shown);
@@ -255,6 +272,43 @@ async fn revoke(cx: &Cx, Form(form): Form<RevokeForm>) -> Result<SeeOther> {
         .revoke(cx)
         .await?;
     Ok(see_other(href!(page).resolve(cx)))
+}
+
+/// The form that makes one of the organization's tokens available to its apps.
+#[derive(Deserialize)]
+struct ShareForm {
+    id: u64,
+}
+
+/// Makes one of the organization's tokens available to its apps, with a new token
+/// that oxploy keeps, as it kept only the old one's hash.
+#[route(POST "./share")]
+async fn share(cx: &Cx, Form(form): Form<ShareForm>) -> Result<SeeOther> {
+    let organization = require_organization(cx).await?;
+    let mut token = McpToken::find_of(cx, Some(organization.id), form.id)
+        .await?
+        .ok_or_not_found()?;
+    if let Err(problem) = token.share_with_apps(cx).await? {
+        return Err(bad_request(problem_text(problem, &organization.name, &token.name)).into());
+    }
+    Ok(see_other(href!(page).resolve(cx)))
+}
+
+/// Why a token named `name` of `owner`, the server or an organization, could not be
+/// made or made available to apps.
+fn problem_text(problem: IssueError, owner: &str, name: &str) -> String {
+    match problem {
+        IssueError::BadName => format!("Give it a name with letters or digits, of up to {MAX_NAME_LEN} characters."),
+        IssueError::Taken => format!(
+            "{owner} already has a token named like {}. Pick another name, so each one's client gets a name of its own.",
+            name.trim(),
+        ),
+        IssueError::Reserved => format!(
+            "Its apps would use it as {}, a variable oxploy sets itself. Pick another name.",
+            crate::features::mcp::variable_name(name)
+        ),
+        IssueError::Server => "A server token is never available to apps.".to_owned(),
+    }
 }
 
 /// Has an organization's token reach every tool turned on, or only the ones picked for
@@ -477,6 +531,14 @@ async fn tokens_section(
         .iter()
         .map(|token| signal(&cx.keyed(token.id), || false))
         .collect();
+    // An organization's token that is not available to its apps can be made so.
+    let sharing: Vec<_> = tokens
+        .iter()
+        .map(|token| {
+            let shareable = kind == Kind::Organization && token.variable().is_none();
+            shareable.then(|| signal(&cx.keyed(token.id), || false))
+        })
+        .collect();
     let reaching: Vec<_> = tokens
         .iter()
         .zip(&picked)
@@ -518,7 +580,13 @@ async fn tokens_section(
                 <ul class="divide-y divide-border">
                     #[key(token.id)]
                     for (index, token) in tokens.iter().enumerate() {
-                        token_row(token: token, revoking: &revoking[index], reaching: reaching[index].as_ref(), total: total)
+                        token_row(
+                            token: token,
+                            revoking: &revoking[index],
+                            reaching: reaching[index].as_ref(),
+                            total: total,
+                            sharing: sharing[index].as_ref()
+                        )
                     }
                 </ul>
             }
@@ -527,6 +595,9 @@ async fn tokens_section(
         #[key(token.id)]
         for (index, token) in tokens.iter().enumerate() {
             revoke_dialog(open: &revoking[index], kind: kind, token: token)
+            if let Some(sharing) = &sharing[index] {
+                share_dialog(open: sharing, token: token)
+            }
             if let (Some(reaching), Some(offered)) = (&reaching[index], offered) {
                 tools_dialog(token: token, reaching: reaching, offered: offered, picked: &picked[index])
             }
@@ -609,6 +680,15 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
             <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-sm break-all select-all">
                 (&issued.secret)
             </code>
+            if let Some(variable) = &issued.variable {
+                <p class="text-sm">
+                    "This organization's apps take it as "
+                    <code class="font-mono select-all">"${" (variable) "}"</code>
+                    ", with a line such as "
+                    <code class="font-mono select-all">"MCP_TOKEN=${" (variable) "}"</code>
+                    " in their Environment tab."
+                </p>
+            }
             <p class="text-sm text-muted-foreground">
                 "To connect Claude Code, run one of these in your own terminal, not in a Claude conversation, which would keep the token in its history:"
             </p>
@@ -634,10 +714,13 @@ async fn token_row(
     revoking: &Signal<bool>,
     reaching: Option<&Reaching>,
     total: usize,
+    sharing: Option<&Signal<bool>>,
 ) -> Result<impl View> {
     let revoking = revoking.clone();
     let label = format!("Revoke {}", token.name);
     let choosing = reaching.map(|reaching| reaching.choosing.clone());
+    let variable = token.variable();
+    let sharing = sharing.filter(|_| variable.is_none()).cloned();
 
     Ok(view! {
         <li class="flex items-center gap-3 px-5 py-4">
@@ -661,7 +744,28 @@ async fn token_row(
                 } else {
                     <span class="text-xs text-muted-foreground">"Reads only"</span>
                 }
+                if let Some(variable) = &variable {
+                    <span class="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                        icon(data: iconify_icon!("lucide:variable"), size: 12, attrs: attributes! { class="shrink-0" })
+                        "Apps take it as"
+                        <code class="font-mono text-foreground select-all">"${" (variable) "}"</code>
+                    </span>
+                }
             </div>
+            if let Some(sharing) = sharing {
+                button(
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    attrs: attributes! {
+                        type="button"
+                        title="Make it available to this organization's apps"
+                        aria-label=(format!("Make {} available to apps", token.name))
+                        @click=$(|_e: Event| sharing.set(true))
+                    },
+                    icon(data: iconify_icon!("lucide:variable"))
+                    "For apps"
+                )
+            }
             if let Some(choosing) = choosing {
                 button(
                     variant: ButtonVariant::Outline,
@@ -994,18 +1098,14 @@ async fn issue_dialog(
     let all = signal(cx, || refused.is_some_and(|refused| refused.picked.is_none()));
     let manages_id = element_id(cx);
     let manages = refused.is_some_and(|refused| refused.manages);
-    let problem = refused.map(|refused| match refused.problem {
-        IssueError::BadName => format!(
-            "Give it a name with letters or digits, of up to {MAX_NAME_LEN} characters."
-        ),
-        IssueError::Taken => format!(
-            "{} already has a token named like {}. Pick another name, so each one's client gets a name of its own.",
-            match kind {
-                Kind::Server => "The server",
-                Kind::Organization => title,
-            },
-            refused.name.trim(),
-        ),
+    let for_apps_id = element_id(cx);
+    let for_apps = refused.is_some_and(|refused| refused.for_apps);
+    let problem = refused.map(|refused| {
+        let owner = match kind {
+            Kind::Server => "The server",
+            Kind::Organization => title,
+        };
+        problem_text(refused.problem, owner, &refused.name)
     });
     let (heading, about) = match kind {
         Kind::Server => (
@@ -1064,6 +1164,17 @@ async fn issue_dialog(
                             switch(attrs: attributes! { id=(&manages_id) name="manages" class="mt-0.5" checked=(manages.then_some("")) })
                         </div>
                     }
+                    if offered.is_some() {
+                        <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
+                            <div class="flex flex-col gap-0.5">
+                                <label for=(&for_apps_id) class="text-sm font-medium">"Available to this organization's apps"</label>
+                                <p class="text-xs text-muted-foreground">
+                                    "For a client that runs here as an app, such as a bot: oxploy keeps the token, and an app takes it as a variable named after it, such as ${OXPLOY_MCP_TELEGRAM_BOT}. Off, oxploy keeps only its hash and shows it once."
+                                </p>
+                            </div>
+                            switch(attrs: attributes! { id=(&for_apps_id) name="for_apps" class="mt-0.5" checked=(for_apps.then_some("")) })
+                        </div>
+                    }
                     if let Some(offered) = offered {
                         <div class="flex flex-col gap-3">
                             <div class="flex items-start justify-between gap-4 rounded-lg border border-border p-3">
@@ -1098,6 +1209,50 @@ async fn issue_dialog(
                         button(attrs: attributes! { type="submit" }, "Create token")
                     )
                 </form>
+            )
+        )
+    })
+}
+
+/// A dialog that confirms making `token` available to the organization's apps, which
+/// gives it a new token.
+#[component]
+async fn share_dialog(cx: &Cx, open: &Signal<bool>, token: &McpToken) -> Result<impl View> {
+    let open = open.clone();
+    let title_id = element_id(cx);
+    let description_id = element_id(cx);
+    let variable = crate::features::mcp::variable_name(&token.name);
+
+    Ok(view! {
+        alert_dialog(
+            open: $(open.get()),
+            attrs: attributes! {
+                aria-labelledby=(&title_id)
+                aria-describedby=(&description_id)
+            },
+            dialog_content(
+                dialog_header(
+                    dialog_title(attrs: attributes! { id=(&title_id) }, "Make it available to apps")
+                    dialog_description(
+                        attrs: attributes! { id=(&description_id) },
+                        "oxploy kept only the hash of "
+                        <strong class="font-medium text-foreground">(&token.name)</strong>
+                        ", so it makes a new token, which it keeps, and clients that send the current one are turned away. This organization's apps take the new one as "
+                        <code class="font-mono text-foreground">"${" (&variable) "}"</code>
+                        ", after a restart."
+                    )
+                )
+                dialog_footer(
+                    button(
+                        variant: ButtonVariant::Ghost,
+                        attrs: attributes! { type="button" @click=$(|_e: Event| open.set(false)) },
+                        "Cancel"
+                    )
+                    <form method="post" action=(href!(share))>
+                        <input type="hidden" name="id" value=(token.id.to_string())>
+                        button(attrs: attributes! { type="submit" }, "Make a new token for apps")
+                    </form>
+                )
             )
         )
     })

@@ -35,6 +35,7 @@ pub fn described(token: &McpToken, reach: &Reach, apps: &[Serving]) -> Value {
         "name": token.name,
         "reaches": if token.picks_tools() { "picked" } else { "all" },
         "tools": tools,
+        "variable": token.variable(),
         "created_at": moment(token.created_at),
         "last_used_at": token.last_used_at.and_then(moment),
     })
@@ -84,7 +85,7 @@ mod tests {
     use super::super::apps::tests::app_with_tools;
     use super::super::{create_mcp_token, revoke_mcp_token, set_token_tools};
     use crate::db::{TestDb, db};
-    use crate::features::mcp::McpToken;
+    use crate::features::mcp::{McpToken, NewToken};
     use crate::features::organization::Organization;
 
     /// An organization named `name`.
@@ -105,6 +106,7 @@ mod tests {
             name: name.to_owned(),
             all: false,
             tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            for_apps: false,
         }
     }
 
@@ -157,11 +159,10 @@ mod tests {
         let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
         let shop = organization(&cx, "Porta Global").await;
         let app = app_with_tools(&cx, shop.id, "Porta Global").await;
-        let (bot, _) = McpToken::issue(&cx, Some(shop.id), "Telegram bot", Some(&[]), false)
-            .await
-            .unwrap()
-            .unwrap();
-        let (server, _) = McpToken::issue(&cx, None, "Claude Local", None, true).await.unwrap().unwrap();
+        let bot = NewToken { name: "Telegram bot", picked: Some(&[]), ..NewToken::default() };
+        let (bot, _) = McpToken::issue(&cx, Some(shop.id), &bot).await.unwrap().unwrap();
+        let server = NewToken { name: "Claude Local", manages: true, ..NewToken::default() };
+        let (server, _) = McpToken::issue(&cx, None, &server).await.unwrap().unwrap();
         assert!(server.manages());
 
         let purge = format!("{}__purge", app.app_name);

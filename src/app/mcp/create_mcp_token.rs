@@ -8,7 +8,9 @@ use topcoat::context::Cx;
 use super::tokens::{describe, picks_named};
 use crate::app::dashboard::panel_url;
 use crate::db::db;
-use crate::features::mcp::{ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, claude_code_command, client_name};
+use crate::features::mcp::{
+    ClaudeScope, IssueError, MAX_NAME_LEN, McpToken, NewToken, claude_code_command, client_name, variable_name,
+};
 use crate::features::organization::Organization;
 
 /// The name agents call the tool by.
@@ -21,8 +23,12 @@ const DESCRIPTION: &str = "Makes an MCP token for one client of an organization,
     tool turned on in the organization's apps. It returns the token's secret this once, \
     as oxploy keeps only its hash, with the commands that connect Claude Code to it, in \
     the project it runs in or in every project of its user: hand them to the client \
-    they are for, and never repeat the secret in a reply. A token of the server cannot \
-    be made here.";
+    they are for, and never repeat the secret in a reply. With for_apps, it is for a \
+    client that runs on this server as one of the organization's apps, such as a bot: \
+    oxploy keeps it, and the app takes it as the variable it returns, such as \
+    ${OXPLOY_MCP_TELEGRAM_BOT}, with a line such as MCP_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT} \
+    in its Environment tab, so the secret need not be handed over. A token of the \
+    server cannot be made here.";
 
 /// The tool's name, description and arguments, for `tools/list`.
 pub fn definition() -> Value {
@@ -52,6 +58,11 @@ pub fn definition() -> Value {
                     "items": { "type": "string" },
                     "description": "The tools it reaches, such as porta-global__list_requests, when all is false.",
                 },
+                "for_apps": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Whether the organization's apps can take it as a variable, for a client that runs here as one of them.",
+                },
             },
             "required": ["organization_id", "name"],
             "additionalProperties": false,
@@ -75,6 +86,8 @@ pub(super) struct Arguments {
     pub all: bool,
     #[serde(default)]
     pub tools: Vec<String>,
+    #[serde(default)]
+    pub for_apps: bool,
 }
 
 /// Makes the token. The inner error says what is wrong with the arguments, making
@@ -111,7 +124,13 @@ pub(super) async fn issue(cx: &Cx, arguments: Arguments, endpoint: &str) -> topc
             Err(refusal) => return Ok(Err(refusal)),
         }
     };
-    let (token, secret) = match McpToken::issue(cx, Some(organization.id), &arguments.name, picked.as_deref(), false).await? {
+    let new = NewToken {
+        name: &arguments.name,
+        picked: picked.as_deref(),
+        manages: false,
+        for_apps: arguments.for_apps,
+    };
+    let (token, secret) = match McpToken::issue(cx, Some(organization.id), &new).await? {
         Ok(issued) => issued,
         Err(IssueError::BadName) => {
             return Ok(Err(format!(
@@ -123,6 +142,12 @@ pub(super) async fn issue(cx: &Cx, arguments: Arguments, endpoint: &str) -> topc
                 "{} already has a token named like {}. Pick another name, so each client gets a name of its own.",
                 organization.name,
                 arguments.name.trim()
+            )));
+        }
+        Err(IssueError::Reserved | IssueError::Server) => {
+            return Ok(Err(format!(
+                "Its apps would take it as {}, a variable oxploy sets itself. Pick another name.",
+                variable_name(&arguments.name)
             )));
         }
     };

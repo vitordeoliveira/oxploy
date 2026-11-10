@@ -5,6 +5,12 @@
 //! A value can use `${NAME}` for a variable oxploy sets, such as
 //! `DATABASE_URL=sqlite:${OXPLOY_STORAGE_DIR}/data.db`, or for one set on an earlier
 //! line.
+//!
+//! It can also use one of its organization's MCP tokens that were made available to
+//! its apps, as `${OXPLOY_MCP_<TOKEN>}`, such as `MCP_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT}`.
+//! Only an app that does gets the token. Saving checks that such a token exists, with
+//! [`check_tokens`], but reading the saved variables does not: a token revoked since is
+//! empty, rather than making the app lose all of its variables.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -22,8 +28,21 @@ pub const STORAGE_VARIABLE: &str = "OXPLOY_STORAGE_DIR";
 /// app serves one. Values can use it either way: it is empty while the app serves none.
 pub const MCP_TOKEN_VARIABLE: &str = "OXPLOY_MCP_TOKEN";
 
+/// The variable with the address of this server's MCP, on 127.0.0.1, where an app
+/// that is an MCP client of its organization calls it.
+pub const MCP_URL_VARIABLE: &str = "OXPLOY_MCP_URL";
+
+/// What the variable of an organization's MCP token starts with, before the token's
+/// name.
+pub const TOKEN_PREFIX: &str = "OXPLOY_MCP_";
+
 /// The variables oxploy sets for every app, which values can use.
-const PROVIDED: [&str; 3] = [PORT_VARIABLE, STORAGE_VARIABLE, MCP_TOKEN_VARIABLE];
+const PROVIDED: [&str; 4] = [PORT_VARIABLE, STORAGE_VARIABLE, MCP_TOKEN_VARIABLE, MCP_URL_VARIABLE];
+
+/// Whether oxploy sets the variable `name` for every app.
+pub fn is_set_by_oxploy(name: &str) -> bool {
+    PROVIDED.contains(&name)
+}
 
 /// One variable.
 #[derive(Debug, PartialEq, Eq)]
@@ -111,7 +130,10 @@ pub fn parse(text: &str, elsewhere: &[SetElsewhere<'_>]) -> Result<Vec<Variable>
         let value = unquote(value);
         if expands {
             for name in references(value).map_err(problem)? {
-                let provided = PROVIDED.contains(&name) || elsewhere.iter().any(|set| set.name == name);
+                // A token's variable is checked when saving, by `check_tokens`.
+                let provided = PROVIDED.contains(&name)
+                    || name.starts_with(TOKEN_PREFIX)
+                    || elsewhere.iter().any(|set| set.name == name);
                 if !provided && !lines_by_key.contains_key(name) {
                     return Err(problem(format!(
                         "${{{name}}} is not set on an earlier line, and oxploy does not set it"
@@ -168,7 +190,36 @@ fn references(value: &str) -> Result<Vec<&str>, String> {
     Ok(names)
 }
 
-/// Replaces each `${NAME}` in `value` with its value in `known`.
+/// Checks that each MCP token the variables in `text` use, as `${OXPLOY_MCP_<TOKEN>}`,
+/// is one of the organization's made available to its apps, named in `available`.
+/// `text` must already read as variables; see [`parse`].
+pub fn check_tokens(text: &str, available: &[String]) -> Result<(), EnvironmentError> {
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        let Some((_, value)) = line.split_once('=').filter(|_| !line.starts_with('#')) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+            continue;
+        }
+        for name in references(unquote(value)).unwrap_or_default() {
+            let token = name.starts_with(TOKEN_PREFIX) && !PROVIDED.contains(&name);
+            if token && !available.iter().any(|available| available == name) {
+                return Err(EnvironmentError {
+                    line: index + 1,
+                    problem: format!(
+                        "${{{name}}} is no MCP token of this organization that its apps can use. The MCP page lists them."
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Replaces each `${NAME}` in `value` with its value in `known`. A token's variable
+/// that is not known, as one revoked since, is empty.
 fn expand(value: &str, known: &HashMap<String, String>) -> String {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -180,6 +231,7 @@ fn expand(value: &str, known: &HashMap<String, String>) -> String {
         };
         match known.get(&after[..end]) {
             Some(value) => expanded.push_str(value),
+            None if after[..end].starts_with(TOKEN_PREFIX) => {}
             None => expanded.push_str(&rest[start..start + 2 + end + 1]),
         }
         rest = &after[end + 1..];
@@ -214,6 +266,33 @@ fn unquote(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_the_organizations_mcp_tokens_only_when_asked_for() {
+        let text = "BOT_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT}\nGONE=${OXPLOY_MCP_REVOKED}\nURL=${OXPLOY_MCP_URL}\nLITERAL='${OXPLOY_MCP_TELEGRAM_BOT}'";
+        let variables = parse(text, &[]).unwrap();
+        let provided = [
+            (MCP_URL_VARIABLE, "http://127.0.0.1:3000/mcp".to_owned()),
+            ("OXPLOY_MCP_TELEGRAM_BOT", "oxp_1".to_owned()),
+        ];
+        assert_eq!(
+            resolve(variables, &provided),
+            [
+                ("BOT_TOKEN".to_owned(), "oxp_1".to_owned()),
+                // A token revoked since is empty, and the other variables stay.
+                ("GONE".to_owned(), String::new()),
+                ("URL".to_owned(), "http://127.0.0.1:3000/mcp".to_owned()),
+                ("LITERAL".to_owned(), "${OXPLOY_MCP_TELEGRAM_BOT}".to_owned()),
+            ]
+        );
+
+        let available = ["OXPLOY_MCP_TELEGRAM_BOT".to_owned()];
+        assert_eq!(check_tokens("BOT=${OXPLOY_MCP_TELEGRAM_BOT}\nURL=${OXPLOY_MCP_URL}", &available), Ok(()));
+        assert_eq!(check_tokens("# A=${OXPLOY_MCP_NONE}\nB='${OXPLOY_MCP_NONE}'", &available), Ok(()));
+        let error = check_tokens("A=1\nGONE=${OXPLOY_MCP_REVOKED}", &available).unwrap_err();
+        assert_eq!(error.line, 2);
+        assert!(error.problem.contains("OXPLOY_MCP_REVOKED"), "{}", error.problem);
+    }
 
     fn pairs(text: &str) -> Vec<(String, String)> {
         parse(text, &[])

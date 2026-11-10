@@ -25,7 +25,10 @@ use toasty::Db;
 use super::app_files::AppFiles;
 use super::databases::{self, ManagedDatabase};
 use super::deployment::Deployment;
-use super::environment::{self, MCP_TOKEN_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE};
+use super::caddy::local_panel_address;
+use super::environment::{self, MCP_TOKEN_VARIABLE, MCP_URL_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE};
+use super::mcp::McpToken;
+use super::project::Project;
 use super::service::Service;
 use super::time_zone;
 use super::usage::Usage;
@@ -83,7 +86,8 @@ impl Launch {
             None => source,
         };
         let databases = ManagedDatabase::of_service_in(db, service.id).await?;
-        let variables = app_variables(service, &files, port, &databases);
+        let oxploy = FromOxploy::of(db, service).await?;
+        let variables = app_variables(service, &files, port, &databases, &oxploy);
         Ok(Some(Launch {
             service_id: service.id,
             binary: files.binary(release_id, binary),
@@ -446,16 +450,45 @@ impl Runtime {
     }
 }
 
+/// What oxploy tells an app about its organization's MCP: where this server's MCP
+/// answers, and the organization's tokens available to its apps, by variable, which the
+/// app's own variables can use.
+#[derive(Clone, Debug, Default)]
+pub struct FromOxploy {
+    pub mcp_url: String,
+    pub tokens: Vec<(String, String)>,
+}
+
+impl FromOxploy {
+    /// What oxploy tells the service's app.
+    pub async fn of(db: &Db, service: &Service) -> toasty::Result<FromOxploy> {
+        let project = Project::filter_by_id(service.project_id)
+            .first()
+            .exec(&mut db.clone())
+            .await?;
+        let tokens = match project {
+            Some(project) => McpToken::for_apps(db, project.organization_id).await?,
+            None => Vec::new(),
+        };
+        Ok(FromOxploy {
+            mcp_url: format!("http://{}/mcp", local_panel_address()),
+            tokens,
+        })
+    }
+}
+
 /// The service's variables as its app and builds get them: those its databases set,
-/// then its own, with each `${NAME}` filled in from what oxploy sets for the app or
-/// from an earlier line, then the token of its MCP server while it serves one.
+/// then its own, with each `${NAME}` filled in from what oxploy sets for the app, its
+/// organization's MCP tokens in `oxploy`, or an earlier line, then where this server's
+/// MCP answers and the token of the app's MCP server while it serves one.
 pub fn app_variables(
     service: &Service,
     files: &AppFiles,
     port: u64,
     managed: &[ManagedDatabase],
+    oxploy: &FromOxploy,
 ) -> Vec<(String, String)> {
-    variables_with_port(service, files, &port.to_string(), managed)
+    variables_with_port(service, files, &port.to_string(), managed, oxploy)
 }
 
 /// The variables of [`app_variables`], with `port` as text, so a service that has no
@@ -465,6 +498,7 @@ pub fn variables_with_port(
     files: &AppFiles,
     port: &str,
     managed: &[ManagedDatabase],
+    oxploy: &FromOxploy,
 ) -> Vec<(String, String)> {
     // Saved variables always parse: a problem is refused when saving.
     let own = environment::parse(
@@ -478,10 +512,14 @@ pub fn variables_with_port(
         (PORT_VARIABLE, port.to_owned()),
         (STORAGE_VARIABLE, files.storage().display().to_string()),
         (MCP_TOKEN_VARIABLE, mcp_token.unwrap_or_default().to_owned()),
+        (MCP_URL_VARIABLE, oxploy.mcp_url.clone()),
     ];
     provided.extend(set_by_databases.iter().map(|(name, value)| (name.as_str(), value.clone())));
+    // Only the app whose variables use one of them gets an organization's token.
+    provided.extend(oxploy.tokens.iter().map(|(name, value)| (name.as_str(), value.clone())));
     let mut variables = set_by_databases.clone();
     variables.extend(environment::resolve(own, &provided));
+    variables.push((MCP_URL_VARIABLE.to_owned(), oxploy.mcp_url.clone()));
     if let Some(token) = mcp_token {
         variables.push((MCP_TOKEN_VARIABLE.to_owned(), token.to_owned()));
     }
