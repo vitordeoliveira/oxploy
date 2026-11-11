@@ -20,6 +20,7 @@ use super::hosts::option_switch;
 use super::{ServiceId, ServiceTab, current_service, settings_card};
 use crate::app::dashboard::mcp::{EFFECT_GROUPS, effect_heading, group_key};
 use crate::app::dashboard::require_organization;
+use crate::components::copy_text::copy_text;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
@@ -161,9 +162,9 @@ pub async fn mcp_tab(cx: &Cx, project: &Project, service: &Service) -> Result<im
                         <p class="text-muted-foreground">
                             "An app that reads another variable, such as MCP_TOKEN, takes it with this line in the Environment tab:"
                         </p>
-                        <code class="w-fit rounded-md border border-border bg-background px-2 py-1 font-mono text-xs select-all">
-                            "MCP_TOKEN=${OXPLOY_MCP_TOKEN}"
-                        </code>
+                        <div>
+                            copy_text(text: "MCP_TOKEN=${OXPLOY_MCP_TOKEN}")
+                        </div>
                     </div>
                 }
             )

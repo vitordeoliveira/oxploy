@@ -11,6 +11,7 @@ use topcoat::{
 
 use super::settings_card;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::components::copy_text::copy_text;
 use crate::components::field::{field, field_description, field_error, field_label};
 use crate::components::textarea::textarea;
 use crate::features::app_files::AppFiles;
@@ -126,6 +127,8 @@ struct Row {
     note: Option<String>,
     /// Whether the value may be a secret, which stays blurred until shown.
     secret: bool,
+    /// Text to copy into the variables above, such as a line that uses it.
+    copies: Vec<String>,
 }
 
 /// Variables that come from one place.
@@ -154,6 +157,7 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
         value: Some(value.to_owned()),
         note,
         secret,
+        copies: Vec::new(),
     };
 
     let yours: Vec<Row> = resolved
@@ -172,6 +176,7 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
                 None => "Chosen at the first deploy.".to_owned(),
             }),
             secret: false,
+            copies: Vec::new(),
         },
         row(
             STORAGE_VARIABLE,
@@ -193,10 +198,12 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
         .map(|(name, _)| Row {
             name: name.clone(),
             value: None,
-            note: Some(format!(
-                "An MCP token of this organization, from the MCP page. The app gets it only with a line such as MCP_TOKEN=${{{name}}}."
-            )),
+            note: Some(
+                "An MCP token of this organization, from the MCP page. The app gets it only from a line above that uses it, such as:"
+                    .to_owned(),
+            ),
             secret: true,
+            copies: vec![format!("${{{name}}}"), format!("MCP_TOKEN=${{{name}}}")],
         })
         .collect();
     if let Some(token) = service.mcp_token_in_use() {
@@ -307,6 +314,14 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
                                             }
                                             if let Some(note) = &row.note {
                                                 <span class="text-xs text-muted-foreground">(note)</span>
+                                            }
+                                            if !row.copies.is_empty() {
+                                                <div class="flex flex-wrap gap-1.5 pt-1">
+                                                    #[key(text.clone())]
+                                                    for text in &row.copies {
+                                                        copy_text(text: text)
+                                                    }
+                                                </div>
                                             }
                                         </div>
                                     </li>

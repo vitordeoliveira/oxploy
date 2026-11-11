@@ -32,6 +32,7 @@ use super::projects::project_id::services::service_id::ServiceTab;
 use super::{panel_url, require_organization, require_server_owner, require_sign_in};
 use crate::components::alert_dialog::alert_dialog;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::components::copy_text::copy_text;
 use crate::components::dialog::{
     dialog, dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title,
 };
@@ -459,9 +460,9 @@ async fn mcp_view(cx: &Cx, shown: Option<&Shown>) -> Result<impl View> {
             </div>
             <section class="flex flex-col gap-2 rounded-xl border border-border bg-card p-5">
                 <h2 class="font-semibold">"Endpoint"</h2>
-                <code class="w-fit max-w-full rounded-md bg-muted px-2 py-1 font-mono text-sm break-all select-all">
-                    (&endpoint)
-                </code>
+                <div>
+                    copy_text(text: &endpoint)
+                </div>
                 <p class="text-sm text-muted-foreground">
                     "Clients send a token as "
                     <code class="font-mono text-foreground">"Authorization: Bearer <token>"</code>
@@ -667,6 +668,10 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
             claude_code_command(&issued.client, endpoint, &issued.secret, ClaudeScope::User),
         ),
     ];
+    let uses = issued
+        .variable
+        .as_ref()
+        .map(|variable| [format!("${{{variable}}}"), format!("MCP_TOKEN=${{{variable}}}")]);
 
     Ok(view! {
         <div class="flex flex-col gap-3 border-b border-border bg-primary/5 p-5">
@@ -677,17 +682,17 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
                     " now. oxploy keeps only its hash, so it cannot show it again."
                 </p>
             </div>
-            <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-sm break-all select-all">
-                (&issued.secret)
-            </code>
-            if let Some(variable) = &issued.variable {
-                <p class="text-sm">
-                    "This organization's apps take it as "
-                    <code class="font-mono select-all">"${" (variable) "}"</code>
-                    ", with a line such as "
-                    <code class="font-mono select-all">"MCP_TOKEN=${" (variable) "}"</code>
-                    " in their Environment tab."
-                </p>
+            copy_text(text: &issued.secret, block: true)
+            if let Some([reference, line]) = &uses {
+                <div class="flex flex-col gap-1.5">
+                    <p class="text-sm">
+                        "This organization's apps take it in their Environment tab, from a line that uses it, such as:"
+                    </p>
+                    <div class="flex flex-wrap gap-1.5">
+                        copy_text(text: reference)
+                        copy_text(text: line)
+                    </div>
+                </div>
             }
             <p class="text-sm text-muted-foreground">
                 "To connect Claude Code, run one of these in your own terminal, not in a Claude conversation, which would keep the token in its history:"
@@ -696,9 +701,7 @@ async fn issued_token(issued: &Issued, endpoint: &str) -> Result<impl View> {
             for (index, (label, command)) in commands.iter().enumerate() {
                 <div class="flex flex-col gap-1.5">
                     <p class="text-xs font-medium">(label)</p>
-                    <code class="rounded-md border border-border bg-background px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap select-all">
-                        (command)
-                    </code>
+                    copy_text(text: command, block: true)
                 </div>
             }
         </div>
@@ -719,8 +722,8 @@ async fn token_row(
     let revoking = revoking.clone();
     let label = format!("Revoke {}", token.name);
     let choosing = reaching.map(|reaching| reaching.choosing.clone());
-    let variable = token.variable();
-    let sharing = sharing.filter(|_| variable.is_none()).cloned();
+    let reference = token.variable().map(|variable| format!("${{{variable}}}"));
+    let sharing = sharing.filter(|_| reference.is_none()).cloned();
 
     Ok(view! {
         <li class="flex items-center gap-3 px-5 py-4">
@@ -744,11 +747,11 @@ async fn token_row(
                 } else {
                     <span class="text-xs text-muted-foreground">"Reads only"</span>
                 }
-                if let Some(variable) = &variable {
+                if let Some(reference) = &reference {
                     <span class="flex flex-wrap items-center gap-1 text-xs text-muted-foreground">
                         icon(data: iconify_icon!("lucide:variable"), size: 12, attrs: attributes! { class="shrink-0" })
                         "Apps take it as"
-                        <code class="font-mono text-foreground select-all">"${" (variable) "}"</code>
+                        copy_text(text: reference)
                     </span>
                 }
             </div>

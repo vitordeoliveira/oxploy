@@ -1,5 +1,6 @@
 pub mod alert_dialog;
 pub mod button;
+pub mod copy_text;
 pub mod dialog;
 pub mod dropdown_menu;
 pub mod field;
