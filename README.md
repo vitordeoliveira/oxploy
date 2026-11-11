@@ -135,6 +135,17 @@ folder it is installed in. To go back, stop oxploy, move `previous/oxploy` and
 dates, and the times oxploy writes in the apps' logs and backups. Until one is picked, it
 is the server's own, and the apps keep the server's own either way.
 
+Once a day, oxploy tells oxploy.com that it runs, with `POST /api/ping`: its version, the
+machine, such as `x86_64-linux`, and a random ID it made the first time it started, which
+tells its reports apart and says nothing about the server. The super admin can also share
+what the server runs, in numbers only, such as how many apps, domains and deployments it
+has, never their names. **Settings** turns either off, shows the report as it would go
+now, and when the last one went out. `OXPLOY_TELEMETRY=off` or `DO_NOT_TRACK=1` turn it off
+whatever Settings says. A development build does not report, unless
+`OXPLOY_TELEMETRY_URL` sends its reports elsewhere, such as to the site running locally at
+`http://127.0.0.1:3000/api/ping`. The code is in `src/features/telemetry.rs`, and what the
+site keeps is on [its documentation](https://oxploy.com/docs/usage-reporting).
+
 ## MCP
 
 `/mcp` lets AI agents, such as a bot or Claude Code, reach the server and its apps through

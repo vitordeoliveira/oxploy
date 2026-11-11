@@ -1,6 +1,6 @@
 //! Settings of the whole server, which only its super admin sees: the panel's own
-//! domain, the time zone it shows times in, the Caddy that serves it and the apps, and
-//! the version of oxploy.
+//! domain, the time zone it shows times in, the Caddy that serves it and the apps, the
+//! version of oxploy, and what it reports to oxploy.com.
 
 use serde::Deserialize;
 use topcoat::{
@@ -12,10 +12,11 @@ use topcoat::{
         error::{SeeOther, bad_request, see_other},
         href, page, route,
     },
-    runtime::{Event, Signal, connected, shard, signal},
+    runtime::{Event, Signal, connected, procedure, shard, signal},
     view::{View, attributes, component, element_id, view},
 };
 
+use super::projects::created_at;
 use super::proxy::{caddy_notice, resolution_label};
 use super::require_server_owner;
 use super::update::{update_dialog, version_card};
@@ -26,9 +27,11 @@ use crate::components::dialog::{dialog_content, dialog_description, dialog_foote
 use crate::components::field::{field, field_description, field_label};
 use crate::components::input::input;
 use crate::components::select::select;
+use crate::components::switch::switch;
 use crate::db::db;
 use crate::features::caddy::{Caddy, CaddyStatus};
 use crate::features::domain::{self, PanelDomain};
+use crate::features::telemetry::{self, Telemetry};
 use crate::features::time_zone::{self, PanelTimeZone};
 
 #[page]
@@ -47,6 +50,8 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
     let updating = signal(cx, || false);
     // How many times the version card asked GitHub, which renders it and the dialog again.
     let checks = signal(cx, || 0usize);
+    // How many times a switch of usage reporting saved, which renders its card again.
+    let reporting_changes = signal(cx, || 0usize);
     let here = href!(page).resolve(cx);
     let time_zone_url = href!(set_time_zone).resolve(cx);
     let time_zone_id = element_id(cx);
@@ -180,12 +185,134 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
                 )
             )
             version_card(open: updating.clone(), checks: checks.clone())
+            usage_reporting_card(changes: reporting_changes.clone())
         </div>
         update_dialog(open: updating.clone(), checks: checks.clone(), return_to: here.clone())
         if let Some(panel) = &panel {
             remove_dialog(open: &removing, host: &panel.host, panel: &ports.panel, action: &remove_url)
         }
     })
+}
+
+/// Whether oxploy tells oxploy.com once a day that it runs, and what it runs, with the
+/// report as it would go now. Each switch saves at once. A shard answers requests of its
+/// own, so it checks access itself.
+#[shard]
+async fn usage_reporting_card(cx: &Cx, changes: Signal<usize>) -> Result<impl View> {
+    require_server_owner(cx).await?;
+    let _ = changes.get();
+    let telemetry = Telemetry::get_in(&db(cx)).await?;
+    let off_by = telemetry::turned_off();
+    let report = telemetry.report(&db(cx)).await?;
+    let report = serde_json::to_string_pretty(&report).unwrap_or_default();
+    let forced_off = off_by.is_some();
+    let sending = !forced_off && telemetry.reports;
+    let reports = signal(cx, || telemetry.reports);
+    let shares = signal(cx, || telemetry.shares_usage);
+    let reports_id = element_id(cx);
+    let shares_id = element_id(cx);
+    let changed = changes.clone();
+    let changed_too = changes.clone();
+    let shares_off = reports.clone();
+    // A failure since the last report that went out.
+    let failure = telemetry
+        .failed_at
+        .filter(|failed| telemetry.sent_at.is_none_or(|sent| *failed > sent))
+        .zip(telemetry.error.clone());
+
+    Ok(view! {
+        settings_card(
+            title: "Usage reporting",
+            text: "Once a day, oxploy tells oxploy.com that it runs, with its version and a random ID that says nothing about this server or you. It is how the project knows how many servers run oxploy, and which versions they are on.",
+            if let Some(by) = off_by {
+                <p class="flex items-start gap-2 rounded-lg bg-muted px-4 py-3 text-sm">
+                    icon(data: iconify_icon!("lucide:circle-off"), size: 16, attrs: attributes! { class="mt-0.5 shrink-0 text-muted-foreground" })
+                    <span>"Turned off by " <span class="font-mono">(by)</span> ", so oxploy sends nothing, whatever is picked here."</span>
+                </p>
+            }
+            <div class="flex flex-col divide-y divide-border rounded-lg border border-border">
+                <div class="flex items-start justify-between gap-4 p-4">
+                    <div class="flex flex-col gap-0.5">
+                        <label for=(&reports_id) class="text-sm font-medium">"Report that this server runs"</label>
+                        <p class="text-xs text-muted-foreground">"Its version, its machine, such as x86_64-linux, and its random ID."</p>
+                    </div>
+                    switch(
+                        attrs: attributes! {
+                            id=(&reports_id)
+                            class="mt-0.5"
+                            disabled=(forced_off.then_some(""))
+                            :checked=$(reports.get())
+                            @change=$(async |_e: Event| {
+                                let saved = set_reporting(!reports.get()).await;
+                                reports.set(saved);
+                                changed.increment();
+                            })
+                        }
+                    )
+                </div>
+                <div class="flex items-start justify-between gap-4 p-4">
+                    <div class="flex flex-col gap-0.5">
+                        <label for=(&shares_id) class="text-sm font-medium">"Share what it runs"</label>
+                        <p class="text-xs text-muted-foreground">
+                            "Adds counts, such as how many apps, domains and deployments it has, and which ways it builds them. Never their names."
+                        </p>
+                    </div>
+                    switch(
+                        attrs: attributes! {
+                            id=(&shares_id)
+                            class="mt-0.5"
+                            :disabled=$(if forced_off { true } else { !shares_off.get() })
+                            :checked=$(shares.get())
+                            @change=$(async |_e: Event| {
+                                let saved = set_sharing(!shares.get()).await;
+                                shares.set(saved);
+                                changed_too.increment();
+                            })
+                        }
+                    )
+                </div>
+            </div>
+            <p role="status" class="text-sm text-muted-foreground">
+                if !sending {
+                    "Nothing is sent."
+                } else if let Some((failed, error)) = &failure {
+                    <span class="text-destructive">"The last report failed " created_at(seconds: *failed) ": " (error) "."</span>
+                    " oxploy tries again within the hour."
+                } else if let Some(sent) = telemetry.sent_at {
+                    "Last sent " created_at(seconds: sent) ". The next goes out a day after it."
+                } else {
+                    "Not sent yet. oxploy sends one within the hour."
+                }
+            </p>
+            <details class="group rounded-lg border border-border">
+                <summary class="flex cursor-pointer items-center gap-2 px-4 py-3 text-sm font-medium select-none">
+                    icon(data: iconify_icon!("lucide:chevron-right"), size: 14, attrs: attributes! { class="shrink-0 transition-transform group-open:rotate-90" })
+                    if sending { "What it sends now" } else { "What it would send" }
+                </summary>
+                <pre class="overflow-x-auto border-t border-border bg-muted/40 px-4 py-3 font-mono text-xs">(report)</pre>
+            </details>
+            field_description(
+                "Turn it off for good with OXPLOY_TELEMETRY=off, or DO_NOT_TRACK=1, in oxploy's environment. "
+                <a href="https://oxploy.com/docs/usage-reporting" class="font-medium text-foreground underline underline-offset-4">"What it sends, and what oxploy.com keeps"</a>
+            )
+        )
+    })
+}
+
+/// Turns usage reporting on or off, and returns whether it is on.
+#[procedure]
+async fn set_reporting(cx: &Cx, on: bool) -> Result<bool> {
+    require_server_owner(cx).await?;
+    Telemetry::set_reports(&db(cx), on).await?;
+    Ok(on)
+}
+
+/// Turns sharing what the server runs on or off, and returns whether it is on.
+#[procedure]
+async fn set_sharing(cx: &Cx, on: bool) -> Result<bool> {
+    require_server_owner(cx).await?;
+    Telemetry::set_shares_usage(&db(cx), on).await?;
+    Ok(on)
 }
 
 /// Where the panel's domain points, looked up once the page is connected. A shard

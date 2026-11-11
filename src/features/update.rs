@@ -511,7 +511,7 @@ fn is_writable(folder: &Path) -> bool {
 }
 
 /// This machine as the release's files name it, such as `x86_64-linux`.
-fn machine() -> String {
+pub fn machine() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 

@@ -46,6 +46,9 @@ async fn main() {
         .unwrap();
     // Looks for a newer release, which the super admin can install from the panel.
     let updater = features::update::Updater::start();
+    // Tells oxploy.com once a day that this server runs, unless it is turned off.
+    features::telemetry::Telemetry::get_in(&db).await.unwrap();
+    features::telemetry::Telemetry::start(db.clone());
     topcoat::start(
         app::router()
             .app_context(db)
