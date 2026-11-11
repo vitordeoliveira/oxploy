@@ -74,8 +74,15 @@ are shared by everyone who uses it; if a certificate does not come, switch the d
 plain HTTP or add one of your own. The panel itself gets a domain under **Settings**,
 always over HTTPS; until then it answers only at `HOST` and `PORT`, `127.0.0.1:3000` by
 default. On macOS, `brew services start caddy` needs a Caddyfile at
-`/opt/homebrew/etc/Caddyfile`, and one with only `{ admin localhost:2019 }` in it is
-enough.
+`/opt/homebrew/etc/Caddyfile`, and one with only the admin API in it is enough. Caddy
+takes a block's braces only at the end and the start of their lines, so it refuses
+`{ admin localhost:2019 }` on one line:
+
+```
+{
+	admin localhost:2019
+}
+```
 
 ## Running on a server
 
