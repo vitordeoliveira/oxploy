@@ -60,8 +60,8 @@ pub async fn create(cx: &Cx, Form(form): Form<NewServiceForm>) -> Result<SeeOthe
         }
     } else {
         let docker = form.kind == "docker";
-        if docker && docker::version().await.is_none() {
-            return Err(bad_request(docker::NO_DOCKER).into());
+        if docker && let Err(why) = docker::status().await {
+            return Err(bad_request(why.to_string()).into());
         }
         let Some(mut service) = Service::add(cx, &project, &details).await? else {
             return Err(bad_request(INVALID_DETAILS).into());

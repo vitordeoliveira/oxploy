@@ -31,7 +31,7 @@ use crate::features::deploy::Deployer;
 use crate::features::docker;
 use crate::features::project::Project;
 use crate::features::service::Service;
-use services::service_id::{self, ServiceId, external_badge};
+use services::service_id::{self, ServiceId, docker_unavailable, external_badge};
 
 module_param!(pub project_id: u64, error = not_found);
 
@@ -155,7 +155,8 @@ const KIND_CHOICE: &str = "flex cursor-pointer flex-col gap-1 rounded-lg border 
 #[component]
 async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Result<impl View> {
     let open = open.clone();
-    let has_docker = docker::version().await.is_some();
+    let docker_status = docker::status().await;
+    let has_docker = docker_status.is_ok();
     let external = signal(cx, || false);
     let (to_app, to_docker, to_external) = (external.clone(), external.clone(), external.clone());
     let title_id = element_id(cx);
@@ -209,7 +210,7 @@ async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Res
                                 if has_docker {
                                     "Any app with a Dockerfile, which oxploy builds and runs in a container. You connect it after."
                                 } else {
-                                    "Any app with a Dockerfile, run in a container. Docker is not installed on this server."
+                                    "Any app with a Dockerfile, run in a container. Not available on this server yet: see below."
                                 }
                             </span>
                         </label>
@@ -228,6 +229,9 @@ async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Res
                             <span class="text-xs text-muted-foreground">"An MCP server that runs elsewhere, which oxploy calls at its URL."</span>
                         </label>
                     </fieldset>
+                    if let Err(why) = &docker_status {
+                        docker_unavailable(why: why)
+                    }
                     field(
                         field_label(attrs: attributes! { for=(&name_id) }, "Name")
                         input(

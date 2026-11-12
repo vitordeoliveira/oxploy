@@ -417,8 +417,10 @@ impl Deployer {
         let saved = |error: toasty::Error| format!("the database could not be updated: {error}");
 
         let kind = service.builds_with();
-        if kind == BuildKind::Dockerfile && docker::version().await.is_none() {
-            return Err(docker::NO_DOCKER.to_owned());
+        if kind == BuildKind::Dockerfile
+            && let Err(why) = docker::status().await
+        {
+            return Err(why.to_string());
         }
         // A GitHub release was built elsewhere, so only builds wait for each other.
         let _build = match kind {

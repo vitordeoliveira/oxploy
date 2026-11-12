@@ -42,7 +42,9 @@ use crate::app::dashboard::projects::{
 };
 use crate::components::button::{ButtonSize, ButtonVariant, button, button_variants};
 use crate::components::tabs::{tabs, tabs_content, tabs_list, tabs_trigger};
+use crate::components::copy_text::copy_text;
 use crate::features::deploy::{AppStatus, Deployer};
+use crate::features::docker::Unavailable;
 use crate::features::domain::Domain;
 use crate::features::project::Project;
 use crate::features::service::Service;
@@ -398,6 +400,38 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
             consequence: if external { String::new() } else { " with the files in its storage".to_owned() },
             action: href!(remove, ProjectId(project.id), ServiceId(service.id)).resolve(cx)
         )
+    })
+}
+
+/// Why this server cannot build and run Docker apps, and how to fix it, with the command
+/// to copy when there is one.
+#[component]
+pub(crate) async fn docker_unavailable(why: &Unavailable) -> Result<impl View> {
+    let (fix, command) = why.fix();
+    Ok(view! {
+        <div class="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm">
+            <span class="mt-0.5 text-destructive">
+                icon(data: iconify_icon!("lucide:triangle-alert"), size: 16)
+            </span>
+            <div class="flex min-w-0 flex-1 flex-col gap-1.5">
+                <p>
+                    <span class="font-medium text-destructive">(why.problem())</span>
+                    " "
+                    <span class="text-muted-foreground">(fix)</span>
+                </p>
+                if let Some(command) = &command {
+                    copy_text(text: command, block: true)
+                }
+                <a
+                    href="https://oxploy.com/docs/installation#docker-apps"
+                    target="_blank"
+                    rel="noopener"
+                    class="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground"
+                >
+                    "Docker apps in the docs"
+                </a>
+            </div>
+        </div>
     })
 }
 

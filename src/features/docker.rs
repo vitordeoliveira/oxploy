@@ -30,48 +30,125 @@ const DOCKER_ENV: [&str; 5] = ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
 /// The variable a container gets with the address its app listens at, every one.
 pub const HOST_VARIABLE: &str = "HOST";
 
-/// The last look at Docker's version, and when.
-static LAST_LOOK: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+/// The last look at Docker, and when.
+static LAST_LOOK: Mutex<Option<(Instant, Result<String, Unavailable>)>> = Mutex::new(None);
 
-/// The version of the Docker engine on this server, or `None` when there is none or it
-/// does not answer. Looked up again at most every [`LOOK_AGAIN_AFTER`].
-pub async fn version() -> Option<String> {
-    if let Some((at, version)) = &*lock_look()
+/// Why this server cannot build and run Docker apps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unavailable {
+    /// There is no `docker` command on the panel's `PATH`.
+    NotInstalled,
+    /// The panel's user may not use Docker, as when it is not in the `docker` group.
+    NoAccess { user: String },
+    /// The `docker` command finds no Docker engine running.
+    NotRunning,
+    /// Docker did not answer in time.
+    NoAnswer,
+    /// Docker answered with another error, as it put it.
+    Failed(String),
+}
+
+impl Unavailable {
+    /// What is wrong.
+    pub fn problem(&self) -> String {
+        match self {
+            Self::NotInstalled => "Docker is not installed on this server.".to_owned(),
+            Self::NoAccess { user } => format!("Docker is installed, but oxploy's user, {user}, may not use it."),
+            Self::NotRunning => "Docker is installed, but it is not running.".to_owned(),
+            Self::NoAnswer => format!("Docker did not answer within {} seconds.", VERSION_TIMEOUT.as_secs()),
+            Self::Failed(error) => format!("Docker answered with an error: {error}"),
+        }
+    }
+
+    /// How to fix it, and the command that does, when there is one.
+    pub fn fix(&self) -> (&'static str, Option<String>) {
+        match self {
+            Self::NotInstalled => ("Install Docker, then add oxploy's user to the docker group and restart oxploy.", None),
+            Self::NoAccess { user } => (
+                "Add it to the docker group, then restart oxploy, so it runs with the group:",
+                Some(format!("sudo usermod -aG docker {user} && sudo systemctl restart oxploy")),
+            ),
+            Self::NotRunning => ("Start it:", Some("sudo systemctl start docker".to_owned())),
+            Self::NoAnswer | Self::Failed(_) => ("Check that Docker runs, then try again.", None),
+        }
+    }
+
+    /// Reads why `docker version` failed from what it printed on standard error.
+    fn from_error(stderr: &str, user: &str) -> Unavailable {
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("permission denied") {
+            Unavailable::NoAccess { user: user.to_owned() }
+        } else if lower.contains("cannot connect to the docker daemon")
+            || lower.contains("daemon is running")
+            || lower.contains("daemon running")
+        {
+            Unavailable::NotRunning
+        } else {
+            let first = stderr.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("it failed");
+            Unavailable::Failed(first.chars().take(300).collect())
+        }
+    }
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (fix, command) = self.fix();
+        write!(f, "{} {fix}", self.problem())?;
+        if let Some(command) = command {
+            write!(f, " {command}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The version of the Docker engine on this server, or why it cannot build and run
+/// Docker apps. Looked up again at most every [`LOOK_AGAIN_AFTER`].
+pub async fn status() -> Result<String, Unavailable> {
+    if let Some((at, status)) = &*lock_look()
         && at.elapsed() < LOOK_AGAIN_AFTER
     {
-        return version.clone();
+        return status.clone();
     }
     // Boxed, so the pages that ask keep a small future: theirs would otherwise hold the
     // whole of a running command's.
-    Box::pin(look_up_version()).await
+    Box::pin(look_up()).await
 }
 
-/// Asks Docker for its version, and keeps the answer for [`version`].
-async fn look_up_version() -> Option<String> {
+/// The version of the Docker engine on this server, if it can build and run Docker
+/// apps. See [`status`].
+pub async fn version() -> Option<String> {
+    status().await.ok()
+}
+
+/// Asks Docker for its version, and keeps the answer for [`status`].
+async fn look_up() -> Result<String, Unavailable> {
     let mut docker = tokio_command();
     docker
         .args(["version", "--format", "{{.Server.Version}}"])
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(VERSION_TIMEOUT, docker.output()).await;
-    let version = match output {
-        Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout)
-            .ok()
-            .map(|version| version.trim().to_owned())
-            .filter(|version| !version.is_empty()),
-        _ => None,
+    let user = std::env::var("USER").unwrap_or_else(|_| "oxploy".to_owned());
+    let status = match output {
+        Err(_) => Err(Unavailable::NoAnswer),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(Unavailable::NotInstalled),
+        Ok(Err(error)) => Err(Unavailable::Failed(error.to_string())),
+        Ok(Ok(output)) => {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if output.status.success() && !version.is_empty() {
+                Ok(version)
+            } else {
+                Err(Unavailable::from_error(&String::from_utf8_lossy(&output.stderr), &user))
+            }
+        }
     };
-    *lock_look() = Some((Instant::now(), version.clone()));
-    version
+    *lock_look() = Some((Instant::now(), status.clone()));
+    status
 }
 
-fn lock_look() -> std::sync::MutexGuard<'static, Option<(Instant, Option<String>)>> {
+fn lock_look() -> std::sync::MutexGuard<'static, Option<(Instant, Result<String, Unavailable>)>> {
     LAST_LOOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
-
-/// What a service built with Docker says when this server cannot run it.
-pub const NO_DOCKER: &str = "Docker is not installed on this server, or it is not running";
 
 /// The docker command, with only the variables it needs from the panel's environment.
 pub fn command() -> Command {
@@ -312,6 +389,24 @@ mod tests {
             inner_port: 8080,
             storage: PathBuf::from("/srv/oxploy/apps/shop-api/storage"),
         }
+    }
+
+    #[test]
+    fn says_why_docker_cannot_be_used() {
+        let denied = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.51/version\": dial unix /var/run/docker.sock: connect: permission denied";
+        let no_access = Unavailable::from_error(denied, "oxploy");
+        assert_eq!(no_access, Unavailable::NoAccess { user: "oxploy".to_owned() });
+        assert_eq!(no_access.fix().1.as_deref(), Some("sudo usermod -aG docker oxploy && sudo systemctl restart oxploy"));
+        let stopped = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?";
+        assert_eq!(Unavailable::from_error(stopped, "oxploy"), Unavailable::NotRunning);
+        let desktop = "failed to connect to the docker API at unix:///Users/me/.docker/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /Users/me/.docker/run/docker.sock: connect: no such file or directory";
+        assert_eq!(Unavailable::from_error(desktop, "me"), Unavailable::NotRunning);
+        let other = "\nError response from daemon: Docker Desktop is unable to start\n";
+        assert_eq!(
+            Unavailable::from_error(other, "me"),
+            Unavailable::Failed("Error response from daemon: Docker Desktop is unable to start".to_owned())
+        );
+        assert!(Unavailable::NotInstalled.to_string().starts_with("Docker is not installed on this server."));
     }
 
     #[test]

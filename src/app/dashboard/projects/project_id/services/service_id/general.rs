@@ -17,7 +17,7 @@ use topcoat::{
 
 use super::super::super::ProjectId;
 use super::hosts::option_switch;
-use super::{ServiceId, ServiceTab, current_service, settings_card};
+use super::{ServiceId, ServiceTab, current_service, docker_unavailable, settings_card};
 use crate::app::dashboard::git;
 use crate::app::dashboard::projects::created_at;
 use crate::app::dashboard::require_organization;
@@ -183,7 +183,7 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
     let shown = signal(cx, || first.to_owned());
     let (shows_cargo, shows_script, shows_release, shows_dockerfile, shows_other) =
         (shown.clone(), shown.clone(), shown.clone(), shown.clone(), shown.clone());
-    let docker_version = docker::version().await;
+    let docker_status = docker::status().await;
     let (project_id, service_id) = (project.id, service.id);
     let cargo_url = href!(save_build, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let script_url = href!(save_script, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
@@ -406,11 +406,8 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
             </div>
             <div :hidden=$(shows_dockerfile.get() != "dockerfile")>
                 <form method="post" action=(&dockerfile_url) class="flex flex-col gap-5">
-                    if docker_version.is_none() {
-                        <p class="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-                            icon(data: iconify_icon!("lucide:triangle-alert"), size: 16, attrs: attributes! { class="shrink-0" })
-                            (docker::NO_DOCKER) ". Install Docker to build and run the app in a container."
-                        </p>
+                    if let Err(why) = &docker_status {
+                        docker_unavailable(why: why)
                     }
                     <p class="text-sm text-muted-foreground">
                         "Deploying runs docker build in the build path, and runs the image in a container on the project's network, where the project's other containers reach it by its app name, "
@@ -452,7 +449,7 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                     </div>
                     <div class="flex justify-end">
                         button(
-                            attrs: attributes! { type="submit" disabled=(docker_version.is_none().then_some("")) },
+                            attrs: attributes! { type="submit" disabled=(docker_status.is_err().then_some("")) },
                             "Save Dockerfile"
                         )
                     </div>
@@ -1233,8 +1230,8 @@ struct DockerfileForm {
 #[route(POST "./dockerfile")]
 async fn save_dockerfile(cx: &Cx, Form(form): Form<DockerfileForm>) -> Result<SeeOther> {
     let (project, mut service) = current_service(cx).await?;
-    if docker::version().await.is_none() {
-        return Err(bad_request(docker::NO_DOCKER).into());
+    if let Err(why) = docker::status().await {
+        return Err(bad_request(why.to_string()).into());
     }
     let build = DockerfileBuild {
         dockerfile: &form.dockerfile,
