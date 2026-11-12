@@ -31,6 +31,10 @@ pub struct Deployment {
     /// The file name of the built binary, once built.
     pub binary: Option<String>,
 
+    /// The Docker image built, such as `oxploy-shop-api:42`, for a service built with
+    /// Docker.
+    pub image: Option<String>,
+
     /// The service's build path when this was built, which the binary runs in. `None`
     /// is the repository root.
     pub build_path: Option<String>,

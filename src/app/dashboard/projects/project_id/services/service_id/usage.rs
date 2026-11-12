@@ -37,6 +37,12 @@ pub async fn monitoring_tab(cx: &Cx, service: &Service) -> Result<impl View> {
 
     Ok(view! {
         <div class="flex flex-col gap-4">
+            if service.runs_in_docker() {
+                <p class="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm text-amber-800 dark:text-amber-300">
+                    icon(data: iconify_icon!("lucide:triangle-alert"), size: 16, attrs: attributes! { class="mt-0.5 shrink-0" })
+                    "This app runs in a container, whose CPU and memory oxploy does not measure yet: the numbers below are the docker command's that runs it, not the app's."
+                </p>
+            }
             (live! {
                 let deployer = Deployer::get(cx);
                 let mut sampled = deployer.usage().subscribe();

@@ -29,13 +29,14 @@ use crate::components::textarea::textarea;
 use crate::components::tabs::{tabs_list, tabs_trigger};
 use crate::features::archive::{self, Runnable};
 use crate::features::deploy::{AppStatus, Deployer, Refusal};
+use crate::features::docker;
 use crate::features::deployment::Deployment;
 use crate::features::github::{Branches, GithubApp, Release, Repository};
 use crate::features::project::Project;
 use crate::features::machine::{Machine, named_for_this_machine};
 use crate::features::time_zone;
 use crate::features::service::{
-    BuildKind, BuildScript, CargoBuild, MAX_SCRIPT_LEN, ReleaseBuild, Service, Source,
+    BuildKind, BuildScript, CargoBuild, DockerfileBuild, MAX_SCRIPT_LEN, ReleaseBuild, Service, Source,
     cargo_command, guess_binary, release_file_matches, release_file_pattern,
 };
 
@@ -142,7 +143,7 @@ pub async fn general_tab(
                                     autocomplete="off"
                                 }
                             )
-                            field_description("The folder the build runs in, such as the one with the Cargo.toml.")
+                            field_description("The folder the build runs in, such as the one with the Cargo.toml or the Dockerfile.")
                         )
                         <div class="flex justify-end md:col-span-2">
                             button(attrs: attributes! { type="submit" }, "Save source")
@@ -162,8 +163,8 @@ struct ShownBuild {
 }
 
 /// How the service is built: with cargo and its options, with a script of the user's
-/// own, or elsewhere, as a file of a GitHub release. A tab for each, with a dot on the
-/// one in use.
+/// own, elsewhere, as a file of a GitHub release, or with Docker, to run in a container.
+/// A tab for each, with a dot on the one in use.
 #[component]
 async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -> Result<impl View> {
     let in_use = service.builds_with();
@@ -171,20 +172,29 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
         BuildKind::Cargo => "cargo",
         BuildKind::Script => "script",
         BuildKind::Release => "release",
+        BuildKind::Dockerfile => "dockerfile",
     };
     // The tabs switch in the browser. `?build=` picks the first one shown, which the
     // tabs also link to for browsers without the runtime.
     let first = match query_params::<ShownBuild>(cx)?.build.as_deref() {
-        Some(slug @ ("cargo" | "script" | "release")) => slug,
+        Some(slug @ ("cargo" | "script" | "release" | "dockerfile")) => slug,
         _ => in_use_slug,
     };
     let shown = signal(cx, || first.to_owned());
-    let (shows_cargo, shows_script, shows_release, shows_other) =
-        (shown.clone(), shown.clone(), shown.clone(), shown.clone());
+    let (shows_cargo, shows_script, shows_release, shows_dockerfile, shows_other) =
+        (shown.clone(), shown.clone(), shown.clone(), shown.clone(), shown.clone());
+    let docker_version = docker::version().await;
     let (project_id, service_id) = (project.id, service.id);
     let cargo_url = href!(save_build, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let script_url = href!(save_script, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
     let release_url = href!(save_release, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    let dockerfile_url = href!(save_dockerfile, ProjectId(project_id), ServiceId(service_id)).resolve(cx);
+    let dockerfile_id = element_id(cx);
+    let container_port_id = element_id(cx);
+    let port_placeholder = match service.port {
+        Some(port) => format!("{port}, as the PORT oxploy passes"),
+        None => "The PORT oxploy passes".to_owned(),
+    };
     // The release's file as chosen, which the binaries to choose from come from.
     let release_file = signal(cx, || service.github_asset.clone().unwrap_or_default());
     let rust_version_id = element_id(cx);
@@ -207,12 +217,13 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
         (BuildKind::Cargo, "cargo", "Cargo", iconify_icon!("lucide:package")),
         (BuildKind::Script, "script", "Script", iconify_icon!("lucide:square-terminal")),
         (BuildKind::Release, "release", "GitHub release", iconify_icon!("lucide:tag")),
+        (BuildKind::Dockerfile, "dockerfile", "Dockerfile", iconify_icon!("lucide:container")),
     ];
 
     Ok(view! {
         settings_card(
             title: "Build",
-            text: "How oxploy turns the code into a binary, or where it gets one built elsewhere.",
+            text: "How oxploy turns the code into a binary or an image, or where it gets a binary built elsewhere.",
             tabs_list(
                 #[key(slug)]
                 for (kind, slug, label, symbol) in tabs {
@@ -245,6 +256,7 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                     BuildKind::Cargo => "The service builds with cargo. Saving this tab switches it.",
                     BuildKind::Script => "The service builds with its script. Saving this tab switches it.",
                     BuildKind::Release => "The service deploys its GitHub releases. Saving this tab switches it.",
+                    BuildKind::Dockerfile => "The service builds with Docker and runs in a container. Saving this tab switches it.",
                 }
             </p>
             <div :hidden=$(shows_cargo.get() != "cargo")>
@@ -389,6 +401,60 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
                     )
                     <div class="flex justify-end">
                         button(attrs: attributes! { type="submit" }, "Save release")
+                    </div>
+                </form>
+            </div>
+            <div :hidden=$(shows_dockerfile.get() != "dockerfile")>
+                <form method="post" action=(&dockerfile_url) class="flex flex-col gap-5">
+                    if docker_version.is_none() {
+                        <p class="flex items-center gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                            icon(data: iconify_icon!("lucide:triangle-alert"), size: 16, attrs: attributes! { class="shrink-0" })
+                            (docker::NO_DOCKER) ". Install Docker to build and run the app in a container."
+                        </p>
+                    }
+                    <p class="text-sm text-muted-foreground">
+                        "Deploying runs docker build in the build path, and runs the image in a container on the project's network, where the project's other containers reach it by its app name, "
+                        <code class="font-mono">(&service.app_name)</code>
+                        ". The build gets none of your variables; the container gets them when it starts."
+                    </p>
+                    <div class="grid grid-cols-1 gap-5 md:grid-cols-2">
+                        field(
+                            field_label(attrs: attributes! { for=(&dockerfile_id) }, "Dockerfile")
+                            input(
+                                attrs: attributes! {
+                                    id=(&dockerfile_id)
+                                    name="dockerfile"
+                                    value=(service.dockerfile.as_deref().unwrap_or(""))
+                                    placeholder="Dockerfile"
+                                    maxlength="255"
+                                    autocomplete="off"
+                                    spellcheck="false"
+                                }
+                            )
+                            field_description("From the build path, such as deploy/Dockerfile.")
+                        )
+                        field(
+                            field_label(attrs: attributes! { for=(&container_port_id) }, "Container port")
+                            input(
+                                attrs: attributes! {
+                                    id=(&container_port_id)
+                                    name="port"
+                                    type="number"
+                                    min="1"
+                                    max="65535"
+                                    value=(service.container_port.map(|port| port.to_string()).unwrap_or_default())
+                                    placeholder=(&port_placeholder)
+                                    autocomplete="off"
+                                }
+                            )
+                            field_description("The port the app listens on in its container, which it gets in PORT, with HOST=0.0.0.0. oxploy publishes it on 127.0.0.1 at the app's port.")
+                        )
+                    </div>
+                    <div class="flex justify-end">
+                        button(
+                            attrs: attributes! { type="submit" disabled=(docker_version.is_none().then_some("")) },
+                            "Save Dockerfile"
+                        )
                     </div>
                 </form>
             </div>
@@ -1148,6 +1214,35 @@ async fn save_release(cx: &Cx, Form(form): Form<ReleaseForm>) -> Result<SeeOther
     if !service.set_release(cx, &build).await? {
         return Err(bad_request(
             "Name the release's file without slashes, and for a .tar.gz the binary in it, as a path inside the archive",
+        )
+        .into());
+    }
+    Ok(see_other(general_url(cx, &project, &service)))
+}
+
+/// A form with how Docker builds and runs the service.
+#[derive(Deserialize)]
+struct DockerfileForm {
+    #[serde(default)]
+    dockerfile: String,
+    #[serde(default)]
+    port: String,
+}
+
+/// Makes the service build with Docker and run in a container.
+#[route(POST "./dockerfile")]
+async fn save_dockerfile(cx: &Cx, Form(form): Form<DockerfileForm>) -> Result<SeeOther> {
+    let (project, mut service) = current_service(cx).await?;
+    if docker::version().await.is_none() {
+        return Err(bad_request(docker::NO_DOCKER).into());
+    }
+    let build = DockerfileBuild {
+        dockerfile: &form.dockerfile,
+        port: &form.port,
+    };
+    if !service.set_dockerfile(cx, &build).await? {
+        return Err(bad_request(
+            "Name the Dockerfile as a path inside the repository, and the port as a number from 1 to 65535",
         )
         .into());
     }

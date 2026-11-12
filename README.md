@@ -43,21 +43,24 @@ in GitHub Actions: the binary itself, or a `.tar.gz` with it and the files it ne
 checked against the release's `.sha256` of the file when there is one. Such a service can
 also deploy each new release on its own: oxploy looks at the repository every minute, and
 does not try again a release that failed. A binary built for another machine, such as a
-Linux one on a Mac, fails its deployment before the running release stops. Each app
-runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`, which
-it picks when the app is made and keeps. An app reaches another app of its project
-through a line such as `API_URL=${OXPLOY_SHOP_API_URL}` in its Environment tab, named
-after the other app's app name, with `_HOST` and `_PORT` beside `_URL`. Apps keep
+Linux one on a Mac, fails its deployment before the running release stops. Each app runs
+as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`, which it
+picks when the app is made and keeps. A service can also be any app with a Dockerfile,
+when the server has Docker: deploying runs `docker build` and runs the image in a
+container on the project's own network, where the project's other containers reach it by
+its app name, published on `127.0.0.1` at its port. An app reaches another app of its
+project through a line such as `API_URL=${OXPLOY_SHOP_API_URL}` in its Environment tab,
+named after the other app's app name, with `_HOST` and `_PORT` beside `_URL`. Apps keep
 running when the panel stops or restarts, and the panel takes them back when it starts.
 Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them
 elsewhere. Each app also gets a storage folder that deploys keep, in
 `OXPLOY_STORAGE_DIR`, and can run a script after each build, before the new release
 starts, such as one that migrates its database. The Storage tab adds SQLite databases
-there and connects them to the app through a variable, a link in each release, or
-both, and backs them up and restores them. Each service's Monitoring tab shows the CPU,
-memory and disk its app takes, and the server's Monitoring page shows the machine's and,
-in its oxploy tab, the panel's and its builds', all sampled every 2 seconds and kept for
-10 minutes in memory.
+there and connects them to the app through a variable, a link in each release, or both,
+and backs them up and restores them. Each service's Monitoring tab shows the CPU, memory
+and disk its app takes, and the server's Monitoring page shows the machine's and, in its
+oxploy tab, the panel's and its builds', all sampled every 2 seconds and kept for 10
+minutes in memory.
 
 Domains go through [Caddy](https://caddyserver.com), which runs on the same machine as a
 service of its own, such as the one its packages install. The Caddy belongs to oxploy:
@@ -103,7 +106,9 @@ chown -R oxploy: /opt/oxploy /var/lib/oxploy
 ```
 
 Run it as a systemd service, as a user whose `PATH` has the Rust that builds the apps.
-`KillMode=process` keeps the apps running while oxploy stops or restarts:
+`KillMode=process` keeps the apps running while oxploy stops or restarts. For apps built
+with Docker, the server needs Docker, and that user its `docker` group
+(`usermod -aG docker oxploy`), which lets it do anything on the machine, as root can:
 
 ```ini
 [Service]

@@ -267,6 +267,8 @@ async fn service_view(cx: &Cx, tab: ServiceTab, #[default] draft: Option<&Draft>
                     <span class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
                         if external {
                             icon(data: iconify_icon!("lucide:plug"), size: 22)
+                        } else if service.runs_in_docker() {
+                            icon(data: iconify_icon!("lucide:container"), size: 22)
                         } else {
                             icon(data: iconify_icon!("lucide:box"), size: 22)
                         }

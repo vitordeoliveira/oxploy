@@ -20,6 +20,8 @@ use crate::components::field::{field, field_description, field_label};
 use crate::components::tabs::{tabs_list, tabs_trigger};
 use crate::components::textarea::textarea;
 use crate::features::app_files::AppFiles;
+use crate::features::deployment::Deployment;
+use crate::features::docker;
 use crate::features::project::Project;
 use crate::features::service::{MAX_SCRIPT_LEN, Service};
 
@@ -35,6 +37,18 @@ pub async fn advanced_tab(
     let after_build_url =
         href!(save_after_build, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
     let after_build_id = element_id(cx);
+    let in_docker = service.runs_in_docker();
+    // The runtime follows the build, which the General tab chooses.
+    let general = href!(super::page, ProjectId(project.id), ServiceId(service.id)).resolve(cx);
+    let (native_href, docker_href) = match in_docker {
+        true => (format!("{general}?build=cargo"), here.to_owned()),
+        false => (here.to_owned(), format!("{general}?build=dockerfile")),
+    };
+    let image = match service.release_id {
+        Some(id) if in_docker => Deployment::find_of(cx, service.id, id).await?.and_then(|release| release.image),
+        _ => None,
+    };
+    let inner_port = service.app_port();
 
     Ok(view! {
         <div class="flex flex-col gap-6">
@@ -43,27 +57,72 @@ pub async fn advanced_tab(
                 text: "How oxploy runs the app.",
                 tabs_list(
                     tabs_trigger(
-                        active: true,
-                        attrs: attributes! { href=(here) },
+                        active: !in_docker,
+                        attrs: attributes! { href=(&native_href) },
                         icon(data: iconify_icon!("lucide:cpu"), size: 14)
                         "Native"
                     )
+                    tabs_trigger(
+                        active: in_docker,
+                        attrs: attributes! { href=(&docker_href) },
+                        icon(data: iconify_icon!("lucide:container"), size: 14)
+                        "Docker"
+                    )
                 )
-                <dl class="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
-                    <dt class="font-medium">"Port"</dt>
-                    <dd class="text-muted-foreground">
-                        if let Some(port) = service.port {
-                            <span class="font-mono">"127.0.0.1:" (port.to_string())</span>
-                        } else {
-                            "Chosen at the first deploy"
-                        }
-                    </dd>
-                    <dt class="font-medium">"Files"</dt>
-                    <dd class="font-mono break-all text-muted-foreground">(files.root().display().to_string())</dd>
-                </dl>
-                field_description(
-                    "The app runs as a process on this machine, in its release's code at the build path. It must listen on 127.0.0.1, at the port oxploy passes in PORT. If it exits, oxploy starts it again, waiting longer after each crash."
-                )
+                if in_docker {
+                    <dl class="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
+                        <dt class="font-medium">"Container"</dt>
+                        <dd class="font-mono break-all text-muted-foreground">(docker::container_name(&service.app_name))</dd>
+                        <dt class="font-medium">"Image"</dt>
+                        <dd class="text-muted-foreground">
+                            if let Some(image) = &image {
+                                <span class="font-mono break-all">(image)</span>
+                            } else {
+                                "Built at the first deploy"
+                            }
+                        </dd>
+                        <dt class="font-medium">"Port"</dt>
+                        <dd class="text-muted-foreground">
+                            if let (Some(port), Some(inner)) = (service.port, inner_port) {
+                                <span class="font-mono">"127.0.0.1:" (port.to_string())</span>
+                                " → "
+                                <span class="font-mono">(inner.to_string())</span>
+                                " in the container"
+                            } else {
+                                "Chosen at the first deploy"
+                            }
+                        </dd>
+                        <dt class="font-medium">"Network"</dt>
+                        <dd class="text-muted-foreground">
+                            <span class="font-mono">(docker::network(project.id))</span>
+                            ", where the project's other containers reach it at "
+                            <span class="font-mono break-all">
+                                "http://" (&service.app_name) ":" (inner_port.map(|port| port.to_string()).unwrap_or_else(|| "PORT".to_owned()))
+                            </span>
+                        </dd>
+                        <dt class="font-medium">"Storage"</dt>
+                        <dd class="font-mono break-all text-muted-foreground">(files.storage().display().to_string())</dd>
+                    </dl>
+                    field_description(
+                        "The app runs in a container of its release's image, which is removed when it stops. oxploy publishes its port on 127.0.0.1, where Caddy sends its traffic, and mounts the storage folder at the same path. If it exits, oxploy starts it again, waiting longer after each crash. The Build in the General tab chooses the runtime."
+                    )
+                } else {
+                    <dl class="grid grid-cols-1 gap-x-6 gap-y-3 text-sm sm:grid-cols-[8rem_minmax(0,1fr)]">
+                        <dt class="font-medium">"Port"</dt>
+                        <dd class="text-muted-foreground">
+                            if let Some(port) = service.port {
+                                <span class="font-mono">"127.0.0.1:" (port.to_string())</span>
+                            } else {
+                                "Chosen at the first deploy"
+                            }
+                        </dd>
+                        <dt class="font-medium">"Files"</dt>
+                        <dd class="font-mono break-all text-muted-foreground">(files.root().display().to_string())</dd>
+                    </dl>
+                    field_description(
+                        "The app runs as a process on this machine, in its release's code at the build path. It must listen on 127.0.0.1, at the port oxploy passes in PORT. If it exits, oxploy starts it again, waiting longer after each crash. The Build in the General tab chooses the runtime."
+                    )
+                }
             )
             settings_card(
                 title: "After the build",
@@ -85,9 +144,15 @@ pub async fn advanced_tab(
                             },
                             (service.after_build.as_deref().unwrap_or(""))
                         )
-                        field_description(
-                            "Runs with sh -e where the app runs, once the databases from the Storage tab are linked, with the app's environment variables and the new binary on the PATH. Leave it empty to run nothing."
-                        )
+                        if in_docker {
+                            field_description(
+                                "Runs with sh -e in a container of the new image, with the app's environment variables, storage and network. The image must have sh. Leave it empty to run nothing."
+                            )
+                        } else {
+                            field_description(
+                                "Runs with sh -e where the app runs, once the databases from the Storage tab are linked, with the app's environment variables and the new binary on the PATH. Leave it empty to run nothing."
+                            )
+                        }
                     )
                     <div class="flex justify-end">
                         button(attrs: attributes! { type="submit" }, "Save script")

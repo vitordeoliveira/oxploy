@@ -5,8 +5,20 @@ mod components;
 mod db;
 mod features;
 
-#[tokio::main]
-async fn main() {
+/// The stack of each of the runtime's threads. A page renders as one future holding its
+/// deepest tab's, which in a debug build outgrows the 2 MiB a thread gets otherwise.
+const THREAD_STACK: usize = 8 * 1024 * 1024;
+
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(THREAD_STACK)
+        .build()
+        .expect("the runtime starts")
+        .block_on(run());
+}
+
+async fn run() {
     // An update runs `oxploy --version` to check the binary it downloaded.
     if std::env::args().nth(1).is_some_and(|arg| arg == "--version") {
         println!("oxploy {}", features::update::VERSION);

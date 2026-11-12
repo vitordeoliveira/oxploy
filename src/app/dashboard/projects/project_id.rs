@@ -28,6 +28,7 @@ use crate::components::textarea::textarea;
 use crate::features::app_mcp::{MAX_TOKEN_LEN, MAX_URL_LEN};
 use crate::features::project::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN};
 use crate::features::deploy::Deployer;
+use crate::features::docker;
 use crate::features::project::Project;
 use crate::features::service::Service;
 use services::service_id::{self, ServiceId, external_badge};
@@ -104,7 +105,7 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
                 empty_state(
                     symbol: iconify_icon!("lucide:box"),
                     title: "No services yet",
-                    text: "A service is one Rust app, a repository that oxploy builds with cargo and keeps running, or an MCP server that runs elsewhere.",
+                    text: "A service is one app that oxploy builds and keeps running, a Rust app built with cargo or any app with a Dockerfile, or an MCP server that runs elsewhere.",
                     button(
                         attrs: attributes! { type="button" @click=$(|_e: Event| creating.set(true)) },
                         icon(data: iconify_icon!("lucide:plus"))
@@ -146,15 +147,17 @@ pub async fn page(cx: &Cx) -> Result<impl View> {
 }
 
 /// How a choice of the kind of a new service looks, marked while it is chosen.
-const KIND_CHOICE: &str = "flex cursor-pointer flex-col gap-1 rounded-lg border border-border p-3 text-sm transition-colors has-[:checked]:border-primary has-[:checked]:bg-primary/5";
+const KIND_CHOICE: &str = "flex cursor-pointer flex-col gap-1 rounded-lg border border-border p-3 text-sm transition-colors has-[:checked]:border-primary has-[:checked]:bg-primary/5 has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60";
 
-/// A dialog that makes a service: a Rust app, whose repository is connected after, or an
-/// external MCP server, with the URL it answers at and the token it takes.
+/// A dialog that makes a service: a Rust app built with cargo or an app built with
+/// Docker, whose repository is connected after, or an external MCP server, with the URL
+/// it answers at and the token it takes. The Docker app needs Docker on the server.
 #[component]
 async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Result<impl View> {
     let open = open.clone();
+    let has_docker = docker::version().await.is_some();
     let external = signal(cx, || false);
-    let (to_app, to_external) = (external.clone(), external.clone());
+    let (to_app, to_docker, to_external) = (external.clone(), external.clone(), external.clone());
     let title_id = element_id(cx);
     let name_id = element_id(cx);
     let description_id = element_id(cx);
@@ -166,12 +169,13 @@ async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Res
             open: $(open.get()),
             attrs: attributes! { aria-labelledby=(&title_id) },
             dialog_content(
+                attrs: attributes! { class="[&]:max-w-2xl" },
                 dialog_header(
                     dialog_title(attrs: attributes! { id=(&title_id) }, "New service")
-                    dialog_description("A Rust app this project deploys, or an MCP server that runs elsewhere, whose tools reach this organization's MCP.")
+                    dialog_description("An app this project deploys, built with cargo or with Docker, or an MCP server that runs elsewhere, whose tools reach this organization's MCP.")
                 )
                 <form method="post" action=(&action) class="flex flex-col gap-4">
-                    <fieldset class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <fieldset class="grid grid-cols-1 gap-2 sm:grid-cols-3">
                         <legend class="sr-only">"Kind"</legend>
                         <label class=(KIND_CHOICE)>
                             <span class="flex items-center gap-2 font-medium">
@@ -187,6 +191,27 @@ async fn new_service_dialog(cx: &Cx, open: &Signal<bool>, action: String) -> Res
                                 "Rust app"
                             </span>
                             <span class="text-xs text-muted-foreground">"A repository oxploy builds with cargo and keeps running. You connect it after."</span>
+                        </label>
+                        <label class=(KIND_CHOICE)>
+                            <span class="flex items-center gap-2 font-medium">
+                                <input
+                                    type="radio"
+                                    name="kind"
+                                    value="docker"
+                                    disabled=((!has_docker).then_some(""))
+                                    class="accent-primary"
+                                    @change=$(|_e: Event| to_docker.set(false))
+                                >
+                                icon(data: iconify_icon!("lucide:container"), size: 16)
+                                "Docker app"
+                            </span>
+                            <span class="text-xs text-muted-foreground">
+                                if has_docker {
+                                    "Any app with a Dockerfile, which oxploy builds and runs in a container. You connect it after."
+                                } else {
+                                    "Any app with a Dockerfile, run in a container. Docker is not installed on this server."
+                                }
+                            </span>
                         </label>
                         <label class=(KIND_CHOICE)>
                             <span class="flex items-center gap-2 font-medium">
@@ -290,6 +315,8 @@ async fn service_card(cx: &Cx, project: &Project, service: &Service) -> Result<i
                 <span class="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                     if external {
                         icon(data: iconify_icon!("lucide:plug"), size: 18)
+                    } else if service.runs_in_docker() {
+                        icon(data: iconify_icon!("lucide:container"), size: 18)
                     } else {
                         icon(data: iconify_icon!("lucide:box"), size: 18)
                     }

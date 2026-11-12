@@ -9,6 +9,7 @@ pub mod caddy;
 pub mod databases;
 pub mod deploy;
 pub mod deployment;
+pub mod docker;
 pub mod domain;
 pub mod environment;
 pub mod github;

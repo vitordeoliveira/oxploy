@@ -114,3 +114,8 @@ snapshot_name = "0021_snapshot.toml"
 id = 2066852709415451627
 name = "0022_add_usage_reporting.sql"
 snapshot_name = "0022_snapshot.toml"
+
+[[migrations]]
+id = 1652007996065149330
+name = "0023_add_docker_builds.sql"
+snapshot_name = "0023_snapshot.toml"

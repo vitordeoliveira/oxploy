@@ -15,8 +15,9 @@ use topcoat::{
 
 use super::{ProjectId, current_project};
 use crate::app::dashboard::projects::INVALID_DETAILS;
+use crate::features::docker;
 use crate::features::project::Details;
-use crate::features::service::Service;
+use crate::features::service::{DockerfileBuild, Service};
 use service_id::ServiceId;
 
 /// The project's page lists its services.
@@ -33,7 +34,8 @@ pub struct NewServiceForm {
     name: String,
     #[serde(default)]
     description: String,
-    /// `external_mcp` for an external MCP server. Anything else makes an app.
+    /// `external_mcp` for an external MCP server, `docker` for an app built with Docker.
+    /// Anything else makes an app built with cargo.
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -57,9 +59,17 @@ pub async fn create(cx: &Cx, Form(form): Form<NewServiceForm>) -> Result<SeeOthe
             Err(problem) => return Err(bad_request(problem.to_string()).into()),
         }
     } else {
-        let Some(service) = Service::add(cx, &project, &details).await? else {
+        let docker = form.kind == "docker";
+        if docker && docker::version().await.is_none() {
+            return Err(bad_request(docker::NO_DOCKER).into());
+        }
+        let Some(mut service) = Service::add(cx, &project, &details).await? else {
             return Err(bad_request(INVALID_DETAILS).into());
         };
+        if docker {
+            let build = DockerfileBuild { dockerfile: "", port: "" };
+            service.set_dockerfile(cx, &build).await?;
+        }
         service
     };
     Ok(see_other(

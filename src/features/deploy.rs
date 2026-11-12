@@ -1,5 +1,6 @@
-//! Deploying a service: fetching its code, building it with cargo, keeping the binary
-//! as a release, and running it in place of the previous one.
+//! Deploying a service: fetching its code, building it with cargo, a script or Docker,
+//! keeping the binary or the image as a release, and running it in place of the
+//! previous one.
 //!
 //! Each deployment runs on a task of its own and writes what happens to its log, which
 //! the Deployments tab shows as it grows. One build runs at a time on the machine, so
@@ -25,13 +26,14 @@ use super::app_files::AppFiles;
 use super::caddy::Caddy;
 use super::databases::{self, ManagedDatabase};
 use super::deployment::{Deployment, DeploymentStatus};
+use super::docker::{self, Container};
 use super::domain::{self, Domain};
 use super::environment::{PORT_VARIABLE, STORAGE_VARIABLE};
 use super::archive;
 use super::github::{GithubApp, Release, ReleaseFile};
 use super::machine::Machine;
 use super::project::{Project, now};
-use super::runtime::{Exits, FromOxploy, Launch, Readiness, Runtime, app_variables, system_env};
+use super::runtime::{self, Exits, FromOxploy, Launch, Readiness, Runs, Runtime, app_variables, system_env};
 use super::service::{BuildKind, Service, assign_port, release_file_matches};
 use super::storage;
 use super::usage::Usage;
@@ -187,6 +189,7 @@ impl Deployer {
             commit_message: None,
             tag: None,
             binary: None,
+            image: None,
             build_path: None,
             created_at: now(),
             finished_at: None,
@@ -270,7 +273,7 @@ impl Deployer {
         // The link goes from the release that runs, or SQLite would make a new, empty
         // database through it.
         let work_dir = match Launch::of(&self.db, service).await? {
-            Some(launch) => Some(launch.work_dir),
+            Some(launch) => launch.work_dir().cloned(),
             None => None,
         };
         // Unmanaged first, so the start that follows makes no link to it.
@@ -339,6 +342,15 @@ impl Deployer {
             .await?;
         ManagedDatabase::disconnect_all(&self.db, service.id).await?;
         let _ = fs::remove_dir_all(files.root());
+        // Images from when it was built with Docker, even if it is not any more.
+        if docker::version().await.is_some() {
+            let app_name = service.app_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                docker::remove_container(&docker::container_name(&app_name));
+                docker::remove_images(&app_name, |_| false);
+            })
+            .await;
+        }
         Ok(())
     }
 
@@ -368,8 +380,16 @@ impl Deployer {
         let status = match outcome {
             Ok(()) => DeploymentStatus::Succeeded,
             Err(_) => {
-                // A failed build's code is not worth its space; its log stays.
+                // A failed build's code is not worth its space, nor its image; its log
+                // stays.
                 let _ = fs::remove_dir_all(files.release(deployment_id));
+                if service.runs_in_docker() {
+                    let app_name = service.app_name.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        docker::remove_images(&app_name, |id| id != deployment_id);
+                    })
+                    .await;
+                }
                 DeploymentStatus::Failed
             }
         };
@@ -397,10 +417,13 @@ impl Deployer {
         let saved = |error: toasty::Error| format!("the database could not be updated: {error}");
 
         let kind = service.builds_with();
+        if kind == BuildKind::Dockerfile && docker::version().await.is_none() {
+            return Err(docker::NO_DOCKER.to_owned());
+        }
         // A GitHub release was built elsewhere, so only builds wait for each other.
         let _build = match kind {
             BuildKind::Release => None,
-            BuildKind::Cargo | BuildKind::Script => {
+            BuildKind::Cargo | BuildKind::Script | BuildKind::Dockerfile => {
                 Some(match self.builds.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -458,7 +481,7 @@ impl Deployer {
                 };
                 Some(fetch_release(&download, service, files, deployment.id, log).await?)
             }
-            BuildKind::Cargo | BuildKind::Script => {
+            BuildKind::Cargo | BuildKind::Script | BuildKind::Dockerfile => {
                 let (commit, message) = fetch_branch(&app, repository, branch, &source, log).await?;
                 deployment
                     .update()
@@ -493,7 +516,9 @@ impl Deployer {
             .await
             .map_err(saved)?;
         let oxploy = FromOxploy::of(&self.db, service).await.map_err(saved)?;
-        let variables = app_variables(service, files, port, &databases, &oxploy);
+        // In a container, the app listens on its own port, which PORT tells it.
+        let app_port = service.app_port().unwrap_or(port);
+        let variables = app_variables(service, files, app_port, &databases, &oxploy);
         let build = Build {
             service,
             files,
@@ -502,37 +527,62 @@ impl Deployer {
             work_dir: &work_dir,
             variables: &variables,
         };
-        let name = match (released, kind) {
-            (Some(binary), _) => binary,
-            (None, BuildKind::Cargo) => build_with_cargo(&build, log).await?,
-            (None, BuildKind::Script | BuildKind::Release) => build_with_script(&build, log).await?,
+        let runs = match kind {
+            BuildKind::Dockerfile => {
+                let image = build_with_docker(&build, log).await?;
+                deployment
+                    .update()
+                    .image(Some(image.clone()))
+                    .exec(&mut db)
+                    .await
+                    .map_err(saved)?;
+                for link in databases.iter().filter_map(|database| database.link.as_deref()) {
+                    log.line(&format!(
+                        "The link {link} to the storage does not reach a container; the app opens the database through its variable"
+                    ));
+                }
+                let container = runtime::container(service, &image, port);
+                if let Some(script) = &service.after_build {
+                    run_after_build_in_container(&build, script, &container, log).await?;
+                }
+                Runs::Container(container)
+            }
+            BuildKind::Cargo | BuildKind::Script | BuildKind::Release => {
+                let name = match (released, kind) {
+                    (Some(binary), _) => binary,
+                    (None, BuildKind::Cargo) => build_with_cargo(&build, log).await?,
+                    (None, _) => build_with_script(&build, log).await?,
+                };
+                let binary = files.binary(deployment.id, &name);
+                // One built for another machine would only fail to start, as an app that
+                // exits.
+                let this = Machine::this();
+                if let Ok(Some(machine)) = Machine::of_binary(&binary)
+                    && !machine.runs_on(this)
+                {
+                    let advice = match kind {
+                        BuildKind::Release => "choose the release's file for this server under Build in the General tab",
+                        _ => "build it for this server",
+                    };
+                    return Err(format!("{name} is built for {machine}, and this server is {this}; {advice}"));
+                }
+                deployment
+                    .update()
+                    .binary(Some(name))
+                    .exec(&mut db)
+                    .await
+                    .map_err(saved)?;
+                let linked = databases::link_all(&work_dir, files, &databases)
+                    .map_err(|error| format!("the databases could not be linked: {error}"))?;
+                for link in linked {
+                    log.line(&format!("Linked {link} to the storage"));
+                }
+                if let Some(script) = &service.after_build {
+                    run_after_build(&build, script, &binary, port, log).await?;
+                }
+                Runs::Native { binary, work_dir }
+            }
         };
-        let binary = files.binary(deployment.id, &name);
-        // One built for another machine would only fail to start, as an app that exits.
-        let this = Machine::this();
-        if let Ok(Some(machine)) = Machine::of_binary(&binary)
-            && !machine.runs_on(this)
-        {
-            let advice = match kind {
-                BuildKind::Release => "choose the release's file for this server under Build in the General tab",
-                BuildKind::Cargo | BuildKind::Script => "build it for this server",
-            };
-            return Err(format!("{name} is built for {machine}, and this server is {this}; {advice}"));
-        }
-        deployment
-            .update()
-            .binary(Some(name))
-            .exec(&mut db)
-            .await
-            .map_err(saved)?;
-        let linked = databases::link_all(&work_dir, files, &databases)
-            .map_err(|error| format!("the databases could not be linked: {error}"))?;
-        for link in linked {
-            log.line(&format!("Linked {link} to the storage"));
-        }
-        if let Some(script) = &service.after_build {
-            run_after_build(&build, script, &binary, port, log).await?;
-        }
 
         // Start.
         deployment
@@ -552,8 +602,7 @@ impl Deployer {
             service_id: service.id,
             files: files.clone(),
             release_id: deployment.id,
-            binary,
-            work_dir,
+            runs,
             port,
             variables,
             databases,
@@ -567,16 +616,29 @@ impl Deployer {
         if let Some(previous) = &previous {
             log.line(&format!("Stopped release #{}", previous.release_id));
         }
-        log.step(&format!("Starting on 127.0.0.1:{port}"));
+        let advice = match &launch.runs {
+            Runs::Native { .. } => "A web app must listen there: read PORT, and bind 127.0.0.1.".to_owned(),
+            Runs::Container(container) => format!(
+                "A web app must listen in its container at 0.0.0.0:{}, which oxploy publishes there: read PORT and HOST.",
+                container.inner_port
+            ),
+        };
+        match &launch.runs {
+            Runs::Native { .. } => log.step(&format!("Starting on 127.0.0.1:{port}")),
+            Runs::Container(container) => log.step(&format!(
+                "Starting the container {} on 127.0.0.1:{port}",
+                container.name
+            )),
+        }
         let started = match self.runtime.start(&launch) {
-            Ok(()) => match self.runtime.wait_until_ready(service.id, port, READY_TIMEOUT).await {
+            Ok(()) => match self.runtime.wait_until_ready(&launch, READY_TIMEOUT).await {
                 Readiness::Listening => {
                     log.line(&format!("Listening on 127.0.0.1:{port}"));
                     Ok(())
                 }
                 Readiness::NotListening => {
                     log.line(&format!(
-                        "Running, but nothing answers on 127.0.0.1:{port} after {}s. A web app must listen there: read PORT, and bind 127.0.0.1.",
+                        "Running, but nothing answers on 127.0.0.1:{port} after {}s. {advice}",
                         READY_TIMEOUT.as_secs()
                     ));
                     Ok(())
@@ -585,7 +647,10 @@ impl Deployer {
                     "the app exited while starting ({how}); what it printed is in the Logs tab"
                 )),
             },
-            Err(error) => Err(format!("the binary could not start: {error}")),
+            Err(error) => Err(match launch.in_container() {
+                false => format!("the binary could not start: {error}"),
+                true => format!("the container could not start: {error}"),
+            }),
         };
         if let Err(problem) = started {
             self.runtime.stop(service.id, files).await;
@@ -610,6 +675,14 @@ impl Deployer {
         }
         self.caddy.changed();
         prune(files, deployment.id);
+        if service.runs_in_docker() {
+            // The images of the releases kept, whose folders prune left.
+            let (app_name, files) = (service.app_name.clone(), files.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                docker::remove_images(&app_name, |id| files.release(id).is_dir());
+            })
+            .await;
+        }
         Ok(())
     }
 
@@ -1043,6 +1116,61 @@ async fn build_with_script(build: &Build<'_>, log: &mut DeployLog) -> Result<Str
     Ok(name.clone())
 }
 
+/// Builds the image with `docker build`, from the Dockerfile in the build path, which
+/// is also what the build sees. The build gets none of the app's variables, which the
+/// container gets when it runs. Returns the image.
+async fn build_with_docker(build: &Build<'_>, log: &mut DeployLog) -> Result<String, String> {
+    let service = build.service;
+    let dockerfile = build.work_dir.join(service.dockerfile());
+    if !dockerfile.is_file() {
+        let path = service.build_path.as_deref().map(|path| format!("/{path}")).unwrap_or_default();
+        return Err(format!("there is no {path}/{}", service.dockerfile()));
+    }
+    let image = docker::image(&service.app_name, build.deployment_id);
+    log.step(&format!("Building the image {image} with docker build"));
+    let mut docker = docker::tokio_command();
+    docker
+        .current_dir(build.work_dir)
+        .args(["build", "--tag", &image, "--file"])
+        .arg(&dockerfile)
+        .arg(".")
+        // Plain lines, rather than a display that redraws itself.
+        .env("BUILDKIT_PROGRESS", "plain");
+    let status = run_logged(docker, log, |line| Some(line.to_owned()))
+        .await
+        .map_err(|error| format!("docker could not run: {error}"))?;
+    if !status.success() {
+        return Err("docker could not build the image".to_owned());
+    }
+    log.line(&format!("Built {image}"));
+    Ok(image)
+}
+
+/// Runs the service's script after the build in a container of the new image, as the
+/// app will run: with the same variables, storage and network, before the new release
+/// starts. The release that runs keeps running if it fails.
+async fn run_after_build_in_container(
+    build: &Build<'_>,
+    script: &str,
+    container: &Container,
+    log: &mut DeployLog,
+) -> Result<(), String> {
+    fs::create_dir_all(&container.storage).map_err(|error| error.to_string())?;
+    let network = container.network.clone();
+    tokio::task::spawn_blocking(move || docker::ensure_network(&network))
+        .await
+        .map_err(|error| error.to_string())??;
+    log.step("Running the script after the build, in the new image");
+    let run = docker::Run::script(container, build.variables, script);
+    let status = run_logged(run.tokio_command(), log, |line| Some(line.to_owned()))
+        .await
+        .map_err(|error| format!("docker could not run: {error}"))?;
+    if !status.success() {
+        return Err(format!("the script after the build failed ({status})"));
+    }
+    Ok(())
+}
+
 /// Runs the service's script after the build, before the new release starts, as the
 /// app will run: in the same folder, with the same variables, and with its binary on
 /// the `PATH`. The release that runs keeps running if it fails.
@@ -1276,6 +1404,132 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds an image, runs the script after the build and the app in containers, and
+    /// stops it, with Docker. `OXPLOY_TEST_IMAGE` names an image with perl to build on,
+    /// and `OXPLOY_TEST_PLATFORM` its platform when it is not the machine's:
+    /// `OXPLOY_TEST_IMAGE=ubuntu:24.04 cargo test -- --ignored dockerfile`.
+    #[tokio::test]
+    #[ignore = "needs Docker, and OXPLOY_TEST_IMAGE naming an image with perl"]
+    async fn builds_and_runs_a_dockerfile() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use topcoat::context::CxTestBuilder;
+
+        use crate::db::TestDb;
+        use crate::features::project::Details;
+        use crate::features::service::DockerfileBuild;
+
+        /// Deletes what the test made, however it ends.
+        struct Cleanup {
+            app_name: String,
+            network: String,
+            files: AppFiles,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                docker::remove_container(&docker::container_name(&self.app_name));
+                docker::remove_images(&self.app_name, |_| false);
+                docker::remove_network(&self.network);
+                let _ = fs::remove_dir_all(self.files.root());
+            }
+        }
+
+        let base = std::env::var("OXPLOY_TEST_IMAGE").expect("OXPLOY_TEST_IMAGE names an image with perl");
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        let project = Project::add(&cx, 7, &Details { name: "oxploy docker test", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let mut service = Service::add(&cx, &project, &Details { name: "App", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let build = DockerfileBuild { dockerfile: "", port: "8080" };
+        assert!(service.set_dockerfile(&cx, &build).await.unwrap());
+        let service = Service::filter_by_id(service.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap();
+        let files = AppFiles::of(&service.app_name);
+        let _cleanup = Cleanup {
+            app_name: service.app_name.clone(),
+            network: docker::network(project.id),
+            files: files.clone(),
+        };
+        let deployment_id = 1;
+        let source = files.source(deployment_id);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("server.pl"),
+            r#"use IO::Socket::INET;
+$| = 1;
+my $server = IO::Socket::INET->new(LocalAddr => $ENV{HOST}, LocalPort => $ENV{PORT}, Listen => 5, ReuseAddr => 1) or die "listen: $!";
+print "listening on $ENV{HOST}:$ENV{PORT}\n";
+while (my $client = $server->accept) {
+    <$client>;
+    print $client "HTTP/1.0 200 OK\r\n\r\nhello $ENV{GREETING}\n";
+    close $client;
+}
+"#,
+        )
+        .unwrap();
+        // An image of another machine's, as an amd64 one on an arm64 Mac, needs its
+        // platform named.
+        let platform = std::env::var("OXPLOY_TEST_PLATFORM").map(|platform| format!("--platform={platform} ")).unwrap_or_default();
+        fs::write(source.join("Dockerfile"), format!("FROM {platform}{base}\nCOPY server.pl /server.pl\nCMD [\"perl\", \"/server.pl\"]\n")).unwrap();
+
+        let mut log = DeployLog::open(&files, deployment_id).unwrap();
+        let variables = vec![("GREETING".to_owned(), "from oxploy".to_owned())];
+        let build = Build {
+            service: &service,
+            files: &files,
+            deployment_id,
+            source: &source,
+            work_dir: &source,
+            variables: &variables,
+        };
+        let deploy_log = || fs::read_to_string(files.deploy_log(deployment_id)).unwrap_or_default();
+        let image = build_with_docker(&build, &mut log).await.unwrap_or_else(|error| panic!("{error}\n{}", deploy_log()));
+        assert_eq!(image, docker::image(&service.app_name, deployment_id));
+        let port = service.port.unwrap();
+        let container = runtime::container(&service, &image, port);
+        assert_eq!(container.inner_port, 8080);
+
+        // The script after the build runs in the image, with the app's variables and its
+        // storage at the same path.
+        let script = r#"echo "after $GREETING on $PORT" > "$OXPLOY_STORAGE_DIR/after.txt""#;
+        run_after_build_in_container(&build, script, &container, &mut log)
+            .await
+            .unwrap_or_else(|error| panic!("{error}\n{}", deploy_log()));
+        assert_eq!(fs::read_to_string(container.storage.join("after.txt")).unwrap(), "after from oxploy on 8080\n");
+
+        let runtime = Runtime::new(test.db.clone());
+        let launch = Launch {
+            service_id: service.id,
+            files: files.clone(),
+            release_id: deployment_id,
+            runs: Runs::Container(container.clone()),
+            port,
+            variables: variables.clone(),
+            databases: Vec::new(),
+        };
+        runtime.start(&launch).unwrap();
+        let ready = runtime.wait_until_ready(&launch, Duration::from_secs(90)).await;
+        let app_log = || fs::read_to_string(files.app_log()).unwrap_or_default();
+        assert!(matches!(ready, Readiness::Listening), "{}", app_log());
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", u16::try_from(port).unwrap())).await.unwrap();
+        stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.ends_with("hello from oxploy\n"), "{answer}");
+        assert!(app_log().contains("listening on 0.0.0.0:8080"), "{}", app_log());
+
+        // Stopping it removes the container.
+        runtime.stop(service.id, &files).await;
+        let left = docker::command()
+            .args(["ps", "--all", "--quiet", "--filter", &format!("name=^{}$", container.name)])
+            .output()
+            .unwrap();
+        assert!(left.stdout.is_empty(), "the container is still there");
+    }
 
     #[test]
     fn reads_binaries_from_cargo_output() {

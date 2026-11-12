@@ -20,7 +20,8 @@ use crate::features::environment::{
     self, MAX_LEN, MCP_TOKEN_VARIABLE, MCP_URL_VARIABLE, PORT_VARIABLE, STORAGE_VARIABLE,
 };
 use crate::db::db;
-use crate::features::runtime::{FromOxploy, system_env, variables_with_port};
+use crate::features::docker::HOST_VARIABLE;
+use crate::features::runtime::{Blocked, FromOxploy, system_env, variables_with_port};
 use crate::features::service::Service;
 
 /// Variables the user submitted that could not be saved, with what is wrong.
@@ -143,8 +144,10 @@ struct Group {
 #[component]
 async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase]) -> Result<impl View> {
     let files = AppFiles::of(&service.app_name);
+    let in_docker = service.runs_in_docker();
+    // The port the app listens on, inside its container for one that runs in Docker.
     let port = service
-        .port
+        .app_port()
         .map_or_else(|| format!("${{{PORT_VARIABLE}}}"), |port| port.to_string());
     let oxploy = FromOxploy::of(&db(cx), service).await?;
     let resolved = variables_with_port(service, &files, &port, managed, &oxploy);
@@ -170,10 +173,13 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
     let mut by_oxploy = vec![
         Row {
             name: PORT_VARIABLE.to_owned(),
-            value: service.port.map(|port| port.to_string()),
-            note: Some(match service.port {
-                Some(_) => "The port the app listens on at 127.0.0.1, which Caddy sends its traffic to.".to_owned(),
-                None => "Chosen at the first deploy.".to_owned(),
+            value: service.app_port().map(|port| port.to_string()),
+            note: Some(match (service.port, in_docker) {
+                (Some(_), false) => "The port the app listens on at 127.0.0.1, which Caddy sends its traffic to.".to_owned(),
+                (Some(published), true) => format!(
+                    "The port the app listens on in its container, which oxploy publishes at 127.0.0.1:{published}, where Caddy sends its traffic."
+                ),
+                (None, _) => "Chosen at the first deploy.".to_owned(),
             }),
             secret: false,
             copies: Vec::new(),
@@ -187,10 +193,24 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
         row(
             MCP_URL_VARIABLE,
             &oxploy.mcp_url,
-            Some("Where this server's MCP answers, for an app that is an MCP client of its organization.".to_owned()),
+            Some(match in_docker {
+                false => "Where this server's MCP answers, for an app that is an MCP client of its organization.".to_owned(),
+                true => "Where this server's MCP answers, on 127.0.0.1, which a container does not reach yet.".to_owned(),
+            }),
             false,
         ),
     ];
+    if in_docker {
+        by_oxploy.insert(
+            1,
+            row(
+                HOST_VARIABLE,
+                "0.0.0.0",
+                Some("Every address of the container, so the published port reaches the app. A line above can change it.".to_owned()),
+                false,
+            ),
+        );
+    }
     // The organization's tokens the app may use, which it gets only if its variables do.
     let tokens: Vec<Row> = oxploy
         .tokens
@@ -214,15 +234,14 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
         .map(|app| Row {
             name: app.name.clone(),
             value: None,
-            note: app.clashes.then(|| {
-                "Its variables take names that oxploy or an MCP token of this organization already use, so a line cannot use them."
-                    .to_owned()
-            }),
+            note: app.blocked.map(|blocked| match blocked {
+                Blocked::Clashes => "Its variables take names that oxploy or an MCP token of this organization already use, so a line cannot use them.",
+                Blocked::NativeFromContainer => "It runs natively, on 127.0.0.1, which this app's container does not reach yet.",
+            }.to_owned()),
             secret: false,
-            copies: if app.clashes {
-                Vec::new()
-            } else {
-                app.variables.iter().map(|(name, _)| format!("${{{name}}}")).collect()
+            copies: match app.blocked {
+                Some(_) => Vec::new(),
+                None => app.variables.iter().map(|(name, _)| format!("${{{name}}}")).collect(),
             },
         })
         .collect();
@@ -241,9 +260,11 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             Some(row(name, value, Some(format!("The database {file}, in the Storage tab.")), false))
         })
         .collect();
-    let from_server: Vec<Row> = system_env()
-        .map(|(name, value)| row(name, &value, None, false))
-        .collect();
+    // A container gets none of them: its image sets its own.
+    let from_server: Vec<Row> = match in_docker {
+        false => system_env().map(|(name, value)| row(name, &value, None, false)).collect(),
+        true => Vec::new(),
+    };
 
     let mut groups = vec![
         Group {
@@ -278,11 +299,17 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             rows: tokens,
         });
     }
-    groups.push(Group {
-        title: "From the server",
-        text: "What programs need, from the environment oxploy runs in.",
-        rows: from_server,
-    });
+    if !in_docker {
+        groups.push(Group {
+            title: "From the server",
+            text: "What programs need, from the environment oxploy runs in.",
+            rows: from_server,
+        });
+    }
+    let builds = match in_docker {
+        false => "Builds get the same, except PORT and OXPLOY_STORAGE_DIR, which reach only the app and the script after the build. Builds also get CARGO_TARGET_DIR, the app's cargo cache, and a build script gets OXPLOY_OUTPUT_DIR, where it leaves the binary.",
+        true => "The container gets only these, not the server's own, such as PATH, which its image sets. docker build gets none of them; the script after the build gets the same, in a container of the new image.",
+    };
     let revealed = signal(cx, || false);
     let reveal = revealed.clone();
 
@@ -361,7 +388,7 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
                 }
             </div>
             field_description(
-                "Builds get the same, except PORT and OXPLOY_STORAGE_DIR, which reach only the app and the script after the build. Builds also get CARGO_TARGET_DIR, the app's cargo cache, and a build script gets OXPLOY_OUTPUT_DIR, where it leaves the binary."
+                (builds)
             )
         )
     })

@@ -104,13 +104,18 @@ impl Project {
         Ok(true)
     }
 
-    /// Deletes the project and its services.
+    /// Deletes the project and its services, with the Docker network its containers
+    /// shared.
     pub async fn remove(self, cx: &Cx) -> Result<()> {
         Service::remove_all_in(cx, self.id).await?;
         Project::filter_by_id(self.id)
             .delete()
             .exec(&mut db(cx))
             .await?;
+        if super::docker::version().await.is_some() {
+            let network = super::docker::network(self.id);
+            let _ = tokio::task::spawn_blocking(move || super::docker::remove_network(&network)).await;
+        }
         Ok(())
     }
 

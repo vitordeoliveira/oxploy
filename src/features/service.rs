@@ -96,8 +96,9 @@ pub struct Service {
     /// See [`environment`].
     pub environment: Option<String>,
 
-    /// The port on 127.0.0.1 the app listens on, passed to it as `PORT`. Chosen the
-    /// first time the app starts, and kept.
+    /// The port on 127.0.0.1 the app answers at: where it listens, passed to it as
+    /// `PORT`, or where its container is published. Chosen when the app is made, and
+    /// kept.
     pub port: Option<u64>,
 
     /// The deployment whose build runs: the latest one that went live.
@@ -134,6 +135,14 @@ pub struct Service {
     /// Where an external MCP server answers, such as `https://api.example.com/mcp`.
     /// See [`app_mcp::external_url`].
     pub mcp_url: Option<String>,
+
+    /// The Dockerfile a service built with Docker builds, from the build path, such as
+    /// `deploy/Dockerfile`. `None` is `Dockerfile`.
+    pub dockerfile: Option<String>,
+
+    /// The port the app listens on in its container, which oxploy publishes at
+    /// [`port`](Self::port) on 127.0.0.1. `None` is the same port.
+    pub container_port: Option<u64>,
 }
 
 /// What a service is.
@@ -176,6 +185,18 @@ pub enum BuildKind {
     /// A file of the repository's latest GitHub release, built elsewhere: the binary,
     /// or an archive with it.
     Release,
+    /// `docker build` with the repository's Dockerfile, whose image runs in a
+    /// container. See [`docker`](super::docker).
+    Dockerfile,
+}
+
+/// How Docker builds and runs a service, as the user typed it.
+pub struct DockerfileBuild<'a> {
+    /// The Dockerfile, from the build path. Empty is `Dockerfile`.
+    pub dockerfile: &'a str,
+    /// The port the app listens on in its container. Empty is the one oxploy passes in
+    /// `PORT`.
+    pub port: &'a str,
 }
 
 /// A build script, as the user wrote it.
@@ -372,6 +393,8 @@ impl Service {
             mcp_token: external.as_ref().map(|(_, token)| token.clone()),
             kind: Some(if external.is_some() { ServiceKind::ExternalMcp } else { ServiceKind::App }),
             mcp_url: external.map(|(url, _)| url),
+            dockerfile: None,
+            container_port: None,
         })
         .exec(&mut db(cx))
         .await?;
@@ -496,6 +519,33 @@ impl Service {
         Ok(true)
     }
 
+    /// Makes the service build with Docker and run in a container. Returns `false`,
+    /// changing nothing, if the Dockerfile is not a path inside the repository or the
+    /// port is not one.
+    pub async fn set_dockerfile(&mut self, cx: &Cx, build: &DockerfileBuild<'_>) -> Result<bool> {
+        let dockerfile = build.dockerfile.trim().trim_start_matches("./");
+        let port = build.port.trim();
+        let dockerfile = match dockerfile {
+            "" => None,
+            path if is_path_inside(path) => Some(path.to_owned()),
+            _ => return Ok(false),
+        };
+        let container_port = match port {
+            "" => None,
+            port => match port.parse::<u64>() {
+                Ok(port @ 1..=65_535) => Some(port),
+                _ => return Ok(false),
+            },
+        };
+        self.update()
+            .build_kind(Some(BuildKind::Dockerfile))
+            .dockerfile(dockerfile)
+            .container_port(container_port)
+            .exec(&mut db(cx))
+            .await?;
+        Ok(true)
+    }
+
     /// Makes the service deploy a file of its repository's latest GitHub release.
     /// Returns `false`, changing nothing, if the file is not a file name, or the binary
     /// is not a path inside the archive. The binary is kept only for an archive.
@@ -570,6 +620,25 @@ impl Service {
     /// The token the app's MCP server takes, while it serves one.
     pub fn mcp_token_in_use(&self) -> Option<&str> {
         self.mcp_path.as_ref().and(self.mcp_token.as_deref())
+    }
+
+    /// Whether its app runs in a container: one built with Docker.
+    pub fn runs_in_docker(&self) -> bool {
+        !self.is_external() && self.builds_with() == BuildKind::Dockerfile
+    }
+
+    /// The port the app itself listens on: inside its container for one that runs in
+    /// Docker, or else its port on 127.0.0.1.
+    pub fn app_port(&self) -> Option<u64> {
+        match self.runs_in_docker() {
+            true => self.container_port.or(self.port),
+            false => self.port,
+        }
+    }
+
+    /// The Dockerfile it builds, from the build path.
+    pub fn dockerfile(&self) -> &str {
+        self.dockerfile.as_deref().unwrap_or("Dockerfile")
     }
 
     /// How the service is built.
@@ -1014,12 +1083,72 @@ mod tests {
         let for_apps = NewToken { name: "Bot URL", for_apps: true, ..NewToken::default() };
         let (_, secret) = McpToken::issue(&cx, Some(7), &for_apps).await.unwrap().unwrap();
         let oxploy = FromOxploy::of(&test.db, &caller).await.unwrap();
-        assert!(oxploy.apps.iter().all(|app| app.clashes));
+        assert!(oxploy.apps.iter().all(|app| app.blocked == Some(crate::features::runtime::Blocked::Clashes)));
         assert!(!oxploy.usable().contains(&"OXPLOY_MCP_BOT_HOST"));
         caller.set_environment(&cx, "BOT=${OXPLOY_MCP_BOT_URL}").await.unwrap().unwrap();
         let caller = Service::filter_by_id(caller.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap();
         let variables = variables_with_port(&caller, &AppFiles::of(&caller.app_name), "4000", &[], &oxploy);
         assert_eq!(variables.iter().find(|(key, _)| key == "BOT").map(|(_, value)| value.clone()), Some(secret));
+    }
+
+    #[tokio::test]
+    async fn a_container_reaches_the_projects_other_containers_by_name() {
+        use crate::features::runtime::Blocked;
+
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        let shop = Project::add(&cx, 7, &Details { name: "Shop", description: "" })
+            .await
+            .unwrap()
+            .unwrap();
+        let add = async |name| {
+            Service::add(&cx, &shop, &Details { name, description: "" })
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let mut web = add("Web").await;
+        let mut api = add("API").await;
+        let worker = add("Worker").await;
+        let dockerfile = |dockerfile, port| DockerfileBuild { dockerfile, port };
+
+        // Only a path inside the repository, and a port.
+        for (path, port) in [("../Dockerfile", ""), ("/etc/Dockerfile", ""), ("", "0"), ("", "70000"), ("", "http")] {
+            assert!(!api.set_dockerfile(&cx, &dockerfile(path, port)).await.unwrap(), "{path} {port}");
+        }
+        assert!(!api.runs_in_docker());
+        assert!(api.set_dockerfile(&cx, &dockerfile(" ./deploy/Dockerfile ", "8080")).await.unwrap());
+        assert!(web.set_dockerfile(&cx, &dockerfile("", "")).await.unwrap());
+        let reload = async |service: &Service| {
+            Service::filter_by_id(service.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap()
+        };
+        let (web, api) = (reload(&web).await, reload(&api).await);
+        assert!(api.runs_in_docker() && web.runs_in_docker() && !worker.runs_in_docker());
+        assert_eq!(api.dockerfile(), "deploy/Dockerfile");
+        assert_eq!(web.dockerfile(), "Dockerfile");
+        // In its container, an app listens on its own port, or else on the one it is
+        // published at.
+        assert_eq!(api.app_port(), Some(8080));
+        assert_eq!(web.app_port(), web.port);
+
+        let from_web = FromOxploy::of(&test.db, &web).await.unwrap();
+        let reached = |oxploy: &FromOxploy, name: &str| {
+            oxploy.apps.iter().find(|app| app.name == name).cloned().unwrap()
+        };
+        let api_from_web = reached(&from_web, "API");
+        assert_eq!(api_from_web.blocked, None);
+        assert_eq!(api_from_web.variables[0], ("OXPLOY_SHOP_API_URL".to_owned(), "http://shop-api:8080".to_owned()));
+        assert_eq!(api_from_web.variables[1].1, "shop-api");
+        assert_eq!(reached(&from_web, "Worker").blocked, Some(Blocked::NativeFromContainer));
+        let mut web = web;
+        let refused = web.set_environment(&cx, "W=${OXPLOY_SHOP_WORKER_URL}").await.unwrap();
+        assert!(refused.is_err());
+
+        // A native app reaches a container where it is published.
+        let from_worker = FromOxploy::of(&test.db, &worker).await.unwrap();
+        let api_from_worker = reached(&from_worker, "API");
+        assert_eq!(api_from_worker.blocked, None);
+        assert_eq!(api_from_worker.variables[0].1, format!("http://127.0.0.1:{}", api.port.unwrap()));
     }
 
     #[tokio::test]
