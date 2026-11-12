@@ -470,6 +470,21 @@ impl Runtime {
 pub struct FromOxploy {
     pub mcp_url: String,
     pub tokens: Vec<(String, String)>,
+    /// The project's other apps, oldest first.
+    pub apps: Vec<ProjectApp>,
+}
+
+/// Another app of the service's project, and where it answers.
+#[derive(Clone, Debug)]
+pub struct ProjectApp {
+    /// The service's name.
+    pub name: String,
+    /// Its URL, host and port, each with its variable, as
+    /// [`address_variables`](environment::address_variables) names them.
+    pub variables: [(String, String); 3],
+    /// Whether one of those names is a variable oxploy sets or an MCP token's, which
+    /// wins, so a line cannot use the app's.
+    pub clashes: bool,
 }
 
 impl FromOxploy {
@@ -483,11 +498,57 @@ impl FromOxploy {
             Some(project) => McpToken::for_apps(db, project.organization_id).await?,
             None => Vec::new(),
         };
+        let mut others = Service::filter_by_project_id(service.project_id)
+            .exec(&mut db.clone())
+            .await?;
+        others.sort_by_key(|other| other.id);
+        let apps: Vec<ProjectApp> = others
+            .iter()
+            .filter(|other| other.id != service.id)
+            .filter_map(|other| {
+                let (host, port) = address(other)?;
+                let [url_name, host_name, port_name] = environment::address_variables(&other.app_name);
+                let clashes = [&url_name, &host_name, &port_name].iter().any(|name| {
+                    environment::is_set_by_oxploy(name) || tokens.iter().any(|(token, _)| token == *name)
+                });
+                Some(ProjectApp {
+                    name: other.name.clone(),
+                    variables: [
+                        (url_name, format!("http://{host}:{port}")),
+                        (host_name, host.to_owned()),
+                        (port_name, port.to_string()),
+                    ],
+                    clashes,
+                })
+            })
+            .collect();
         Ok(FromOxploy {
             mcp_url: format!("http://{}/mcp", local_panel_address()),
             tokens,
+            apps,
         })
     }
+
+    /// The variables starting with `OXPLOY_` that a line can use besides the ones oxploy
+    /// sets for every app: the organization's tokens and the project's other apps'.
+    pub fn usable(&self) -> Vec<&str> {
+        let tokens = self.tokens.iter().map(|(name, _)| name.as_str());
+        let apps = self
+            .apps
+            .iter()
+            .filter(|app| !app.clashes)
+            .flat_map(|app| app.variables.iter().map(|(name, _)| name.as_str()));
+        tokens.chain(apps).collect()
+    }
+}
+
+/// Where `app` answers for the other apps on this server, if it is an app with a port:
+/// on this machine, at 127.0.0.1, where every app listens.
+fn address(app: &Service) -> Option<(&'static str, u64)> {
+    if app.is_external() {
+        return None;
+    }
+    Some(("127.0.0.1", app.port?))
 }
 
 /// The service's variables as its app and builds get them: those its databases set,
@@ -528,8 +589,16 @@ pub fn variables_with_port(
         (MCP_URL_VARIABLE, oxploy.mcp_url.clone()),
     ];
     provided.extend(set_by_databases.iter().map(|(name, value)| (name.as_str(), value.clone())));
-    // Only the app whose variables use one of them gets an organization's token.
+    // Only the app whose variables use one of them gets an organization's token, or
+    // where another app of its project answers.
     provided.extend(oxploy.tokens.iter().map(|(name, value)| (name.as_str(), value.clone())));
+    provided.extend(
+        oxploy
+            .apps
+            .iter()
+            .filter(|app| !app.clashes)
+            .flat_map(|app| app.variables.iter().map(|(name, value)| (name.as_str(), value.clone()))),
+    );
     let mut variables = set_by_databases.clone();
     variables.extend(environment::resolve(own, &provided));
     variables.push((MCP_URL_VARIABLE.to_owned(), oxploy.mcp_url.clone()));

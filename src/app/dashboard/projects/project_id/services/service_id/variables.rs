@@ -206,6 +206,26 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             copies: vec![format!("${{{name}}}"), format!("MCP_TOKEN=${{{name}}}")],
         })
         .collect();
+    // Where the project's other apps answer, which the app gets only if its variables
+    // use it.
+    let apps: Vec<Row> = oxploy
+        .apps
+        .iter()
+        .map(|app| Row {
+            name: app.name.clone(),
+            value: None,
+            note: app.clashes.then(|| {
+                "Its variables take names that oxploy or an MCP token of this organization already use, so a line cannot use them."
+                    .to_owned()
+            }),
+            secret: false,
+            copies: if app.clashes {
+                Vec::new()
+            } else {
+                app.variables.iter().map(|(name, _)| format!("${{{name}}}")).collect()
+            },
+        })
+        .collect();
     if let Some(token) = service.mcp_token_in_use() {
         by_oxploy.push(row(
             MCP_TOKEN_VARIABLE,
@@ -242,6 +262,13 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
             title: "From the Storage tab",
             text: "",
             rows: from_storage,
+        });
+    }
+    if !apps.is_empty() {
+        groups.push(Group {
+            title: "Other apps in this project",
+            text: "Their URL, host and port, which a line above can use. The app gets only the ones a line uses.",
+            rows: apps,
         });
     }
     if !tokens.is_empty() {
@@ -293,7 +320,9 @@ async fn available_card(cx: &Cx, service: &Service, managed: &[ManagedDatabase])
                             <p class="text-sm text-muted-foreground">"None yet."</p>
                         } else {
                             <ul class="divide-y divide-border rounded-lg border border-border">
-                                #[key(row.name.clone())]
+                                // Two apps of a project can share a name, but not their
+                                // variables.
+                                #[key(row.copies.first().unwrap_or(&row.name).clone())]
                                 for row in &group.rows {
                                     <li class="grid grid-cols-1 gap-x-4 gap-y-0.5 px-4 py-2.5 text-sm sm:grid-cols-[minmax(0,14rem)_minmax(0,1fr)]">
                                         <code class="font-mono font-medium break-all">(&row.name)</code>

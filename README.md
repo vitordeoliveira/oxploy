@@ -44,7 +44,10 @@ checked against the release's `.sha256` of the file when there is one. Such a se
 also deploy each new release on its own: oxploy looks at the repository every minute, and
 does not try again a release that failed. A binary built for another machine, such as a
 Linux one on a Mac, fails its deployment before the running release stops. Each app
-runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`. Apps keep
+runs as a process listening on `127.0.0.1`, at the port oxploy passes in `PORT`, which
+it picks when the app is made and keeps. An app reaches another app of its project
+through a line such as `API_URL=${OXPLOY_SHOP_API_URL}` in its Environment tab, named
+after the other app's app name, with `_HOST` and `_PORT` beside `_URL`. Apps keep
 running when the panel stops or restarts, and the panel takes them back when it starts.
 Their code, builds and logs live in `data/`; set `OXPLOY_DATA_DIR` to keep them
 elsewhere. Each app also gets a storage folder that deploys keep, in

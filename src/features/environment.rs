@@ -7,10 +7,12 @@
 //! line.
 //!
 //! It can also use one of its organization's MCP tokens that were made available to
-//! its apps, as `${OXPLOY_MCP_<TOKEN>}`, such as `MCP_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT}`.
-//! Only an app that does gets the token. Saving checks that such a token exists, with
-//! [`check_tokens`], but reading the saved variables does not: a token revoked since is
-//! empty, rather than making the app lose all of its variables.
+//! its apps, as `${OXPLOY_MCP_<TOKEN>}`, such as `MCP_TOKEN=${OXPLOY_MCP_TELEGRAM_BOT}`,
+//! and where another app of its project answers, as `${OXPLOY_<APP>_URL}`, `_HOST` and
+//! `_PORT`, such as `API_URL=${OXPLOY_SHOP_API_URL}`. Only an app that does gets them.
+//! Saving checks that what a value uses exists, with [`check_references`], but reading
+//! the saved variables does not: a token revoked or an app deleted since is empty,
+//! rather than making the app lose all of its variables.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -39,9 +41,19 @@ pub const TOKEN_PREFIX: &str = "OXPLOY_MCP_";
 /// The variables oxploy sets for every app, which values can use.
 const PROVIDED: [&str; 4] = [PORT_VARIABLE, STORAGE_VARIABLE, MCP_TOKEN_VARIABLE, MCP_URL_VARIABLE];
 
+/// What the names of the variables oxploy sets start with.
+const OXPLOY_PREFIX: &str = "OXPLOY_";
+
 /// Whether oxploy sets the variable `name` for every app.
 pub fn is_set_by_oxploy(name: &str) -> bool {
     PROVIDED.contains(&name)
+}
+
+/// The variables that tell where the app named `app_name` answers: its URL, its host
+/// and its port, such as `OXPLOY_SHOP_API_URL` for the app `shop-api`.
+pub fn address_variables(app_name: &str) -> [String; 3] {
+    let app = app_name.to_ascii_uppercase().replace('-', "_");
+    ["URL", "HOST", "PORT"].map(|part| format!("{OXPLOY_PREFIX}{app}_{part}"))
 }
 
 /// One variable.
@@ -117,7 +129,7 @@ pub fn parse(text: &str, elsewhere: &[SetElsewhere<'_>]) -> Result<Vec<Variable>
                 "oxploy sets PORT itself, to the port Caddy sends traffic to".to_owned(),
             ));
         }
-        if key.starts_with("OXPLOY_") {
+        if key.starts_with(OXPLOY_PREFIX) {
             return Err(problem(format!(
                 "{key} starts with OXPLOY_, which is for the variables oxploy sets"
             )));
@@ -130,9 +142,10 @@ pub fn parse(text: &str, elsewhere: &[SetElsewhere<'_>]) -> Result<Vec<Variable>
         let value = unquote(value);
         if expands {
             for name in references(value).map_err(problem)? {
-                // A token's variable is checked when saving, by `check_tokens`.
+                // A token's or an app's variable is checked when saving, by
+                // `check_references`.
                 let provided = PROVIDED.contains(&name)
-                    || name.starts_with(TOKEN_PREFIX)
+                    || name.starts_with(OXPLOY_PREFIX)
                     || elsewhere.iter().any(|set| set.name == name);
                 if !provided && !lines_by_key.contains_key(name) {
                     return Err(problem(format!(
@@ -190,10 +203,11 @@ fn references(value: &str) -> Result<Vec<&str>, String> {
     Ok(names)
 }
 
-/// Checks that each MCP token the variables in `text` use, as `${OXPLOY_MCP_<TOKEN>}`,
-/// is one of the organization's made available to its apps, named in `available`.
+/// Checks that each variable starting with `OXPLOY_` that the values in `text` use is
+/// one oxploy sets for every app, or one named in `available`: the organization's MCP
+/// tokens made available to its apps, and the variables of the project's other apps.
 /// `text` must already read as variables; see [`parse`].
-pub fn check_tokens(text: &str, available: &[String]) -> Result<(), EnvironmentError> {
+pub fn check_references(text: &str, available: &[&str]) -> Result<(), EnvironmentError> {
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         let Some((_, value)) = line.split_once('=').filter(|_| !line.starts_with('#')) else {
@@ -204,22 +218,29 @@ pub fn check_tokens(text: &str, available: &[String]) -> Result<(), EnvironmentE
             continue;
         }
         for name in references(unquote(value)).unwrap_or_default() {
-            let token = name.starts_with(TOKEN_PREFIX) && !PROVIDED.contains(&name);
-            if token && !available.iter().any(|available| available == name) {
-                return Err(EnvironmentError {
-                    line: index + 1,
-                    problem: format!(
-                        "${{{name}}} is no MCP token of this organization that its apps can use. The MCP page lists them."
-                    ),
-                });
+            let checked = name.starts_with(OXPLOY_PREFIX) && !PROVIDED.contains(&name);
+            if !checked || available.contains(&name) {
+                continue;
             }
+            let problem = if name.starts_with(TOKEN_PREFIX) {
+                format!("${{{name}}} is no MCP token of this organization that its apps can use. The MCP page lists them.")
+            } else if ["_URL", "_HOST", "_PORT"].iter().any(|part| name.ends_with(part)) {
+                format!("${{{name}}} is no other app of this project. What the app gets, below, lists them.")
+            } else {
+                format!("${{{name}}} is not set on an earlier line, and oxploy does not set it")
+            };
+            return Err(EnvironmentError {
+                line: index + 1,
+                problem,
+            });
         }
     }
     Ok(())
 }
 
-/// Replaces each `${NAME}` in `value` with its value in `known`. A token's variable
-/// that is not known, as one revoked since, is empty.
+/// Replaces each `${NAME}` in `value` with its value in `known`. A variable starting
+/// with `OXPLOY_` that is not known, as a token revoked or an app deleted since, is
+/// empty.
 fn expand(value: &str, known: &HashMap<String, String>) -> String {
     let mut expanded = String::with_capacity(value.len());
     let mut rest = value;
@@ -231,7 +252,7 @@ fn expand(value: &str, known: &HashMap<String, String>) -> String {
         };
         match known.get(&after[..end]) {
             Some(value) => expanded.push_str(value),
-            None if after[..end].starts_with(TOKEN_PREFIX) => {}
+            None if after[..end].starts_with(OXPLOY_PREFIX) => {}
             None => expanded.push_str(&rest[start..start + 2 + end + 1]),
         }
         rest = &after[end + 1..];
@@ -286,12 +307,37 @@ mod tests {
             ]
         );
 
-        let available = ["OXPLOY_MCP_TELEGRAM_BOT".to_owned()];
-        assert_eq!(check_tokens("BOT=${OXPLOY_MCP_TELEGRAM_BOT}\nURL=${OXPLOY_MCP_URL}", &available), Ok(()));
-        assert_eq!(check_tokens("# A=${OXPLOY_MCP_NONE}\nB='${OXPLOY_MCP_NONE}'", &available), Ok(()));
-        let error = check_tokens("A=1\nGONE=${OXPLOY_MCP_REVOKED}", &available).unwrap_err();
+        let available = ["OXPLOY_MCP_TELEGRAM_BOT"];
+        assert_eq!(check_references("BOT=${OXPLOY_MCP_TELEGRAM_BOT}\nURL=${OXPLOY_MCP_URL}", &available), Ok(()));
+        assert_eq!(check_references("# A=${OXPLOY_MCP_NONE}\nB='${OXPLOY_MCP_NONE}'", &available), Ok(()));
+        let error = check_references("A=1\nGONE=${OXPLOY_MCP_REVOKED}", &available).unwrap_err();
         assert_eq!(error.line, 2);
         assert!(error.problem.contains("OXPLOY_MCP_REVOKED"), "{}", error.problem);
+    }
+
+    #[test]
+    fn uses_where_the_projects_other_apps_answer() {
+        assert_eq!(
+            address_variables("shop-api-2"),
+            ["OXPLOY_SHOP_API_2_URL", "OXPLOY_SHOP_API_2_HOST", "OXPLOY_SHOP_API_2_PORT"]
+        );
+        let text = "API=${OXPLOY_SHOP_API_URL}\nGONE=http://${OXPLOY_SHOP_OLD_HOST}:${OXPLOY_SHOP_OLD_PORT}/";
+        let provided = [("OXPLOY_SHOP_API_URL", "http://127.0.0.1:10001".to_owned())];
+        assert_eq!(
+            resolve(parse(text, &[]).unwrap(), &provided),
+            [
+                ("API".to_owned(), "http://127.0.0.1:10001".to_owned()),
+                // An app deleted since leaves its variables empty.
+                ("GONE".to_owned(), "http://:/".to_owned()),
+            ]
+        );
+
+        let available = ["OXPLOY_SHOP_API_URL"];
+        assert_eq!(check_references("API=${OXPLOY_SHOP_API_URL}", &available), Ok(()));
+        let gone = check_references("API=${OXPLOY_SHOP_OLD_URL}", &available).unwrap_err();
+        assert!(gone.problem.contains("no other app of this project"), "{}", gone.problem);
+        let typo = check_references("DIR=${OXPLOY_STORAGE}", &available).unwrap_err();
+        assert!(typo.problem.contains("oxploy does not set it"), "{}", typo.problem);
     }
 
     fn pairs(text: &str) -> Vec<(String, String)> {

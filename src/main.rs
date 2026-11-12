@@ -27,6 +27,9 @@ async fn main() {
 
     // The time zone the super admin picked, which the panel shows times in.
     features::time_zone::PanelTimeZone::load(&db).await.unwrap();
+    // Apps made before ports came with them get one, so their project's other apps can
+    // use where they answer.
+    features::service::Service::give_ports(&db).await.unwrap();
     let monitor = features::monitoring::Monitor::start().unwrap();
     // Keeps Caddy's routes to the apps in step with their domains.
     let caddy = features::caddy::Caddy::start(db.clone());

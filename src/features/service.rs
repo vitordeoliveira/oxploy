@@ -1,5 +1,8 @@
 //! Services, the Rust apps a project deploys, stored in the database.
 
+use std::collections::HashSet;
+
+use toasty::Db;
 use tokio::sync::Mutex;
 use topcoat::{Result, context::Cx};
 
@@ -11,8 +14,9 @@ use super::deploy::Deployer;
 use super::domain::Domain;
 use super::environment::{self, EnvironmentError};
 use super::github::is_repository_name;
-use super::mcp::{McpToken, McpTokenTool};
+use super::mcp::McpTokenTool;
 use super::project::{Details, Project, now};
+use super::runtime::FromOxploy;
 use crate::db::db;
 
 /// A Rust app deployed from a repository.
@@ -219,6 +223,12 @@ const MAX_APP_NAME_LEN: usize = 63;
 /// one.
 static NAMING: Mutex<()> = Mutex::const_new(());
 
+/// The ports oxploy gives apps, on 127.0.0.1.
+const PORTS: std::ops::RangeInclusive<u64> = 10_000..=19_999;
+
+/// Serializes picking ports, so two apps cannot get the same one.
+static PORTING: Mutex<()> = Mutex::const_new(());
+
 impl Service {
     /// Returns the services of a project, oldest first.
     pub async fn in_project(cx: &Cx, project_id: u64) -> Result<Vec<Service>> {
@@ -365,7 +375,25 @@ impl Service {
         })
         .exec(&mut db(cx))
         .await?;
+        let mut service = service;
+        if !service.is_external() {
+            // The port comes with the app, so the project's other apps can use where it
+            // answers before its first deploy.
+            service.port = assign_port(&db(cx), service.id).await?;
+        }
         Ok(service)
+    }
+
+    /// Gives a port to each app that has none, as apps made before ports came with
+    /// them, which got theirs at their first deploy.
+    pub async fn give_ports(db: &Db) -> toasty::Result<()> {
+        let services = Service::all().exec(&mut db.clone()).await?;
+        for service in services {
+            if service.port.is_none() && !service.is_external() {
+                assign_port(db, service.id).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Replaces the name and description. The app name stays. Returns `false`, changing
@@ -440,16 +468,8 @@ impl Service {
         if let Err(error) = environment::parse(text, &databases::set_elsewhere(&databases)) {
             return Ok(Err(error));
         }
-        let project = Project::filter_by_id(self.project_id).first().exec(&mut db(cx)).await?;
-        let available: Vec<String> = match project {
-            Some(project) => McpToken::for_apps(&db(cx), project.organization_id)
-                .await?
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect(),
-            None => Vec::new(),
-        };
-        if let Err(error) = environment::check_tokens(text, &available) {
+        let oxploy = FromOxploy::of(&db(cx), self).await?;
+        if let Err(error) = environment::check_references(text, &oxploy.usable()) {
             return Ok(Err(error));
         }
         let text = (!text.is_empty()).then(|| text.to_owned());
@@ -598,6 +618,34 @@ fn external_settings(url: &str, token: Option<&str>) -> Result<(String, Option<S
         return Err(ExternalProblem::Token);
     }
     Ok((url, token.map(str::to_owned)))
+}
+
+/// Returns the app's port on 127.0.0.1, giving it one that no other service has and
+/// nothing listens on if it has none yet, or `None` if every port is taken.
+pub async fn assign_port(db: &Db, service_id: u64) -> toasty::Result<Option<u64>> {
+    let _porting = PORTING.lock().await;
+    let mut db = db.clone();
+    let services = Service::all().exec(&mut db).await?;
+    if let Some(port) = services
+        .iter()
+        .find(|service| service.id == service_id)
+        .and_then(|service| service.port)
+    {
+        return Ok(Some(port));
+    }
+    let taken: HashSet<u64> = services.iter().filter_map(|service| service.port).collect();
+    let Some(port) = PORTS.into_iter().find(|port| {
+        !taken.contains(port)
+            && u16::try_from(*port).is_ok_and(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+    }) else {
+        return Ok(None);
+    };
+    Service::filter_by_id(service_id)
+        .update()
+        .port(Some(port))
+        .exec(&mut db)
+        .await?;
+    Ok(Some(port))
 }
 
 /// Returns an app name no other service uses, such as `shop-api`, or `shop-api-2`
@@ -851,8 +899,8 @@ mod tests {
     #[tokio::test]
     async fn an_app_gets_only_the_organizations_tokens_its_variables_use() {
         use crate::features::app_files::AppFiles;
-        use crate::features::mcp::NewToken;
-        use crate::features::runtime::{FromOxploy, variables_with_port};
+        use crate::features::mcp::{McpToken, NewToken};
+        use crate::features::runtime::variables_with_port;
 
         let test = TestDb::new().await;
         let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
@@ -898,6 +946,80 @@ mod tests {
         let value = |name: &str| variables.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
         assert_eq!(value("A").as_deref(), Some("1"));
         assert_eq!(value("TOKEN").as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn an_app_uses_where_the_other_apps_of_its_project_answer() {
+        use crate::features::app_files::AppFiles;
+        use crate::features::mcp::{McpToken, NewToken};
+        use crate::features::runtime::variables_with_port;
+
+        let test = TestDb::new().await;
+        let cx = CxTestBuilder::new().app_context(test.db.clone()).build();
+        async fn add_project(cx: &Cx, name: &str) -> Project {
+            Project::add(cx, 7, &Details { name, description: "" }).await.unwrap().unwrap()
+        }
+        async fn add(cx: &Cx, project: &Project, name: &str) -> Service {
+            Service::add(cx, project, &Details { name, description: "" }).await.unwrap().unwrap()
+        }
+        let shop = add_project(&cx, "Shop").await;
+        let blog = add_project(&cx, "Blog").await;
+        let mut web = add(&cx, &shop, "Web").await;
+        let api = add(&cx, &shop, "API").await;
+        let site = add(&cx, &blog, "Site").await;
+        let external = Details { name: "Docs", description: "" };
+        Service::add_external(&cx, &shop, &external, "https://docs.example.com/mcp", None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // An app has its port from the start, and an external MCP server none.
+        let (web_port, api_port) = (web.port.unwrap(), api.port.unwrap());
+        assert_ne!(web_port, api_port);
+        assert!(site.port.is_some());
+        assert_eq!(Service::filter_by_id(api.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap().port, Some(api_port));
+
+        // Only the project's other apps: not itself, another project's or an external server.
+        let oxploy = FromOxploy::of(&test.db, &web).await.unwrap();
+        let names: Vec<&str> = oxploy.apps.iter().map(|app| app.name.as_str()).collect();
+        assert_eq!(names, ["API"]);
+        assert_eq!(
+            oxploy.apps[0].variables,
+            [
+                ("OXPLOY_SHOP_API_URL".to_owned(), format!("http://127.0.0.1:{api_port}")),
+                ("OXPLOY_SHOP_API_HOST".to_owned(), "127.0.0.1".to_owned()),
+                ("OXPLOY_SHOP_API_PORT".to_owned(), api_port.to_string()),
+            ]
+        );
+
+        let refused = web.set_environment(&cx, "A=1\nSITE=${OXPLOY_BLOG_SITE_URL}").await.unwrap().unwrap_err();
+        assert_eq!(refused.line, 2);
+        assert!(refused.problem.contains("no other app of this project"), "{}", refused.problem);
+        web.set_environment(&cx, "API_URL=${OXPLOY_SHOP_API_URL}\nAPI_PORT=${OXPLOY_SHOP_API_PORT}")
+            .await
+            .unwrap()
+            .unwrap();
+        let web = Service::filter_by_id(web.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap();
+        let variables = variables_with_port(&web, &AppFiles::of(&web.app_name), "4000", &[], &oxploy);
+        let value = |name: &str| variables.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        assert_eq!(value("API_URL"), Some(format!("http://127.0.0.1:{api_port}")));
+        assert_eq!(value("API_PORT"), Some(api_port.to_string()));
+        // The app gets them only through its own lines.
+        assert!(variables.iter().all(|(key, _)| !key.starts_with("OXPLOY_SHOP_")));
+
+        // When a token's variable takes the same name, the token wins.
+        let mcp = add_project(&cx, "MCP").await;
+        let mut caller = add(&cx, &mcp, "Caller").await;
+        add(&cx, &mcp, "Bot").await;
+        let for_apps = NewToken { name: "Bot URL", for_apps: true, ..NewToken::default() };
+        let (_, secret) = McpToken::issue(&cx, Some(7), &for_apps).await.unwrap().unwrap();
+        let oxploy = FromOxploy::of(&test.db, &caller).await.unwrap();
+        assert!(oxploy.apps.iter().all(|app| app.clashes));
+        assert!(!oxploy.usable().contains(&"OXPLOY_MCP_BOT_HOST"));
+        caller.set_environment(&cx, "BOT=${OXPLOY_MCP_BOT_URL}").await.unwrap().unwrap();
+        let caller = Service::filter_by_id(caller.id).first().exec(&mut test.db.clone()).await.unwrap().unwrap();
+        let variables = variables_with_port(&caller, &AppFiles::of(&caller.app_name), "4000", &[], &oxploy);
+        assert_eq!(variables.iter().find(|(key, _)| key == "BOT").map(|(_, value)| value.clone()), Some(secret));
     }
 
     #[tokio::test]

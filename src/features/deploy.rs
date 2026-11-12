@@ -32,15 +32,12 @@ use super::github::{GithubApp, Release, ReleaseFile};
 use super::machine::Machine;
 use super::project::{Project, now};
 use super::runtime::{Exits, FromOxploy, Launch, Readiness, Runtime, app_variables, system_env};
-use super::service::{BuildKind, Service, release_file_matches};
+use super::service::{BuildKind, Service, assign_port, release_file_matches};
 use super::storage;
 use super::usage::Usage;
 
 /// How long a new release may take to start listening on its port.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The ports oxploy gives apps, on 127.0.0.1.
-const PORTS: std::ops::RangeInclusive<u64> = 10_000..=19_999;
 
 /// How often oxploy looks for new GitHub releases of the services that deploy them on
 /// their own.
@@ -487,7 +484,10 @@ impl Deployer {
         // The port comes first, so the variables can use `${PORT}` in builds too.
         let port = match service.port {
             Some(port) => port,
-            None => self.assign_port(service).await?,
+            None => assign_port(&self.db, service.id)
+                .await
+                .map_err(saved)?
+                .ok_or("there is no free port left for apps")?,
         };
         let databases = ManagedDatabase::of_service_in(&self.db, service.id)
             .await
@@ -707,31 +707,6 @@ impl Deployer {
         Ok(app.filter(|app| app.organization_id == project.organization_id))
     }
 
-    /// Gives the service a port on 127.0.0.1 that no other service has and nothing
-    /// listens on.
-    async fn assign_port(&self, service: &Service) -> Result<u64, String> {
-        let mut db = self.db.clone();
-        let services = Service::all()
-            .exec(&mut db)
-            .await
-            .map_err(|error| error.to_string())?;
-        let taken: HashSet<_> = services.iter().filter_map(|service| service.port).collect();
-        let port = PORTS
-            .into_iter()
-            .find(|port| {
-                !taken.contains(port)
-                    && u16::try_from(*port)
-                        .is_ok_and(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
-            })
-            .ok_or("there is no free port left for apps")?;
-        Service::filter_by_id(service.id)
-            .update()
-            .port(Some(port))
-            .exec(&mut db)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(port)
-    }
 }
 
 /// What one deployment's build works with.
