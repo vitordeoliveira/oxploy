@@ -76,10 +76,17 @@ pub struct Service {
     /// The file the build script leaves in `OXPLOY_OUTPUT_DIR`, which oxploy starts.
     pub script_binary: Option<String>,
 
-    /// The file of the repository's latest GitHub release to deploy, when the service
-    /// deploys releases, such as `api-x86_64-linux.tar.gz`. A `*` stands for any text,
-    /// such as the version.
+    /// The file of the repository's GitHub release to deploy, when the service deploys
+    /// releases, such as `api-x86_64-linux.tar.gz`. A `*` stands for any text, such as
+    /// the version.
     pub github_asset: Option<String>,
+
+    /// The tag of the release to deploy, when the service deploys releases, such as
+    /// `api/v*` for the newest release of a monorepo's app, or `api/v*-beta.*` for its
+    /// newest beta. A `*` stands for any text without a `-`, so `v*` leaves out
+    /// `v1.4.0-beta.1`. `None` deploys the repository's latest release, as GitHub
+    /// marks it. See [`release_tag_matches`].
+    pub github_tag: Option<String>,
 
     /// The binary in the release's file, when the file is an archive, such as `api` or
     /// `bin/api`. A file that is not an archive is the binary itself.
@@ -182,7 +189,7 @@ pub enum BuildKind {
     Cargo,
     /// A shell script the user writes.
     Script,
-    /// A file of the repository's latest GitHub release, built elsewhere: the binary,
+    /// A file of one of the repository's GitHub releases, built elsewhere: the binary,
     /// or an archive with it.
     Release,
     /// `docker build` with the repository's Dockerfile, whose image runs in a
@@ -208,6 +215,9 @@ pub struct BuildScript<'a> {
 
 /// The file of a GitHub release a service deploys, as the user typed it.
 pub struct ReleaseBuild<'a> {
+    /// The release's tag, where `*` stands for any text without a `-`. Empty is the
+    /// repository's latest release.
+    pub tag: &'a str,
     /// The file's name, where `*` stands for any text.
     pub file: &'a str,
     /// The binary in the file, when it is an archive.
@@ -380,6 +390,7 @@ impl Service {
             build_script: None,
             script_binary: None,
             github_asset: None,
+            github_tag: None,
             github_asset_binary: None,
             deploys_new_releases: None,
             after_build: None,
@@ -546,13 +557,15 @@ impl Service {
         Ok(true)
     }
 
-    /// Makes the service deploy a file of its repository's latest GitHub release.
-    /// Returns `false`, changing nothing, if the file is not a file name, or the binary
-    /// is not a path inside the archive. The binary is kept only for an archive.
+    /// Makes the service deploy a file of one of its repository's GitHub releases: the
+    /// latest, or the newest whose tag matches the build's. Returns `false`, changing
+    /// nothing, if the tag is not a tag, the file is not a file name, or the binary is
+    /// not a path inside the archive. The binary is kept only for an archive.
     pub async fn set_release(&mut self, cx: &Cx, build: &ReleaseBuild<'_>) -> Result<bool> {
+        let tag = build.tag.trim();
         let file = build.file.trim();
         let binary = build.binary.trim().trim_start_matches("./");
-        if !is_release_file(file) {
+        if !is_release_file(file) || !(tag.is_empty() || is_release_tag(tag)) {
             return Ok(false);
         }
         let binary = if archive::is_archive(file) {
@@ -565,6 +578,7 @@ impl Service {
         };
         self.update()
             .build_kind(Some(BuildKind::Release))
+            .github_tag((!tag.is_empty()).then(|| tag.to_owned()))
             .github_asset(Some(file.to_owned()))
             .github_asset_binary(binary)
             .deploys_new_releases(Some(build.automatic))
@@ -792,6 +806,18 @@ fn is_release_file(name: &str) -> bool {
         && name != ".."
 }
 
+/// Returns whether `tag` names a release's tag, where `*` stands for any text: text
+/// a git tag can be named, that is not only stars.
+fn is_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 255
+        && tag.chars().any(|c| c != '*')
+        && !tag.contains("..")
+        && !tag.starts_with('/')
+        && !tag.ends_with('/')
+        && !tag.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?[\\".contains(c))
+}
+
 /// Returns whether `path` is a file path that stays inside the folder it starts from,
 /// such as `api` or `bin/api`.
 fn is_path_inside(path: &str) -> bool {
@@ -827,10 +853,37 @@ pub fn release_file_matches(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
+/// Returns whether `tag` matches a release tag's name as the user typed it, where `*`
+/// stands for any text without a `-`: the version, and no prerelease after it. `v*`
+/// matches `v1.4.0` and not `v1.4.0-beta.1`, which `v*-beta.*` matches.
+pub fn release_tag_matches(pattern: &str, tag: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    let Some(mut rest) = tag.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        return rest.is_empty();
+    };
+    for part in middle {
+        match rest.find(part) {
+            // The star's text is up to the part, where it must have no dash.
+            Some(at) if !rest[..at].contains('-') => rest = &rest[at + part.len()..],
+            _ => return false,
+        }
+    }
+    rest.len() >= last.len()
+        && rest.ends_with(last)
+        && !rest[..rest.len() - last.len()].contains('-')
+}
+
 /// The name to save for a file of the release tagged `tag`: the file's name, with the
 /// release's version in it as `*`, so that the files of the next releases match too.
-/// `api-v1.2.0-linux.tar.gz` of `v1.2.0` is `api-*-linux.tar.gz`.
+/// `api-v1.2.0-linux.tar.gz` of `v1.2.0` is `api-*-linux.tar.gz`, and of a monorepo's
+/// `api/v1.2.0` too.
 pub fn release_file_pattern(tag: &str, name: &str) -> String {
+    let tag = tag.rsplit('/').next().unwrap_or(tag);
     let version = tag.trim_start_matches('v');
     // A short version, such as `1`, could be part of anything else in the name.
     [tag, version]
@@ -1303,6 +1356,35 @@ mod tests {
     }
 
     #[test]
+    fn release_tags_match_with_stars_up_to_a_dash() {
+        assert!(release_tag_matches("v*", "v1.4.0"));
+        assert!(!release_tag_matches("v*", "v1.4.0-beta.1"));
+        assert!(release_tag_matches("v*-beta.*", "v1.4.0-beta.1"));
+        assert!(!release_tag_matches("v*-beta.*", "v1.4.0"));
+        assert!(release_tag_matches("api/v*", "api/v1.4.0"));
+        assert!(!release_tag_matches("api/v*", "web/v1.4.0"));
+        assert!(!release_tag_matches("api/v*", "api/v1.4.0-rc.1"));
+        assert!(release_tag_matches("api/v*-*", "api/v1.4.0-rc.1"));
+        assert!(release_tag_matches("nightly-*-*-*", "nightly-2025-01-31"));
+        assert!(!release_tag_matches("nightly-*", "nightly-2025-01-31"));
+        assert!(release_tag_matches("v1.4.0", "v1.4.0"));
+        assert!(!release_tag_matches("v1.4.0", "v1.4.0-beta.1"));
+        assert!(!release_tag_matches("a*a", "a"));
+    }
+
+    #[test]
+    fn release_tags_are_git_tags() {
+        assert!(is_release_tag("api/v*-beta.*"));
+        assert!(is_release_tag("v1.4.0"));
+        assert!(!is_release_tag("*"));
+        assert!(!is_release_tag(""));
+        assert!(!is_release_tag("v 1"));
+        assert!(!is_release_tag("v1..2"));
+        assert!(!is_release_tag("/v1"));
+        assert!(!is_release_tag("v1^"));
+    }
+
+    #[test]
     fn release_files_and_binaries_stay_plain() {
         assert!(is_release_file("api-*-x86_64-linux.tar.gz"));
         assert!(!is_release_file("*"));
@@ -1323,6 +1405,11 @@ mod tests {
             "oxploy-website-x86_64-linux.tar.gz"
         );
         assert_eq!(release_file_pattern("v1", "api-v1-x86_64.tar.gz"), "api-v1-x86_64.tar.gz");
+        assert_eq!(release_file_pattern("api/v1.2.0", "api-v1.2.0-linux.tar.gz"), "api-*-linux.tar.gz");
+        assert_eq!(
+            release_file_pattern("api/v1.4.0-beta.1", "api-1.4.0-beta.1-linux.tar.gz"),
+            "api-*-linux.tar.gz"
+        );
     }
 
     #[test]

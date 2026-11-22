@@ -742,9 +742,9 @@ impl Deployer {
         }
     }
 
-    /// Deploys the service if its repository's latest release is not the one it last
-    /// tried, and has the service's file. A release that failed is not tried again on
-    /// its own.
+    /// Deploys the service if the release it deploys, its repository's latest or the
+    /// newest tagged like its tag, is not the one it last tried, and has the service's
+    /// file. A release that failed is not tried again on its own.
     async fn deploy_if_released(&self, service: &Service) -> toasty::Result<()> {
         let (Some(app_id), Some(repository), Some(pattern)) =
             (service.github_app_id, &service.repository, &service.github_asset)
@@ -755,7 +755,7 @@ impl Deployer {
             return Ok(());
         };
         // When GitHub cannot be reached, the next look tries again.
-        let Ok(Some(release)) = app.latest_release(repository).await else {
+        let Ok(Some(release)) = app.release_to_deploy(repository, service.github_tag.as_deref()).await else {
             return Ok(());
         };
         let last = Deployment::filter_by_service_id(service.id)
@@ -855,7 +855,8 @@ async fn fetch_branch(
     Ok((commit, message))
 }
 
-/// Finds the repository's latest GitHub release, and the service's file of it.
+/// Finds the GitHub release the service deploys, its repository's latest or the newest
+/// tagged like its tag, and the service's file of it.
 async fn find_release(
     app: &GithubApp,
     repository: &str,
@@ -866,12 +867,19 @@ async fn find_release(
         .github_asset
         .as_deref()
         .ok_or("choose the release's file under Build in the General tab")?;
-    log.step(&format!("Fetching the latest release of {repository}"));
+    let tag = service.github_tag.as_deref();
+    match tag {
+        Some(tag) => log.step(&format!("Fetching the newest release of {repository} tagged like {tag}")),
+        None => log.step(&format!("Fetching the latest release of {repository}")),
+    }
     let release = app
-        .latest_release(repository)
+        .release_to_deploy(repository, tag)
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("{repository} has no release yet"))?;
+        .ok_or_else(|| match tag {
+            Some(tag) => format!("{repository} has no release tagged like {tag}"),
+            None => format!("{repository} has no release yet"),
+        })?;
     match release.name.as_deref().map(str::trim) {
         Some(title) if !title.is_empty() && title != release.tag_name => {
             log.line(&format!("Release {}, {title}", release.tag_name));

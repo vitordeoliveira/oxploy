@@ -195,8 +195,11 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
         Some(port) => format!("{port}, as the PORT oxploy passes"),
         None => "The PORT oxploy passes".to_owned(),
     };
-    // The release's file as chosen, which the binaries to choose from come from.
+    // The release's tag as typed, which the files to choose from come from, and its file
+    // as chosen, which the binaries come from.
+    let release_tag = signal(cx, || service.github_tag.clone().unwrap_or_default());
     let release_file = signal(cx, || service.github_asset.clone().unwrap_or_default());
+    let release_tag_id = element_id(cx);
     let rust_version_id = element_id(cx);
     let binary_id = element_id(cx);
     let features_id = element_id(cx);
@@ -385,13 +388,31 @@ async fn build_card(cx: &Cx, project: &Project, service: &Service, here: &str) -
             <div :hidden=$(shows_release.get() != "release")>
                 <form method="post" action=(&release_url) class="flex flex-col gap-5">
                     <p class="text-sm text-muted-foreground">
-                        "Deploying downloads a file of the repository's latest release, built elsewhere, such as in GitHub Actions, for this server: "
+                        "Deploying downloads a file of one of the repository's releases, built elsewhere, such as in GitHub Actions, for this server: "
                         (Machine::this().to_string())
                         ". The branch and build path above do not apply."
                     </p>
+                    field(
+                        field_label(attrs: attributes! { for=(&release_tag_id) }, "Tag")
+                        input(
+                            attrs: attributes! {
+                                id=(&release_tag_id)
+                                name="tag"
+                                value=(service.github_tag.as_deref().unwrap_or(""))
+                                placeholder="The latest release"
+                                maxlength="255"
+                                autocomplete="off"
+                                spellcheck="false"
+                                @change=$(|e: Event| release_tag.set(e.target.value))
+                            }
+                        )
+                        field_description(
+                            "Empty deploys the repository's latest release, as GitHub marks it. A tag deploys the newest release tagged like it, prereleases too: api/v* for a monorepo's app, or api/v*-beta.* for its betas. A * stands for any text without a dash, so v* leaves out v1.4.0-beta.1."
+                        )
+                    )
                     <div class="grid grid-cols-1 gap-5 md:grid-cols-2">
-                        release_file_field(project_id: project_id, service_id: service_id, file: release_file.clone())
-                        release_binary_field(project_id: project_id, service_id: service_id, file: $(release_file.get()))
+                        release_file_field(project_id: project_id, service_id: service_id, tag: $(release_tag.get()), file: release_file.clone())
+                        release_binary_field(project_id: project_id, service_id: service_id, tag: $(release_tag.get()), file: $(release_file.get()))
                     </div>
                     option_switch(
                         name: "automatic",
@@ -483,13 +504,13 @@ pub(super) async fn deploy_card(cx: &Cx, project_id: u64, service_id: u64, chang
     let stopped = status == AppStatus::Stopped;
     let text = match (status, releases) {
         (AppStatus::NotDeployed, false) => "Fetch the branch, build it and start it.",
-        (AppStatus::NotDeployed, true) => "Download the repository's latest release and start it.",
+        (AppStatus::NotDeployed, true) => "Download the repository's release and start it.",
         (AppStatus::Deploying, _) => "A deployment is in progress. Its log is in the Deployments tab.",
         (AppStatus::Running, false) => "Deploying again builds the branch's latest commit and swaps it in.",
-        (AppStatus::Running, true) => "Deploying again downloads the latest release and swaps it in.",
+        (AppStatus::Running, true) => "Deploying again downloads the newest release and swaps it in.",
         (AppStatus::Restarting, _) => "The app exited, and oxploy is starting it again. Its output is in the Logs tab.",
         (AppStatus::Stopped, false) => "The app is stopped. Start it again, or deploy the latest commit.",
-        (AppStatus::Stopped, true) => "The app is stopped. Start it again, or deploy the latest release.",
+        (AppStatus::Stopped, true) => "The app is stopped. Start it again, or deploy the newest release.",
     };
     // What the last button did, or does now, said under the buttons.
     let busy = signal(cx, || false);
@@ -663,7 +684,7 @@ enum ReleaseChoices {
     Loading,
     /// The service has no source saved yet.
     NoSource,
-    /// The repository has no release yet.
+    /// The repository has no release to choose from, for this reason.
     NoRelease(String),
     Failed(String),
     Found {
@@ -673,12 +694,17 @@ enum ReleaseChoices {
     },
 }
 
-/// The service, and the latest release of its saved repository, for the GitHub release
-/// tab's fields.
+/// The service, and the release of its saved repository that `tag` picks, its latest
+/// when `tag` is empty, for the GitHub release tab's fields.
 ///
 /// Shards answer requests of their own, without the page's guards, so this checks
 /// access.
-async fn release_choices(cx: &Cx, project_id: u64, service_id: u64) -> Result<(Service, ReleaseChoices)> {
+async fn release_choices(
+    cx: &Cx,
+    project_id: u64,
+    service_id: u64,
+    tag: &str,
+) -> Result<(Service, ReleaseChoices)> {
     let organization = require_organization(cx).await?;
     let project = Project::find_in(cx, organization.id, project_id)
         .await?
@@ -697,36 +723,39 @@ async fn release_choices(cx: &Cx, project_id: u64, service_id: u64) -> Result<(S
     if !connected(cx) {
         return Ok((service, ReleaseChoices::Loading));
     }
-    let choices = match app.latest_release(&repository).await {
+    let tag = tag.trim();
+    let choices = match app.release_to_deploy(&repository, (!tag.is_empty()).then_some(tag)).await {
         Ok(Some(release)) => ReleaseChoices::Found {
             app: Box::new(app),
             repository,
             release,
         },
-        Ok(None) => ReleaseChoices::NoRelease(repository),
+        Ok(None) if tag.is_empty() => ReleaseChoices::NoRelease(format!("{repository} has no release yet")),
+        Ok(None) => ReleaseChoices::NoRelease(format!("{repository} has no release tagged like {tag}")),
         Err(error) => ReleaseChoices::Failed(error.to_string()),
     };
     Ok((service, choices))
 }
 
-/// The files of the latest release of the service's repository, to choose the one to
-/// deploy, as it is saved: with the release's version as `*`. Choosing one updates
-/// `file`, which lists the binaries in it. Without a release to choose from, the name is
-/// typed.
+/// The files of the release of the service's repository that `tag` picks, to choose
+/// the one to deploy, as it is saved: with the release's version as `*`. Choosing one
+/// updates `file`, which lists the binaries in it. Without a release to choose from,
+/// the name is typed.
 #[shard]
 async fn release_file_field(
     cx: &Cx,
     project_id: u64,
     service_id: u64,
+    tag: String,
     file: Signal<String>,
 ) -> Result<impl View> {
-    let (_, choices) = release_choices(cx, project_id, service_id).await?;
+    let (_, choices) = release_choices(cx, project_id, service_id, &tag).await?;
     let saved = file.get_untracked();
     let id = element_id(cx);
     let (choose, type_in) = (file.clone(), file.clone());
     let reason = match &choices {
         ReleaseChoices::NoSource => "Save a source above to choose from its releases. Meanwhile, type the file's name.".to_owned(),
-        ReleaseChoices::NoRelease(repository) => format!("{repository} has no release yet. Type the file's name, or publish a release and come back to choose it."),
+        ReleaseChoices::NoRelease(why) => format!("{why}. Type the file's name, or publish a release and come back to choose it."),
         ReleaseChoices::Failed(error) => format!("{error}. Type the file's name meanwhile."),
         ReleaseChoices::Loading | ReleaseChoices::Found { .. } => String::new(),
     };
@@ -763,7 +792,7 @@ async fn release_file_field(
                             (if saved.is_empty() { "Loading the release from GitHub…" } else { saved.as_str() })
                         </option>
                     )
-                    field_description("Loading the latest release from GitHub…")
+                    field_description("Loading the release from GitHub…")
                 }
                 _ => {
                     input(
@@ -822,8 +851,14 @@ enum BinaryChoices {
 /// oxploy downloads the archive to look into it. When it cannot, the path is typed,
 /// starting from a guess.
 #[shard]
-async fn release_binary_field(cx: &Cx, project_id: u64, service_id: u64, file: String) -> Result<impl View> {
-    let (service, choices) = release_choices(cx, project_id, service_id).await?;
+async fn release_binary_field(
+    cx: &Cx,
+    project_id: u64,
+    service_id: u64,
+    tag: String,
+    file: String,
+) -> Result<impl View> {
+    let (service, choices) = release_choices(cx, project_id, service_id, &tag).await?;
     let id = element_id(cx);
     let file = file.trim().to_owned();
     let saved = service.github_asset_binary.clone().unwrap_or_default();
@@ -1192,6 +1227,8 @@ async fn save_script(cx: &Cx, Form(form): Form<ScriptForm>) -> Result<SeeOther> 
 /// A form with the file of a GitHub release to deploy.
 #[derive(Deserialize)]
 struct ReleaseForm {
+    #[serde(default)]
+    tag: String,
     file: String,
     #[serde(default)]
     binary: String,
@@ -1204,13 +1241,14 @@ struct ReleaseForm {
 async fn save_release(cx: &Cx, Form(form): Form<ReleaseForm>) -> Result<SeeOther> {
     let (project, mut service) = current_service(cx).await?;
     let build = ReleaseBuild {
+        tag: &form.tag,
         file: &form.file,
         binary: &form.binary,
         automatic: form.automatic.is_some(),
     };
     if !service.set_release(cx, &build).await? {
         return Err(bad_request(
-            "Name the release's file without slashes, and for a .tar.gz the binary in it, as a path inside the archive",
+            "Name the release's tag as git names tags, its file without slashes, and for a .tar.gz the binary in it, as a path inside the archive",
         )
         .into());
     }

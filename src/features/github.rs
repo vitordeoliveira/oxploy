@@ -20,6 +20,7 @@ use topcoat::{Result, context::Cx};
 
 use super::archive;
 use super::project::now;
+use super::service::release_tag_matches;
 use crate::db::db;
 
 /// A GitHub App registered for an organization.
@@ -74,6 +75,12 @@ pub struct Release {
     pub tag_name: String,
     /// Its title, which may be empty or the tag again.
     pub name: Option<String>,
+    /// Whether it is still being written, unpublished.
+    #[serde(default)]
+    pub draft: bool,
+    /// When it was published, such as `2025-01-31T10:00:00Z`. `None` for a draft.
+    #[serde(default)]
+    pub published_at: Option<String>,
     pub assets: Vec<ReleaseFile>,
 }
 
@@ -393,6 +400,29 @@ impl GithubApp {
             Err(GithubError::Rejected { status: 404, .. }) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Returns the release of a repository to deploy: with `tag`, the newest published
+    /// release whose tag matches it (see [`release_tag_matches`]), prereleases
+    /// included, among the repository's last 100 releases; otherwise its latest
+    /// release. `None` if there is none.
+    pub async fn release_to_deploy(&self, repository: &str, tag: Option<&str>) -> Result<Option<Release>, GithubError> {
+        let Some(pattern) = tag else {
+            return self.latest_release(repository).await;
+        };
+        if !is_repository_name(repository) {
+            return Err(GithubError::Rejected {
+                status: 404,
+                message: "Not Found".to_owned(),
+            });
+        }
+        let token = self.installation_token().await?;
+        let path = format!("/repos/{repository}/releases?per_page=100");
+        let releases: Vec<Release> = api(Method::Get, path, Some(token)).await?;
+        Ok(releases
+            .into_iter()
+            .filter(|release| !release.draft && release_tag_matches(pattern, &release.tag_name))
+            .max_by(|a, b| a.published_at.cmp(&b.published_at)))
     }
 
     /// Downloads a file of one of a repository's releases into the file at `to`, which
